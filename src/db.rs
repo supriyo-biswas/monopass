@@ -171,7 +171,7 @@ fn create_file_encryption_key_item(conn: &Connection) -> rusqlite::Result<()> {
     getrandom::fill(&mut key[..]).map_err(|error| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::other(error.to_string())))
     })?;
-    let key_hex = hex_encode(&*key);
+    let key_hex = Zeroizing::new(hex_encode(&*key));
     let fields = Zeroizing::new(internal_key_fields(&key_hex, true));
     insert_internal_key_item(
         conn,
@@ -327,11 +327,12 @@ pub(crate) fn prompt_password(prompt: &str) -> io::Result<Zeroizing<String>> {
     eprint!("{prompt}");
     io::stderr().flush()?;
 
-    let mut password = String::new();
+    let mut password = Zeroizing::new(String::new());
     io::stdin().read_line(&mut password)?;
-    Ok(Zeroizing::new(
-        password.trim_end_matches(['\r', '\n']).to_owned(),
-    ))
+    while password.ends_with(['\r', '\n']) {
+        password.pop();
+    }
+    Ok(password)
 }
 
 #[cfg(test)]

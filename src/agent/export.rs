@@ -114,8 +114,7 @@ async fn build_zip(
     item_name: &str,
     item: ItemResponse,
 ) -> Result<Zeroizing<Vec<u8>>, ExportJobError> {
-    let mut output = Cursor::new(Vec::new());
-    let mut zip = ZipWriter::new(&mut output);
+    let mut output = Zeroizing::new(Vec::new());
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let ItemResponse {
         name,
@@ -125,49 +124,56 @@ async fn build_zip(
     } = item;
     let mut export_files = Vec::new();
 
-    for file in &files {
-        let response = database
-            .get_reference(
-                dir_name.to_owned(),
-                item_name.to_owned(),
-                file.name.clone(),
-                None,
-                true,
-                true,
-            )
-            .await
-            .map_err(ExportJobError::from_db)?;
-        let etag = response
-            .etag
-            .ok_or_else(|| ExportJobError::bad_reference("file response missing checksum"))?;
-        let bytes = reference_body_bytes(response.body).await?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        if actual != etag {
-            return Err(ExportJobError::bad_reference("file checksum mismatch"));
+    {
+        let mut cursor = Cursor::new(&mut *output);
+        let mut zip = ZipWriter::new(&mut cursor);
+
+        for file in &files {
+            let response = database
+                .get_reference(
+                    dir_name.to_owned(),
+                    item_name.to_owned(),
+                    file.name.clone(),
+                    None,
+                    true,
+                    true,
+                )
+                .await
+                .map_err(ExportJobError::from_db)?;
+            let etag = response
+                .etag
+                .ok_or_else(|| ExportJobError::bad_reference("file response missing checksum"))?;
+            let bytes = reference_body_bytes(response.body).await?;
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            if actual != etag {
+                return Err(ExportJobError::bad_reference("file checksum mismatch"));
+            }
+            zip.start_file(format!("files/{etag}"), options)
+                .map_err(|_| ExportJobError::internal())?;
+            zip.write_all(&bytes)
+                .map_err(|_| ExportJobError::internal())?;
+            export_files.push(ExportFile {
+                name: file.name.clone(),
+                sha256: etag,
+            });
         }
-        zip.start_file(format!("files/{etag}"), options)
+
+        zip.start_file("fields.json", options)
             .map_err(|_| ExportJobError::internal())?;
-        zip.write_all(&bytes)
+        let export = ExportItem {
+            name,
+            fields,
+            files: export_files,
+        };
+        let fields_bytes = Zeroizing::new(
+            serde_json::to_vec_pretty(&export).map_err(|_| ExportJobError::internal())?,
+        );
+        zip.write_all(&fields_bytes)
             .map_err(|_| ExportJobError::internal())?;
-        export_files.push(ExportFile {
-            name: file.name.clone(),
-            sha256: etag,
-        });
+        zip.finish().map_err(|_| ExportJobError::internal())?;
     }
 
-    zip.start_file("fields.json", options)
-        .map_err(|_| ExportJobError::internal())?;
-    let export = ExportItem {
-        name,
-        fields,
-        files: export_files,
-    };
-    let fields_bytes =
-        Zeroizing::new(serde_json::to_vec_pretty(&export).map_err(|_| ExportJobError::internal())?);
-    zip.write_all(&fields_bytes)
-        .map_err(|_| ExportJobError::internal())?;
-    zip.finish().map_err(|_| ExportJobError::internal())?;
-    Ok(Zeroizing::new(output.into_inner()))
+    Ok(output)
 }
 
 async fn reference_body_bytes(body: ReferenceBody) -> Result<Zeroizing<Vec<u8>>, ExportJobError> {
