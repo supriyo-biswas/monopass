@@ -65,8 +65,13 @@ pub fn run(config: &Config, args: Args) -> AppResult {
                 Zeroizing::new(file_path.to_string_lossy().into_owned()),
             );
         } else if item.fields.iter().any(|field| field.name == reference.name) {
-            let value = String::from_utf8(std::mem::take(&mut *bytes))
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let value = match String::from_utf8(std::mem::take(&mut *bytes)) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _bytes = Zeroizing::new(error.into_bytes());
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8").into());
+                }
+            };
             env.insert(key, Zeroizing::new(value));
         } else {
             return Err(

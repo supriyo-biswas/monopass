@@ -2696,7 +2696,7 @@ impl DatabaseWorker {
         let row = item_version_row(&self.connection, dir_id, item_name, version)?;
 
         let mut fields: std::collections::HashMap<String, Field> =
-            serde_json::from_str(&row.fields_json).map_err(|_| DbError::Internal)?;
+            serde_json::from_str(row.fields_json.as_str()).map_err(|_| DbError::Internal)?;
         if raw {
             // Raw mode intentionally leaves stored field data unchanged.
         } else if reveal {
@@ -2992,7 +2992,7 @@ impl DatabaseWorker {
         let row = item_version_row(&self.connection, dir_id, item_name, version)?;
 
         let fields: std::collections::HashMap<String, Field> =
-            serde_json::from_str(&row.fields_json).map_err(|_| DbError::Internal)?;
+            serde_json::from_str(row.fields_json.as_str()).map_err(|_| DbError::Internal)?;
         if let Some(field) = fields.get(field_name)
             && matches!(field.field_type, FieldType::Totp)
         {
@@ -3282,9 +3282,9 @@ impl DatabaseWorker {
         let key_hex = fields
             .get("key")
             .filter(|field| matches!(field.field_type, FieldType::String))
-            .map(|field| field.data.as_str())
+            .map(|field| Zeroizing::new(field.data.as_str().to_owned()))
             .ok_or(DbError::Internal)?;
-        decode_file_key(&key_hex)
+        decode_file_key(key_hex.as_str())
     }
 
     #[cfg(test)]
@@ -3708,7 +3708,7 @@ struct ItemVersionRow {
     item_id: i64,
     item_name: String,
     version_id: i64,
-    fields_json: String,
+    fields_json: Zeroizing<String>,
     item_created_at: i64,
     item_updated_at: i64,
 }
@@ -3735,7 +3735,7 @@ fn item_version_row(
                     item_id: row.get(0)?,
                     item_name: row.get(1)?,
                     version_id: row.get(2)?,
-                    fields_json: row.get(3)?,
+                    fields_json: Zeroizing::new(row.get(3)?),
                     item_created_at: row.get(4)?,
                     item_updated_at: row.get(5)?,
                 })
@@ -3750,19 +3750,21 @@ fn source_fields(
     connection: &Connection,
     item_id: i64,
 ) -> Result<std::collections::HashMap<String, Field>, DbError> {
-    let fields_json: String = connection
-        .query_row(
-            r#"
+    let fields_json: Zeroizing<String> = Zeroizing::new(
+        connection
+            .query_row(
+                r#"
             SELECT v.fields
             FROM items i
             JOIN item_versions v ON v.item_id = i.id AND v.version_id = i.latest_version_id
             WHERE i.id = ?1
             "#,
-            [item_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| DbError::Internal)?;
-    serde_json::from_str(&fields_json).map_err(|_| DbError::Internal)
+                [item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| DbError::Internal)?,
+    );
+    serde_json::from_str(fields_json.as_str()).map_err(|_| DbError::Internal)
 }
 
 fn item_fields_for_version(
@@ -3770,16 +3772,18 @@ fn item_fields_for_version(
     item_id: i64,
     version_id: i64,
 ) -> Result<std::collections::HashMap<String, Field>, DbError> {
-    let fields_json: String = connection
-        .query_row(
-            "SELECT fields FROM item_versions WHERE item_id = ?1 AND version_id = ?2",
-            (item_id, version_id),
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| DbError::Internal)?
-        .ok_or(DbError::NotFound)?;
-    serde_json::from_str(&fields_json).map_err(|_| DbError::Internal)
+    let fields_json: Zeroizing<String> = Zeroizing::new(
+        connection
+            .query_row(
+                "SELECT fields FROM item_versions WHERE item_id = ?1 AND version_id = ?2",
+                (item_id, version_id),
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| DbError::Internal)?
+            .ok_or(DbError::NotFound)?,
+    );
+    serde_json::from_str(fields_json.as_str()).map_err(|_| DbError::Internal)
 }
 
 fn item_total_versions(connection: &Connection, item_id: i64) -> Result<u64, DbError> {
@@ -4030,14 +4034,14 @@ fn create_item_version(
             |row| row.get(0),
         )
         .map_err(|_| DbError::Internal)?;
-    let fields_json = serde_json::to_string(fields).map_err(|_| DbError::Internal)?;
+    let fields_json = Zeroizing::new(serde_json::to_string(fields).map_err(|_| DbError::Internal)?);
     transaction
         .execute(
             r#"
             INSERT INTO item_versions (version_id, item_id, fields, created_at)
             VALUES (?1, ?2, ?3, ?4)
             "#,
-            (version_id, item_id, fields_json, created_at),
+            (version_id, item_id, fields_json.as_str(), created_at),
         )
         .map_err(map_insert_error)?;
     Ok(version_id)
@@ -4103,7 +4107,7 @@ fn create_private_blob_file(path: &Path) -> Result<fs::File, DbError> {
 }
 
 fn decode_file_key(key_hex: &str) -> Result<Zeroizing<[u8; FILE_KEY_BYTES]>, DbError> {
-    let key = hex_decode_exact(key_hex, FILE_KEY_BYTES).ok_or(DbError::Internal)?;
+    let key = Zeroizing::new(hex_decode_exact(key_hex, FILE_KEY_BYTES).ok_or(DbError::Internal)?);
     let mut bytes = [0u8; FILE_KEY_BYTES];
     bytes.copy_from_slice(&key);
     Ok(Zeroizing::new(bytes))
@@ -4709,7 +4713,7 @@ fn decode_base32_secret(secret: &str) -> Result<Zeroizing<Vec<u8>>, DbError> {
         _ => return Err(invalid_totp_field()),
     }
 
-    let normalized = secret.to_ascii_uppercase();
+    let normalized = Zeroizing::new(secret.to_ascii_uppercase());
     let decoded = BASE32_NOPAD
         .decode(normalized.as_bytes())
         .map_err(|_| invalid_totp_field())?;
