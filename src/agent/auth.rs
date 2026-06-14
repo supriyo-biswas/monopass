@@ -1,14 +1,19 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::Request;
 use axum::extract::State;
 use axum::extract::connect_info::{ConnectInfo, Connected};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::IncomingStream;
+use http_body::{Frame, SizeHint};
 use tokio::net::UnixListener;
 
 use super::error::ApiError;
 use super::process::{ProcessChainHash, hash_verified_client_chain};
-use super::state::AgentState;
+use super::state::{ActiveDatabaseRequest, AgentState};
 
 #[derive(Debug, Clone)]
 pub struct PeerConnectInfo {
@@ -73,10 +78,42 @@ pub async fn require_unlocked_database(
     };
 
     if let Some(database) = state.authorize_database_access(process_hash).await {
+        let active_request = state.begin_active_database_request();
         request.extensions_mut().insert(database);
-        Ok(next.run(request).await)
+        let response = next.run(request).await;
+        Ok(response.map(|body| {
+            Body::new(GuardedBody {
+                body,
+                _active_request: active_request,
+            })
+        }))
     } else {
         Err(ApiError::access_denied())
+    }
+}
+
+struct GuardedBody {
+    body: Body,
+    _active_request: ActiveDatabaseRequest,
+}
+
+impl HttpBody for GuardedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
     }
 }
 

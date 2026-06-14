@@ -253,6 +253,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_route_response_body_delays_unload_until_dropped() {
+        let state = authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state.clone());
+
+        let response = router
+            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(1, state.active_database_request_count());
+        let now = Instant::now();
+
+        state.lock(now).await;
+
+        assert!(!state.unload_if_authorization_expired(now).await);
+        drop(response);
+        assert_eq!(0, state.active_database_request_count());
+        assert!(state.unload_if_authorization_expired(now).await);
+    }
+
+    #[tokio::test]
+    async fn streaming_reference_response_body_delays_unload_until_dropped() {
+        let state = authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state.clone());
+        router
+            .clone()
+            .oneshot(put_request_with_hash(
+                "/api/v1/dir/personal",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(bytes_request_with_hash(
+                "PUT",
+                "/api/v1/file/upload",
+                b"stream me",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        let file_id = json_body(response).await["id"].as_str().unwrap().to_owned();
+        let response = router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/dir/personal/item/github",
+                json!({"files": {"notes": {"id": file_id}}}),
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        drop(response);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/ref/personal/github/notes",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(1, state.active_database_request_count());
+        let now = Instant::now();
+
+        state.lock(now).await;
+
+        assert!(!state.unload_if_authorization_expired(now).await);
+        drop(response);
+        assert_eq!(0, state.active_database_request_count());
+        assert!(state.unload_if_authorization_expired(now).await);
+    }
+
+    #[tokio::test]
     async fn dir_api_creates_gets_lists_updates_and_deletes() {
         let state = authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);

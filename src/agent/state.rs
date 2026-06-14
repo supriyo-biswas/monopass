@@ -69,6 +69,7 @@ pub struct AgentState {
     file_store_path: PathBuf,
     job_store_path: PathBuf,
     inner: Arc<Mutex<InnerState>>,
+    active_database_requests: Arc<AtomicUsize>,
 }
 
 impl AgentState {
@@ -100,6 +101,7 @@ impl AgentState {
             file_store_path: file_store_path.as_ref().to_owned(),
             job_store_path: job_store_path.as_ref().to_owned(),
             inner: Arc::new(Mutex::new(InnerState::default())),
+            active_database_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -264,7 +266,7 @@ impl AgentState {
 
         let cleanup_due = {
             let mut inner = self.inner.lock().await;
-            if !inner.active_jobs.is_empty() {
+            if self.has_active_database_work_locked(&inner) {
                 return false;
             }
             inner.authorized_processes.retain_unexpired(now, auth_ttl);
@@ -296,7 +298,7 @@ impl AgentState {
         let should_unload = inner.database.as_ref().is_some_and(|current| {
             current.ptr_eq(&database)
                 && inner.max_authorization_expires_at.is_none()
-                && inner.active_jobs.is_empty()
+                && !self.has_active_database_work_locked(&inner)
         });
 
         if cleanup_due {
@@ -396,9 +398,38 @@ impl AgentState {
         self.inner.lock().await.active_jobs.remove(job_id);
     }
 
+    pub fn begin_active_database_request(&self) -> ActiveDatabaseRequest {
+        self.active_database_requests
+            .fetch_add(1, Ordering::Relaxed);
+        ActiveDatabaseRequest {
+            active_database_requests: self.active_database_requests.clone(),
+        }
+    }
+
+    fn has_active_database_work_locked(&self, inner: &InnerState) -> bool {
+        !inner.active_jobs.is_empty() || self.active_database_requests.load(Ordering::Relaxed) > 0
+    }
+
     #[cfg(test)]
     pub async fn active_job_count(&self) -> usize {
         self.inner.lock().await.active_jobs.len()
+    }
+
+    #[cfg(test)]
+    pub fn active_database_request_count(&self) -> usize {
+        self.active_database_requests.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug)]
+pub struct ActiveDatabaseRequest {
+    active_database_requests: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveDatabaseRequest {
+    fn drop(&mut self) {
+        self.active_database_requests
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1150,7 +1181,7 @@ impl DbHandle {
     }
 
     #[cfg(test)]
-    async fn test_slow_write(&self, duration: Duration) -> Result<(), DbError> {
+    pub(crate) async fn test_slow_write(&self, duration: Duration) -> Result<(), DbError> {
         self.request_writer(|reply| DbCommand::TestSleep { duration, reply })
             .await
     }
@@ -5398,6 +5429,32 @@ mod tests {
             .await;
 
         assert_eq!(0, state.active_job_count().await);
+        assert!(state.unload_if_authorization_expired(now + AUTH_TTL).await);
+        assert!(state.database_handle().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_unload_waits_for_active_database_requests() {
+        let state = AgentState::from_database_path("missing.db");
+        let now = Instant::now();
+        state.store_database_handle(DbHandle::test()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_process_hash_at(ProcessChainHash::test(1), now)
+            .await;
+        state.set_last_authorized_database_access(Some(now)).await;
+        state
+            .set_max_authorization_expires_at(Some(now + AUTH_TTL))
+            .await;
+        let active_request = state.begin_active_database_request();
+
+        assert_eq!(1, state.active_database_request_count());
+        assert!(!state.unload_if_authorization_expired(now + AUTH_TTL).await);
+        assert!(state.database_handle().await.is_some());
+
+        drop(active_request);
+
+        assert_eq!(0, state.active_database_request_count());
         assert!(state.unload_if_authorization_expired(now + AUTH_TTL).await);
         assert!(state.database_handle().await.is_none());
     }
