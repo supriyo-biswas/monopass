@@ -1,0 +1,43 @@
+name: Conventional Commits
+
+on:
+  push:
+    branches:
+      - master
+      - conventional-commit
+  pull_request:
+    branches:
+      - master
+      - conventional-commit
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  enforce:
+    name: Enforce conventional commits on master
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install commitlint
+        run: npm install --no-save @commitlint/cli @commitlint/config-conventional
+
+      - name: Validate commit messages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          message_file="$(mktemp)"
+          git log -1 --format=%B "${GITHUB_SHA}" > "${message_file}"
+
+          npx commitlint \
+            --config .github/commitlint.config.cjs \
+            --edit "${message_file}"
+
+          rm -f "${message_file}"

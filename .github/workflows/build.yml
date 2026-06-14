@@ -1,9 +1,15 @@
 name: Build
 
 on:
-  pull_request: {}
+  pull_request:
+    paths:
+      - '**/*.rs'
+      - 'Cargo.lock'
   workflow_dispatch: {}
-  push: {}
+  push:
+    paths:
+      - '**/*.rs'
+      - 'Cargo.lock'
 
 permissions:
   contents: read
