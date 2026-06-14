@@ -1,0 +1,128 @@
+name: Build
+
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+  push: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: linux-x86_64
+            binary_path: target/x86_64-unknown-linux-musl/release/monopass
+            linux: true
+            run_tests: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact_name: linux-aarch64
+            binary_path: target/aarch64-unknown-linux-musl/release/monopass
+            linux: true
+            run_tests: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            artifact_name: macos-aarch64
+            binary_path: target/aarch64-apple-darwin/release/monopass
+            linux: false
+            run_tests: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: matrix.linux
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Cargo build output
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ matrix.target }}-
+
+      - name: Run tests
+        if: matrix.run_tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Verify Linux binary is static
+        if: matrix.linux
+        run: |
+          file "${{ matrix.binary_path }}"
+          if ldd "${{ matrix.binary_path }}" 2>&1 | tee ldd-output.txt | grep -Eq "not a dynamic executable|statically linked"; then
+            exit 0
+          fi
+
+          cat ldd-output.txt
+          exit 1
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          tar -czf "dist/monopass-${{ matrix.artifact_name }}.tar.gz" -C "$(dirname "${{ matrix.binary_path }}")" monopass
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monopass-${{ matrix.artifact_name }}
+          path: dist/monopass-${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release artifacts
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --verify-tag --title "$TAG_NAME" --notes "Automated release artifacts for $TAG_NAME."
+          fi
+
+          gh release upload "$TAG_NAME" dist/*.tar.gz --clobber
