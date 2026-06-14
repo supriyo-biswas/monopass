@@ -354,11 +354,15 @@ pub async fn import_item(
 ) -> Result<(StatusCode, Json<JobAcceptedResponse>), ApiError> {
     let encrypted_path = spool_import_body(&mut body).await?;
     let job_id = random_job_id().map_err(|_| ApiError::internal_error())?;
-    database
+    state.register_active_job(job_id.clone()).await;
+    if let Err(error) = database
         .create_import_job(job_id.clone(), dir_name.clone(), item_name.clone())
         .await
-        .map_err(ApiError::from)?;
-    state.register_active_job(job_id.clone()).await;
+    {
+        state.unregister_active_job(&job_id).await;
+        let _ = std::fs::remove_file(&encrypted_path);
+        return Err(ApiError::from(error));
+    }
     spawn_import_task(
         state,
         database,
@@ -383,7 +387,8 @@ pub async fn export_item(
     Path((dir_name, item_name, contact_name)): Path<(String, String, String)>,
 ) -> Result<(StatusCode, Json<JobAcceptedResponse>), ApiError> {
     let job_id = random_job_id().map_err(|_| ApiError::internal_error())?;
-    database
+    state.register_active_job(job_id.clone()).await;
+    if let Err(error) = database
         .create_export_job(
             job_id.clone(),
             dir_name.clone(),
@@ -391,8 +396,10 @@ pub async fn export_item(
             contact_name.clone(),
         )
         .await
-        .map_err(ApiError::from)?;
-    state.register_active_job(job_id.clone()).await;
+    {
+        state.unregister_active_job(&job_id).await;
+        return Err(ApiError::from(error));
+    }
     spawn_export_task(
         state,
         database,
@@ -821,6 +828,7 @@ impl From<DbError> for ApiError {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use base64::Engine;
     use base64::engine::general_purpose;
@@ -828,7 +836,10 @@ mod tests {
     use tempfile::NamedTempFile;
     use zeroize::Zeroizing;
 
-    use super::{bearer_password, lock, send_upload_body_bytes, status, unlock};
+    use super::{
+        bearer_password, export_item, import_item, lock, send_upload_body_bytes, status, unlock,
+    };
+    use crate::agent::models::{CreateContactRequest, CreateItemRequest};
     use crate::agent::process::ProcessChainHash;
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
 
@@ -1167,6 +1178,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_job_is_active_before_job_record_write_completes() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        database.create_dir("Personal".to_owned()).await.unwrap();
+        let blocker = block_writer(&database).await;
+        let import_state = state.clone();
+        let import_database = database.clone();
+        let import_task = tokio::spawn(async move {
+            import_item(
+                axum::extract::State(import_state),
+                axum::Extension(import_database),
+                axum::extract::Path(("Personal".to_owned(), "github".to_owned())),
+                Body::from("not an age export"),
+            )
+            .await
+        });
+
+        wait_for_active_jobs(&state, 1).await;
+        let now = Instant::now();
+        state.lock(now).await;
+
+        assert!(!state.unload_if_authorization_expired(now).await);
+        assert_eq!(1, state.active_job_count().await);
+        assert_eq!(StatusCode::ACCEPTED, import_task.await.unwrap().unwrap().0);
+        assert!(blocker.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn export_job_is_active_before_job_record_write_completes() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        database.create_dir("Personal".to_owned()).await.unwrap();
+        database
+            .create_item(
+                "Personal".to_owned(),
+                "github".to_owned(),
+                CreateItemRequest::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .create_contact(
+                "alice@example.com".to_owned(),
+                CreateContactRequest {
+                    name: Some("alice".to_owned()),
+                    age_public_key: age::x25519::Identity::generate().to_public().to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+        let blocker = block_writer(&database).await;
+        let export_state = state.clone();
+        let export_database = database.clone();
+        let export_task = tokio::spawn(async move {
+            export_item(
+                axum::extract::State(export_state),
+                axum::Extension(export_database),
+                axum::extract::Path((
+                    "Personal".to_owned(),
+                    "github".to_owned(),
+                    "alice@example.com".to_owned(),
+                )),
+            )
+            .await
+        });
+
+        wait_for_active_jobs(&state, 1).await;
+        let now = Instant::now();
+        state.lock(now).await;
+
+        assert!(!state.unload_if_authorization_expired(now).await);
+        assert_eq!(1, state.active_job_count().await);
+        assert_eq!(StatusCode::ACCEPTED, export_task.await.unwrap().unwrap().0);
+        assert!(blocker.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn status_missing_process_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = status(axum::extract::State(state), None).await.unwrap_err();
@@ -1182,6 +1272,48 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    async fn block_writer(
+        database: &DbHandle,
+    ) -> tokio::task::JoinHandle<Result<(), super::DbError>> {
+        let before = database.dispatch_counts().0;
+        let worker_database = database.clone();
+        let task = tokio::spawn(async move {
+            worker_database
+                .test_slow_write(Duration::from_secs(3))
+                .await
+        });
+        wait_for_writer_dispatches(&database, before + 1).await;
+        task
+    }
+
+    async fn wait_for_writer_dispatches(database: &DbHandle, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if database.dispatch_counts().0 >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for writer dispatches"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_for_active_jobs(state: &AgentState, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if state.active_job_count().await >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for active jobs"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     fn create_encrypted_database(path: &std::path::Path, password: &str) {

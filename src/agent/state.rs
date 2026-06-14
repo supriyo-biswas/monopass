@@ -69,6 +69,7 @@ pub struct AgentState {
     file_store_path: PathBuf,
     job_store_path: PathBuf,
     inner: Arc<Mutex<InnerState>>,
+    active_database_requests: Arc<AtomicUsize>,
 }
 
 impl AgentState {
@@ -100,6 +101,7 @@ impl AgentState {
             file_store_path: file_store_path.as_ref().to_owned(),
             job_store_path: job_store_path.as_ref().to_owned(),
             inner: Arc::new(Mutex::new(InnerState::default())),
+            active_database_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -130,12 +132,20 @@ impl AgentState {
                 return Err(UnlockError::AccessDenied);
             }
             let database = inner.database.clone().ok_or(UnlockError::AccessDenied)?;
+            let auth_epoch = inner.auth_epoch;
             drop(inner);
             let auth_ttl = database
                 .user_setting_duration(AUTH_TTL_SETTING)
                 .await
                 .map_err(|_| UnlockError::AccessDenied)?;
             let mut inner = self.inner.lock().await;
+            let database_is_current = inner
+                .database
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&database));
+            if inner.auth_epoch != auth_epoch || !database_is_current {
+                return Err(UnlockError::AccessDenied);
+            }
             let now = Instant::now();
             inner.authorized_processes.insert(process_hash, now);
             inner.record_authorization_expiry(now + auth_ttl);
@@ -161,6 +171,7 @@ impl AgentState {
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
 
+        inner.invalidate_auth_epoch();
         inner.database = Some(handle);
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
         let now = Instant::now();
@@ -172,6 +183,7 @@ impl AgentState {
 
     pub async fn lock(&self, now: Instant) {
         let mut inner = self.inner.lock().await;
+        inner.invalidate_auth_epoch();
         inner.authorized_processes.clear();
         inner.max_authorization_expires_at = Some(now);
     }
@@ -254,7 +266,7 @@ impl AgentState {
 
         let cleanup_due = {
             let mut inner = self.inner.lock().await;
-            if !inner.active_jobs.is_empty() {
+            if self.has_active_database_work_locked(&inner) {
                 return false;
             }
             inner.authorized_processes.retain_unexpired(now, auth_ttl);
@@ -286,7 +298,7 @@ impl AgentState {
         let should_unload = inner.database.as_ref().is_some_and(|current| {
             current.ptr_eq(&database)
                 && inner.max_authorization_expires_at.is_none()
-                && inner.active_jobs.is_empty()
+                && !self.has_active_database_work_locked(&inner)
         });
 
         if cleanup_due {
@@ -301,6 +313,7 @@ impl AgentState {
     }
 
     fn unload_locked(inner: &mut InnerState) {
+        inner.invalidate_auth_epoch();
         inner.database = None;
         inner.password_verifier = None;
         inner.authorized_processes.clear();
@@ -316,6 +329,7 @@ impl AgentState {
     #[cfg(test)]
     pub async fn store_database_handle(&self, handle: DbHandle) {
         let mut inner = self.inner.lock().await;
+        inner.invalidate_auth_epoch();
         inner.database = Some(handle);
         inner.last_authorized_database_access = Some(Instant::now());
     }
@@ -384,9 +398,38 @@ impl AgentState {
         self.inner.lock().await.active_jobs.remove(job_id);
     }
 
+    pub fn begin_active_database_request(&self) -> ActiveDatabaseRequest {
+        self.active_database_requests
+            .fetch_add(1, Ordering::Relaxed);
+        ActiveDatabaseRequest {
+            active_database_requests: self.active_database_requests.clone(),
+        }
+    }
+
+    fn has_active_database_work_locked(&self, inner: &InnerState) -> bool {
+        !inner.active_jobs.is_empty() || self.active_database_requests.load(Ordering::Relaxed) > 0
+    }
+
     #[cfg(test)]
     pub async fn active_job_count(&self) -> usize {
         self.inner.lock().await.active_jobs.len()
+    }
+
+    #[cfg(test)]
+    pub fn active_database_request_count(&self) -> usize {
+        self.active_database_requests.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug)]
+pub struct ActiveDatabaseRequest {
+    active_database_requests: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveDatabaseRequest {
+    fn drop(&mut self) {
+        self.active_database_requests
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -405,9 +448,14 @@ struct InnerState {
     max_authorization_expires_at: Option<Instant>,
     last_cleanup_at: Option<Instant>,
     active_jobs: HashSet<String>,
+    auth_epoch: u64,
 }
 
 impl InnerState {
+    fn invalidate_auth_epoch(&mut self) {
+        self.auth_epoch = self.auth_epoch.wrapping_add(1);
+    }
+
     fn record_authorization_expiry(&mut self, expires_at: Instant) {
         self.max_authorization_expires_at = Some(
             self.max_authorization_expires_at
@@ -1133,7 +1181,7 @@ impl DbHandle {
     }
 
     #[cfg(test)]
-    async fn test_slow_write(&self, duration: Duration) -> Result<(), DbError> {
+    pub(crate) async fn test_slow_write(&self, duration: Duration) -> Result<(), DbError> {
         self.request_writer(|reply| DbCommand::TestSleep { duration, reply })
             .await
     }
@@ -4806,9 +4854,9 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        AgentState, AuthCache, CreateContactRequest, CreateItemRequest, DbError, DbHandle,
-        FILE_RECORD_PLAINTEXT_BYTES, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
-        PRIVATE_FILE_MODE, PageRequest, UpdateContactRequest,
+        AgentState, AuthCache, CreateContactRequest, CreateItemRequest, DATABASE_READER_WORKERS,
+        DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES,
+        PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest,
     };
     use crate::agent::process::ProcessChainHash;
 
@@ -4863,6 +4911,35 @@ mod tests {
             })
             .collect();
         *entries = serde_json::Value::Array(named);
+    }
+
+    async fn block_reader_workers(
+        database: &DbHandle,
+    ) -> Vec<tokio::task::JoinHandle<Result<(), DbError>>> {
+        let before = database.dispatch_counts().1;
+        let mut tasks = Vec::with_capacity(DATABASE_READER_WORKERS);
+        for _ in 0..DATABASE_READER_WORKERS {
+            let database = database.clone();
+            tasks.push(tokio::spawn(async move {
+                database.test_slow_read(Duration::from_secs(3)).await
+            }));
+        }
+        wait_for_reader_dispatches(database, before + DATABASE_READER_WORKERS).await;
+        tasks
+    }
+
+    async fn wait_for_reader_dispatches(database: &DbHandle, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if database.dispatch_counts().1 >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for reader dispatches"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
@@ -5085,6 +5162,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_lock_makes_in_flight_repeated_unlock_fail_closed() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        let now = Instant::now();
+        state.store_database_handle(database.clone()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_process_hash_at(ProcessChainHash::test(1), now)
+            .await;
+        state
+            .set_max_authorization_expires_at(Some(now + AUTH_TTL))
+            .await;
+        let blockers = block_reader_workers(&database).await;
+        let before_unlock_read = database.dispatch_counts().1;
+        let unlock_state = state.clone();
+        let unlock_task = tokio::spawn(async move {
+            unlock_state
+                .unlock(password("correct"), ProcessChainHash::test(2))
+                .await
+        });
+        wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
+        let lock_time = Instant::now();
+
+        state.lock(lock_time).await;
+
+        assert_eq!(Err(UnlockError::AccessDenied), unlock_task.await.unwrap());
+        for blocker in blockers {
+            assert!(blocker.await.unwrap().is_ok());
+        }
+        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert_eq!(Some(lock_time), state.max_authorization_expires_at().await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_lock_and_unload_keep_in_flight_repeated_unlock_closed() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        let now = Instant::now();
+        state.store_database_handle(database.clone()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_process_hash_at(ProcessChainHash::test(1), now)
+            .await;
+        state
+            .set_max_authorization_expires_at(Some(now + AUTH_TTL))
+            .await;
+        let blockers = block_reader_workers(&database).await;
+        let before_unlock_read = database.dispatch_counts().1;
+        let unlock_state = state.clone();
+        let unlock_task = tokio::spawn(async move {
+            unlock_state
+                .unlock(password("correct"), ProcessChainHash::test(2))
+                .await
+        });
+        wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
+
+        state.lock(now).await;
+        assert!(state.unload_if_authorization_expired(now).await);
+
+        assert_eq!(Err(UnlockError::AccessDenied), unlock_task.await.unwrap());
+        for blocker in blockers {
+            assert!(blocker.await.unwrap().is_ok());
+        }
+        assert!(state.database_handle().await.is_none());
+        assert!(!state.has_password_verifier().await);
+        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
+    }
+
+    #[tokio::test]
     async fn concurrent_unlock_attempts_store_one_handle() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
@@ -5283,6 +5429,32 @@ mod tests {
             .await;
 
         assert_eq!(0, state.active_job_count().await);
+        assert!(state.unload_if_authorization_expired(now + AUTH_TTL).await);
+        assert!(state.database_handle().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_unload_waits_for_active_database_requests() {
+        let state = AgentState::from_database_path("missing.db");
+        let now = Instant::now();
+        state.store_database_handle(DbHandle::test()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_process_hash_at(ProcessChainHash::test(1), now)
+            .await;
+        state.set_last_authorized_database_access(Some(now)).await;
+        state
+            .set_max_authorization_expires_at(Some(now + AUTH_TTL))
+            .await;
+        let active_request = state.begin_active_database_request();
+
+        assert_eq!(1, state.active_database_request_count());
+        assert!(!state.unload_if_authorization_expired(now + AUTH_TTL).await);
+        assert!(state.database_handle().await.is_some());
+
+        drop(active_request);
+
+        assert_eq!(0, state.active_database_request_count());
         assert!(state.unload_if_authorization_expired(now + AUTH_TTL).await);
         assert!(state.database_handle().await.is_none());
     }

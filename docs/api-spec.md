@@ -33,8 +33,8 @@ HTTP/1.1 200 OK
 
 Clears cached process-chain authorizations immediately and schedules the
 unlocked database for unload on the agent's next authorization-expiry sweep.
-The request does not close the database synchronously; active jobs continue to
-delay unload as normal.
+The request does not close the database synchronously; active database requests
+and active jobs continue to delay unload as normal.
 
 Failure:
 - `403 access_denied`
