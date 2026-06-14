@@ -130,12 +130,20 @@ impl AgentState {
                 return Err(UnlockError::AccessDenied);
             }
             let database = inner.database.clone().ok_or(UnlockError::AccessDenied)?;
+            let auth_epoch = inner.auth_epoch;
             drop(inner);
             let auth_ttl = database
                 .user_setting_duration(AUTH_TTL_SETTING)
                 .await
                 .map_err(|_| UnlockError::AccessDenied)?;
             let mut inner = self.inner.lock().await;
+            let database_is_current = inner
+                .database
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&database));
+            if inner.auth_epoch != auth_epoch || !database_is_current {
+                return Err(UnlockError::AccessDenied);
+            }
             let now = Instant::now();
             inner.authorized_processes.insert(process_hash, now);
             inner.record_authorization_expiry(now + auth_ttl);
@@ -161,6 +169,7 @@ impl AgentState {
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
 
+        inner.invalidate_auth_epoch();
         inner.database = Some(handle);
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
         let now = Instant::now();
@@ -172,6 +181,7 @@ impl AgentState {
 
     pub async fn lock(&self, now: Instant) {
         let mut inner = self.inner.lock().await;
+        inner.invalidate_auth_epoch();
         inner.authorized_processes.clear();
         inner.max_authorization_expires_at = Some(now);
     }
@@ -301,6 +311,7 @@ impl AgentState {
     }
 
     fn unload_locked(inner: &mut InnerState) {
+        inner.invalidate_auth_epoch();
         inner.database = None;
         inner.password_verifier = None;
         inner.authorized_processes.clear();
@@ -316,6 +327,7 @@ impl AgentState {
     #[cfg(test)]
     pub async fn store_database_handle(&self, handle: DbHandle) {
         let mut inner = self.inner.lock().await;
+        inner.invalidate_auth_epoch();
         inner.database = Some(handle);
         inner.last_authorized_database_access = Some(Instant::now());
     }
@@ -405,9 +417,14 @@ struct InnerState {
     max_authorization_expires_at: Option<Instant>,
     last_cleanup_at: Option<Instant>,
     active_jobs: HashSet<String>,
+    auth_epoch: u64,
 }
 
 impl InnerState {
+    fn invalidate_auth_epoch(&mut self) {
+        self.auth_epoch = self.auth_epoch.wrapping_add(1);
+    }
+
     fn record_authorization_expiry(&mut self, expires_at: Instant) {
         self.max_authorization_expires_at = Some(
             self.max_authorization_expires_at
@@ -4806,9 +4823,9 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        AgentState, AuthCache, CreateContactRequest, CreateItemRequest, DbError, DbHandle,
-        FILE_RECORD_PLAINTEXT_BYTES, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
-        PRIVATE_FILE_MODE, PageRequest, UpdateContactRequest,
+        AgentState, AuthCache, CreateContactRequest, CreateItemRequest, DATABASE_READER_WORKERS,
+        DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES,
+        PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest,
     };
     use crate::agent::process::ProcessChainHash;
 
@@ -4863,6 +4880,35 @@ mod tests {
             })
             .collect();
         *entries = serde_json::Value::Array(named);
+    }
+
+    async fn block_reader_workers(
+        database: &DbHandle,
+    ) -> Vec<tokio::task::JoinHandle<Result<(), DbError>>> {
+        let before = database.dispatch_counts().1;
+        let mut tasks = Vec::with_capacity(DATABASE_READER_WORKERS);
+        for _ in 0..DATABASE_READER_WORKERS {
+            let database = database.clone();
+            tasks.push(tokio::spawn(async move {
+                database.test_slow_read(Duration::from_secs(3)).await
+            }));
+        }
+        wait_for_reader_dispatches(database, before + DATABASE_READER_WORKERS).await;
+        tasks
+    }
+
+    async fn wait_for_reader_dispatches(database: &DbHandle, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if database.dispatch_counts().1 >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for reader dispatches"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
@@ -5082,6 +5128,75 @@ mod tests {
         assert!(state.database_handle().await.is_none());
         assert!(!state.has_password_verifier().await);
         assert_eq!(None, state.max_authorization_expires_at().await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_lock_makes_in_flight_repeated_unlock_fail_closed() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        let now = Instant::now();
+        state.store_database_handle(database.clone()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_process_hash_at(ProcessChainHash::test(1), now)
+            .await;
+        state
+            .set_max_authorization_expires_at(Some(now + AUTH_TTL))
+            .await;
+        let blockers = block_reader_workers(&database).await;
+        let before_unlock_read = database.dispatch_counts().1;
+        let unlock_state = state.clone();
+        let unlock_task = tokio::spawn(async move {
+            unlock_state
+                .unlock(password("correct"), ProcessChainHash::test(2))
+                .await
+        });
+        wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
+        let lock_time = Instant::now();
+
+        state.lock(lock_time).await;
+
+        assert_eq!(Err(UnlockError::AccessDenied), unlock_task.await.unwrap());
+        for blocker in blockers {
+            assert!(blocker.await.unwrap().is_ok());
+        }
+        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert_eq!(Some(lock_time), state.max_authorization_expires_at().await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_lock_and_unload_keep_in_flight_repeated_unlock_closed() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        let now = Instant::now();
+        state.store_database_handle(database.clone()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_process_hash_at(ProcessChainHash::test(1), now)
+            .await;
+        state
+            .set_max_authorization_expires_at(Some(now + AUTH_TTL))
+            .await;
+        let blockers = block_reader_workers(&database).await;
+        let before_unlock_read = database.dispatch_counts().1;
+        let unlock_state = state.clone();
+        let unlock_task = tokio::spawn(async move {
+            unlock_state
+                .unlock(password("correct"), ProcessChainHash::test(2))
+                .await
+        });
+        wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
+
+        state.lock(now).await;
+        assert!(state.unload_if_authorization_expired(now).await);
+
+        assert_eq!(Err(UnlockError::AccessDenied), unlock_task.await.unwrap());
+        for blocker in blockers {
+            assert!(blocker.await.unwrap().is_ok());
+        }
+        assert!(state.database_handle().await.is_none());
+        assert!(!state.has_password_verifier().await);
+        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
     }
 
     #[tokio::test]
