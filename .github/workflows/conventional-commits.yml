@@ -4,11 +4,9 @@ on:
   push:
     branches:
       - master
-      - conventional-commit
   pull_request:
     branches:
       - master
-      - conventional-commit
   workflow_dispatch: {}
 
 permissions:
