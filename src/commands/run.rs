@@ -26,7 +26,7 @@ pub struct Args {
         required = true,
         trailing_var_arg = true,
         allow_hyphen_values = true,
-        help = "Command to run after resolving pass:// and op:// references"
+        help = "Command to run after resolving pass:// references"
     )]
     command: Vec<String>,
 }

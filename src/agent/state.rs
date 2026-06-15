@@ -2993,16 +2993,21 @@ impl DatabaseWorker {
 
         let fields: std::collections::HashMap<String, Field> =
             serde_json::from_str(row.fields_json.as_str()).map_err(|_| DbError::Internal)?;
-        if let Some(field) = fields.get(field_name)
-            && matches!(field.field_type, FieldType::Totp)
-        {
-            let bytes = if raw {
-                Zeroizing::new(field.data.as_bytes().to_vec())
-            } else {
-                Zeroizing::new(current_totp(&field.data)?.into_bytes())
-            };
+        if let Some(field) = fields.get(field_name) {
+            if matches!(field.field_type, FieldType::Totp) {
+                let bytes = if raw {
+                    Zeroizing::new(field.data.as_bytes().to_vec())
+                } else {
+                    Zeroizing::new(current_totp(&field.data)?.into_bytes())
+                };
+                return Ok(ReferenceResponse {
+                    body: ReferenceBody::Bytes(bytes),
+                    etag: None,
+                });
+            }
+
             return Ok(ReferenceResponse {
-                body: ReferenceBody::Bytes(bytes),
+                body: ReferenceBody::Bytes(Zeroizing::new(field.data.as_bytes().to_vec())),
                 etag: None,
             });
         }
@@ -3520,6 +3525,9 @@ fn create_item_in(
         .keys()
         .cloned()
         .collect::<std::collections::HashSet<_>>();
+    let mut final_file_names = request_file_names.clone();
+    final_file_names.extend(source_file_map.keys().cloned());
+    validate_field_and_file_name_uniqueness(&fields, &final_file_names)?;
 
     let now = now_timestamp();
     transaction
@@ -3613,6 +3621,15 @@ fn update_item_in(
         .cloned()
         .collect::<std::collections::HashSet<_>>();
     let source_file_map = source_files(transaction, item_id)?;
+    let mut final_file_names = source_file_map
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for name in &removed_file_names {
+        final_file_names.remove(name);
+    }
+    final_file_names.extend(request_file_names.iter().cloned());
+    validate_field_and_file_name_uniqueness(&fields, &final_file_names)?;
     let now = now_timestamp();
     let version_id = create_item_version(transaction, item_id, &fields, now)?;
 
@@ -4776,6 +4793,18 @@ fn validate_unique_name(
     }
 }
 
+fn validate_field_and_file_name_uniqueness(
+    fields: &std::collections::HashMap<String, Field>,
+    file_names: &std::collections::HashSet<String>,
+) -> Result<(), DbError> {
+    if let Some(name) = fields.keys().find(|name| file_names.contains(*name)) {
+        return Err(DbError::BadRequest(format!(
+            "field and file names must be unique: `{name}`"
+        )));
+    }
+    Ok(())
+}
+
 fn update_field_name(entry: &UpdateFieldEntry) -> &str {
     match entry {
         UpdateFieldEntry::Set(field) => &field.name,
@@ -4854,7 +4883,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use data_encoding::BASE32_NOPAD;
-    use tempfile::NamedTempFile;
+    use rusqlite::Connection;
+    use tempfile::{NamedTempFile, TempDir};
     use zeroize::Zeroizing;
 
     use super::{
@@ -4915,6 +4945,115 @@ mod tests {
             })
             .collect();
         *entries = serde_json::Value::Array(named);
+    }
+
+    fn legacy_overlap_database() -> (TempDir, DbHandle) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let database_path = tempdir.path().join("legacy-overlap.db");
+        let mut writer = Connection::open(&database_path).unwrap();
+        writer.pragma_update(None, "foreign_keys", "ON").unwrap();
+        writer
+            .execute_batch(
+                r#"
+                CREATE TABLE dirs (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT UNIQUE NOT NULL,
+                    bitmask INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE items (
+                    id INTEGER PRIMARY KEY,
+                    dir_id INTEGER NOT NULL REFERENCES dirs (id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    bitmask INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    oldest_version_id INTEGER,
+                    latest_version_id INTEGER,
+                    UNIQUE (dir_id, name),
+                    FOREIGN KEY (id, oldest_version_id) REFERENCES item_versions (item_id, version_id) DEFERRABLE INITIALLY DEFERRED,
+                    FOREIGN KEY (id, latest_version_id) REFERENCES item_versions (item_id, version_id) DEFERRABLE INITIALLY DEFERRED
+                );
+                CREATE TABLE item_versions (
+                    version_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE,
+                    fields TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (item_id, version_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE files (
+                    id BLOB PRIMARY KEY,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    nonce BLOB NOT NULL,
+                    tag BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE (sha256)
+                ) WITHOUT ROWID;
+                CREATE TABLE item_version_file_mapping (
+                    item_id INTEGER NOT NULL,
+                    version_id INTEGER NOT NULL,
+                    file_id BLOB NOT NULL REFERENCES files (id) ON DELETE CASCADE,
+                    file_name TEXT NOT NULL,
+                    PRIMARY KEY (item_id, version_id, file_id),
+                    UNIQUE (item_id, version_id, file_name),
+                    FOREIGN KEY (item_id, version_id) REFERENCES item_versions (item_id, version_id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                "#,
+            )
+            .unwrap();
+        let reader = Connection::open(&database_path).unwrap();
+        reader.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let file_id = vec![1u8; 32];
+        let fields = serde_json::json!({
+            "password": {
+                "name": "password",
+                "type": "string",
+                "concealed": true,
+                "data": "field-bytes"
+            }
+        });
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO dirs (id, name, bitmask, created_at, updated_at) VALUES (1, 'dir', 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO items (id, dir_id, name, bitmask, created_at, updated_at, oldest_version_id, latest_version_id) VALUES (1, 1, 'item', 0, 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO item_versions (version_id, item_id, fields, created_at) VALUES (1, 1, ?1, 1)",
+                [fields.to_string()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO files (id, sha256, size, nonce, tag, created_at) VALUES (?1, ?2, 4, ?3, ?4, 1)",
+                (
+                    &file_id,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    vec![2u8; 8],
+                    vec![3u8; 16],
+                ),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO item_version_file_mapping (item_id, version_id, file_id, file_name) VALUES (1, 1, ?1, 'password')",
+                [&file_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        (tempdir, DbHandle::new(writer, vec![reader], PathBuf::new()))
     }
 
     async fn block_reader_workers(
@@ -5653,6 +5792,44 @@ mod tests {
         assert_eq!("alice", field(&item, "username").data);
         assert_eq!("new", field(&item, "password").data);
         assert_eq!(9, file(&item, "notes").size);
+        assert_eq!(
+            b"new".as_slice(),
+            reference_body(
+                database
+                    .get_reference(
+                        "dir".to_owned(),
+                        "item".to_owned(),
+                        "password".to_owned(),
+                        None,
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .as_slice()
+        );
+        assert_eq!(
+            b"old".as_slice(),
+            reference_body(
+                database
+                    .get_reference(
+                        "dir".to_owned(),
+                        "item".to_owned(),
+                        "password".to_owned(),
+                        Some(1),
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .as_slice()
+        );
         assert_eq!(
             b"new notes".as_slice(),
             reference_body(
@@ -6395,6 +6572,25 @@ mod tests {
             .await
             .as_slice()
         );
+        assert_eq!(
+            b"normal-secret".as_slice(),
+            reference_body(
+                database
+                    .get_reference(
+                        "dir".to_owned(),
+                        "normal".to_owned(),
+                        "password".to_owned(),
+                        None,
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .as_slice()
+        );
 
         let masked = database
             .get_item(
@@ -6484,6 +6680,25 @@ mod tests {
                         "dir".to_owned(),
                         "guarded".to_owned(),
                         "notes".to_owned(),
+                        None,
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .as_slice()
+        );
+        assert_eq!(
+            b"guarded-secret".as_slice(),
+            reference_body(
+                database
+                    .get_reference(
+                        "dir".to_owned(),
+                        "guarded".to_owned(),
+                        "password".to_owned(),
                         None,
                         false,
                         true,
@@ -7972,6 +8187,102 @@ mod tests {
         assert_eq!(
             super::DbError::BadRequest("duplicate file name `notes`".to_owned()),
             file_error
+        );
+
+        let overlap_error = database
+            .create_item(
+                "dir".to_owned(),
+                "overlap".to_owned(),
+                item_request(serde_json::json!({
+                    "fields": {
+                        "password": {"type": "string", "data": "one"}
+                    },
+                    "files": {
+                        "password": {"id": file_id}
+                    }
+                }))
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            super::DbError::BadRequest(
+                "field and file names must be unique: `password`".to_owned()
+            ),
+            overlap_error
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_reads_prefer_matching_fields_over_files() {
+        let (_tempdir, database) = legacy_overlap_database();
+
+        assert_eq!(
+            b"field-bytes".as_slice(),
+            reference_body(
+                database
+                    .get_reference(
+                        "dir".to_owned(),
+                        "item".to_owned(),
+                        "password".to_owned(),
+                        None,
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_field_and_file_name_overlap_in_final_item() {
+        let database = DbHandle::test();
+        database.create_dir("dir".to_owned()).await.unwrap();
+        let file_id = database.create_file(b"file-bytes".to_vec()).await.unwrap();
+        let new_file_id = database.create_file(b"new-file".to_vec()).await.unwrap();
+
+        database
+            .create_item(
+                "dir".to_owned(),
+                "item".to_owned(),
+                item_request(serde_json::json!({
+                    "fields": {
+                        "password": {"type": "string", "data": "field-bytes"}
+                    },
+                    "files": {
+                        "notes": {"id": file_id}
+                    }
+                }))
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = database
+            .update_item(
+                "dir".to_owned(),
+                "item".to_owned(),
+                item_request(serde_json::json!({
+                    "files": {
+                        "password": {"id": new_file_id}
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            super::DbError::BadRequest(
+                "field and file names must be unique: `password`".to_owned()
+            ),
+            error
         );
     }
 

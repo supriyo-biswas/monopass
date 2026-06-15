@@ -898,6 +898,22 @@ mod tests {
         let response = router
             .clone()
             .oneshot(request_with_hash(
+                "/api/v1/ref/personal/github/password",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(
+            "application/octet-stream",
+            response.headers()[header::CONTENT_TYPE]
+        );
+        assert!(response.headers().get(header::ETAG).is_none());
+        assert_eq!(b"secret".as_slice(), body_bytes(response).await.as_ref());
+
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/notes",
                 ProcessChainHash::test(1),
             ))
@@ -919,6 +935,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(StatusCode::NOT_FOUND, response.status());
+    }
+
+    #[tokio::test]
+    async fn item_api_rejects_field_and_file_name_collisions() {
+        let state = authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+
+        router
+            .clone()
+            .oneshot(put_request_with_hash(
+                "/api/v1/dir/personal",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+
+        let file_id = json_body(
+            router
+                .clone()
+                .oneshot(bytes_request_with_hash(
+                    "PUT",
+                    "/api/v1/file/upload",
+                    b"notes",
+                    ProcessChainHash::test(1),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second_file_id = json_body(
+            router
+                .clone()
+                .oneshot(bytes_request_with_hash(
+                    "PUT",
+                    "/api/v1/file/upload",
+                    b"new notes",
+                    ProcessChainHash::test(1),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/dir/personal/item/conflict",
+                json!({
+                    "fields": {
+                        "password": {"type": "string", "data": "secret"}
+                    },
+                    "files": {
+                        "password": {"id": file_id}
+                    }
+                }),
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
+        let body = json_body(response).await;
+        assert_eq!("bad_request", body["error"]["code"]);
+        assert_eq!(
+            "field and file names must be unique: `password`",
+            body["error"]["message"]
+        );
+
+        router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/dir/personal/item/github",
+                json!({
+                    "fields": {
+                        "password": {"type": "string", "data": "secret"}
+                    },
+                    "files": {
+                        "notes": {"id": file_id}
+                    }
+                }),
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(json_request_with_hash(
+                "PATCH",
+                "/api/v1/dir/personal/item/github",
+                json!({
+                    "files": {
+                        "password": {"id": second_file_id}
+                    }
+                }),
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
+        let body = json_body(response).await;
+        assert_eq!("bad_request", body["error"]["code"]);
+        assert_eq!(
+            "field and file names must be unique: `password`",
+            body["error"]["message"]
+        );
     }
 
     #[tokio::test]

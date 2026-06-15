@@ -372,7 +372,7 @@ HTTP/1.1 200 OK
 ```
 
 `fields` and `files` are optional arrays. Each entry must include a non-empty
-`name`, and names must be unique within each array.
+`name`, and names must be unique within each array and across both arrays.
 
 Field rules:
 - `type` is one of `"string"`, `"file"`, `"totp"`.
@@ -465,10 +465,12 @@ fields and file mappings as a new item version, points the item at the new
 latest version, and updates `updated_at`.
 
 `fields` and `files` are optional arrays. Each entry must include a non-empty
-unique `name`. Each field entry is either a field object with the same shape
-and validation as create item, or `{ "name": "...", "remove": true }`. Each
-file entry is either `{ "name": "...", "id": "..." }` with the same validation
-as create item, or `{ "name": "...", "remove": true }`.
+unique `name`. Field names and file names must be unique within each array and
+across both arrays in the resulting item version. Each field entry is either a
+field object with the same shape and validation as create item, or
+`{ "name": "...", "remove": true }`. Each file entry is either
+`{ "name": "...", "id": "..." }` with the same validation as create item, or
+`{ "name": "...", "remove": true }`.
 
 Set entries override same-name existing values. Remove entries delete same-name
 existing fields or file mappings from the new version; removing a missing field
@@ -694,6 +696,9 @@ hex SHA-256 of the plaintext file bytes. TOTP references return generated TOTP
 bytes and do not include an `ETag`. Use
 `GET /api/v1/ref/{dirName}/{itemName}/{fieldName}?raw=true` for TOTP references
 to return the stored `otpauth://...` string bytes instead of a generated code.
+Plain string field references return the stored field bytes directly and do not
+include an `ETag`. If a field and file share the same name, the field is
+returned by this endpoint.
 `version` is optional and follows the same validation and retained-version
 lookup rules as `GET /api/v1/dir/{dirName}/item/{itemName}?version={n}`.
 

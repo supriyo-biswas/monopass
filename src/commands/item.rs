@@ -373,6 +373,7 @@ fn build_create_request(
     concealed_fields: Option<Vec<String>>,
     files: Vec<String>,
 ) -> AppResult<CreateItemRequest> {
+    let file_inputs = parse_file_inputs(files)?;
     let mut request = CreateItemRequest::default();
     request.fields = build_fields(
         username,
@@ -382,7 +383,11 @@ fn build_create_request(
         fields,
         concealed_fields,
     )?;
-    for (name, id) in upload_files(client, files)? {
+    validate_field_and_file_name_overlap(
+        request.fields.iter().map(|field| field.name.as_str()),
+        file_inputs.iter().map(|file| file.name.as_str()),
+    )?;
+    for (name, id) in upload_files(client, file_inputs)? {
         request.files.push(FileInput { name, id });
     }
     Ok(request)
@@ -398,6 +403,7 @@ fn build_update_request(
     concealed_fields: Option<Vec<String>>,
     files: Vec<String>,
 ) -> AppResult<UpdateItemRequest> {
+    let file_inputs = parse_file_inputs(files)?;
     let mut request = UpdateItemRequest::default();
     for field in build_fields(
         username,
@@ -414,7 +420,14 @@ fn build_update_request(
             data: field.data,
         }));
     }
-    for (name, id) in upload_files(client, files)? {
+    validate_field_and_file_name_overlap(
+        request.fields.iter().filter_map(|entry| match entry {
+            UpdateFieldEntry::Set(field) => Some(field.name.as_str()),
+            UpdateFieldEntry::Remove(_) => None,
+        }),
+        file_inputs.iter().map(|file| file.name.as_str()),
+    )?;
+    for (name, id) in upload_files(client, file_inputs)? {
         request
             .files
             .push(UpdateFileEntry::Set(UpdateFileSet { name, id }));
@@ -538,7 +551,30 @@ fn push_field(
     Ok(())
 }
 
-fn upload_files(client: &Client<'_>, files: Vec<String>) -> AppResult<Vec<(String, String)>> {
+fn validate_field_and_file_name_overlap<'a>(
+    field_names: impl IntoIterator<Item = &'a str>,
+    file_names: impl IntoIterator<Item = &'a str>,
+) -> AppResult {
+    let file_names: HashSet<&str> = file_names.into_iter().collect();
+    if let Some(name) = field_names
+        .into_iter()
+        .find(|name| file_names.contains(name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("field and file names must be unique: {name}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+struct PendingFileInput {
+    name: String,
+    path: PathBuf,
+}
+
+fn parse_file_inputs(files: Vec<String>) -> AppResult<Vec<PendingFileInput>> {
     let mut output = Vec::new();
     let mut names = HashSet::new();
     for raw in files {
@@ -560,11 +596,24 @@ fn upload_files(client: &Client<'_>, files: Vec<String>) -> AppResult<Vec<(Strin
             )
             .into());
         }
-        let path = PathBuf::from(path);
+        output.push(PendingFileInput {
+            name: name.to_owned(),
+            path: PathBuf::from(path),
+        });
+    }
+    Ok(output)
+}
+
+fn upload_files(
+    client: &Client<'_>,
+    files: Vec<PendingFileInput>,
+) -> AppResult<Vec<(String, String)>> {
+    let mut output = Vec::new();
+    for PendingFileInput { name, path } in files {
         let bytes = Zeroizing::new(fs::read(&path)?);
         let response: CreateFileResponse =
             client.put_bytes_json(&api_path("/file/upload"), bytes)?;
-        output.push((name.to_owned(), response.id));
+        output.push((name, response.id));
     }
     Ok(output)
 }
@@ -595,7 +644,8 @@ mod tests {
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
-        FieldType, build_fields, human_size, remove_item_is_permanent_delete, write_human_item,
+        FieldType, build_fields, human_size, remove_item_is_permanent_delete,
+        validate_field_and_file_name_overlap, write_human_item,
     };
     use crate::secret::SecretString;
 
@@ -731,6 +781,20 @@ mod tests {
 
         assert_eq!(1, fields.len());
         assert_eq!(Some(false), fields[0].concealed);
+    }
+
+    #[test]
+    fn field_and_file_names_must_not_overlap() {
+        let error = validate_field_and_file_name_overlap(
+            ["password"].iter().copied(),
+            ["password"].iter().copied(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            "field and file names must be unique: password",
+            error.to_string()
+        );
     }
 
     #[test]

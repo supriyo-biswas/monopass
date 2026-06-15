@@ -115,6 +115,11 @@ Use `GET /api/v1/ref/{dirName}/{itemName}/{fieldOrFileName}` to stream a field
 or file value to stdout or `--out-file`. The argument may be prefixed with
 `pass://` or `op://` without changing behavior.
 
+Plain string fields are returned as their stored bytes. TOTP fields still
+return generated codes by default, and `?raw=true` on a TOTP reference returns
+the stored `otpauth://...` payload bytes. If a field and file share a name, the
+field wins.
+
 If the reference read returns `403 access_denied`, retry the original reference
 request once with the prompted master password bearer after a successful unlock.
 
@@ -210,7 +215,8 @@ Build a `CreateItemRequest` and send
   with `concealed: true`; other fields are sent with `concealed: false`.
 - `--file name=path` uploads each path with `PUT /api/v1/file/upload`, then
   attaches returned IDs in the item request.
-- Duplicate field names or duplicate file names in one command fail locally.
+- Duplicate field names, duplicate file names, or a field and file with the
+  same name in one command fail locally.
 - `pwgenspec` is a comma-separated password generation specification described
   later.
 
@@ -230,8 +236,9 @@ monopass edit <dir>/<item>
 Build the same partial request shape as `add` and send
 `PATCH /api/v1/dir/{dirName}/item/{itemName}` to update the item. The API
 merges supplied fields and files with the existing item and stores a new
-version. Omitted fields and files are retained. Fields or files deleted during
-editing are sent as update-only removal entries, for example
+version. Omitted fields and files are retained. Field and file names must stay
+unique in the resulting item version. Fields or files deleted during editing
+are sent as update-only removal entries, for example
 `{ "name": "old_password", "remove": true }`.
 
 ## remove command
