@@ -149,25 +149,9 @@ fn linux_parent_pid_from_stat(stat: &str) -> Option<i32> {
 #[cfg(target_os = "macos")]
 impl ProcessResolver for PlatformProcessResolver {
     fn parent_pid(&self, pid: i32) -> Option<i32> {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        let result = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-
-        if result == size {
-            i32::try_from(unsafe { info.assume_init() }.pbi_ppid).ok()
-        } else if pid == 1 {
-            Some(0)
-        } else {
-            None
-        }
+        macos_parent_pid_from_bsd_info(pid)
+            .or_else(|| macos_parent_pid_from_short_bsd_info(pid))
+            .or_else(|| (pid == 1).then_some(0))
     }
 
     fn exe_path(&self, pid: i32) -> Option<PathBuf> {
@@ -185,6 +169,63 @@ impl ProcessResolver for PlatformProcessResolver {
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn proc_pidpath(pid: libc::pid_t, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_pid_from_bsd_info(pid: i32) -> Option<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+
+    (result == size)
+        .then(|| i32::try_from(unsafe { info.assume_init() }.pbi_ppid).ok())
+        .flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_pid_from_short_bsd_info(pid: i32) -> Option<i32> {
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+
+    #[repr(C)]
+    struct ProcBsdShortInfo {
+        pbsi_pid: u32,
+        pbsi_ppid: u32,
+        pbsi_pgid: u32,
+        pbsi_status: u32,
+        pbsi_comm: [libc::c_char; libc::MAXCOMLEN],
+        pbsi_flags: u32,
+        pbsi_uid: libc::uid_t,
+        pbsi_gid: libc::gid_t,
+        pbsi_ruid: libc::uid_t,
+        pbsi_rgid: libc::gid_t,
+        pbsi_svuid: libc::uid_t,
+        pbsi_svgid: libc::gid_t,
+        pbsi_rfu: u32,
+    }
+
+    let mut info = std::mem::MaybeUninit::<ProcBsdShortInfo>::uninit();
+    let size = std::mem::size_of::<ProcBsdShortInfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+
+    (result == size)
+        .then(|| i32::try_from(unsafe { info.assume_init() }.pbsi_ppid).ok())
+        .flatten()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -345,6 +386,21 @@ mod tests {
             .with(9, 1, "/shell");
 
         assert!(super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_platform_resolver_hashes_current_process_chain() {
+        let resolver = super::PlatformProcessResolver;
+
+        assert!(
+            super::hash_verified_client_chain_with_resolver(
+                std::process::id() as i32,
+                "/not/the/current/test/binary",
+                &resolver,
+            )
+            .is_some()
+        );
     }
 
     #[test]
