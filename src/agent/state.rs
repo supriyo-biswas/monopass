@@ -5797,8 +5797,8 @@ mod tests {
             reference_body(
                 database
                     .get_reference(
-                        "dir".to_owned(),
-                        "item".to_owned(),
+                        "dest".to_owned(),
+                        "copy".to_owned(),
                         "password".to_owned(),
                         None,
                         false,
@@ -5816,10 +5816,10 @@ mod tests {
             reference_body(
                 database
                     .get_reference(
-                        "dir".to_owned(),
+                        "source".to_owned(),
                         "item".to_owned(),
                         "password".to_owned(),
-                        Some(1),
+                        None,
                         false,
                         false,
                     )
