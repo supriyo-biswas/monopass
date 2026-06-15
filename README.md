@@ -12,6 +12,13 @@ monopass is a local-first password manager and credential storage daemon that st
 * **Automatic session caching:** Prevent repeated password prompts. Enter your master password once, and the requesting process chain is trusted for 15 minutes (configurable).
 * **CLI-native:** Automate workflows easily by integrating the command-line interface directly into your scripts.
 
+## Getting started
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/supriyo-biswas/monopass/master/install.sh | sh
+monopass init
+```
+
 ## License
 
 This project is licensed under the MIT license. See the [LICENSE file](LICENSE) for details.
