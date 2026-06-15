@@ -251,7 +251,9 @@ With `--force`, permanently delete the item with
 For directory paths, non-recursive removal uses `rmdir` behavior.
 `--recursive` lists items with `GET /api/v1/dir/{dirName}/items`, soft-deletes
 or permanently deletes each item depending on `--force`, then deletes the
-directory with `DELETE /api/v1/dir/{dirName}`.
+directory with `DELETE /api/v1/dir/{dirName}`. `rm -r Trash` is the exception:
+it permanently deletes the listed Trash items and leaves the reserved `Trash`
+directory in place.
 
 ## copy command
 

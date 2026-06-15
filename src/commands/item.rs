@@ -221,6 +221,9 @@ pub fn remove(config: &Config, args: RemoveArgs) -> AppResult {
                 for item in super::dir::list_all_items(&client, &dir)? {
                     remove_item(&client, &dir, &item.name, args.force)?;
                 }
+                if !remove_dir_after_recursive_delete(&dir) {
+                    return Ok(());
+                }
             }
             client.delete_empty(&api_path(&format!("/dir/{}", path_component(&dir))))
         }
@@ -612,6 +615,12 @@ mod tests {
     }
 
     #[test]
+    fn recursive_trash_remove_empties_without_deleting_trash_dir() {
+        assert!(!super::remove_dir_after_recursive_delete("Trash"));
+        assert!(super::remove_dir_after_recursive_delete("Personal"));
+    }
+
+    #[test]
     fn human_item_output_lists_fields_and_files_by_name() {
         let item = ItemResponse {
             name: "github".to_owned(),
@@ -737,4 +746,8 @@ mod tests {
 #[cfg(test)]
 fn remove_item_is_permanent_delete(dir: &str, force: bool) -> bool {
     force || dir == "Trash"
+}
+
+fn remove_dir_after_recursive_delete(dir: &str) -> bool {
+    dir != "Trash"
 }
