@@ -83,7 +83,7 @@ fn stop_agent_instructions_for(platform: StopAgentPlatform) -> &'static str {
             "monopass agent is running. Stop it with `systemctl --user stop monopass-agent.socket monopass-agent.service`, then retry `monopass passwd`."
         }
         StopAgentPlatform::Macos => {
-            "monopass agent is running. Stop it with `launchctl bootout gui/$(id -u) com.monopass.agent`, then retry `monopass passwd`."
+            "monopass agent is running. Stop it with `launchctl bootout gui/$(id -u)/com.monopass.agent`, then retry `monopass passwd`."
         }
         StopAgentPlatform::OtherUnix => {
             "monopass agent is running. Stop any running `monopass agent` process, then retry `monopass passwd`."
@@ -127,7 +127,7 @@ mod tests {
     fn macos_stop_instructions_use_launchctl() {
         let instructions = stop_agent_instructions_for(StopAgentPlatform::Macos);
 
-        assert!(instructions.contains("launchctl bootout gui/$(id -u) com.monopass.agent"));
+        assert!(instructions.contains("launchctl bootout gui/$(id -u)/com.monopass.agent"));
         assert!(instructions.contains("monopass passwd"));
     }
 
