@@ -18,8 +18,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run tests
+        run: cargo test --locked
+
   build:
     name: Build ${{ matrix.artifact_name }}
+    needs: unit-tests
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -31,19 +53,16 @@ jobs:
             artifact_name: linux-x86_64
             binary_path: target/x86_64-unknown-linux-musl/release/monopass
             linux: true
-            run_tests: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact_name: linux-aarch64
             binary_path: target/aarch64-unknown-linux-musl/release/monopass
             linux: true
-            run_tests: false
           - runner: macos-15
             target: aarch64-apple-darwin
             artifact_name: darwin-arm64
             binary_path: target/aarch64-apple-darwin/release/monopass
             linux: false
-            run_tests: false
 
     steps:
       - name: Checkout
@@ -73,10 +92,6 @@ jobs:
           key: cargo-target-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-target-${{ matrix.target }}-
-
-      - name: Run tests
-        if: matrix.run_tests
-        run: cargo test --locked
 
       - name: Build release binary
         env:
