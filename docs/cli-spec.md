@@ -250,6 +250,12 @@ monopass rm <dir>[/<item>] --force --recursive
 For item paths, the default behavior is a soft delete: move the item to
 `Trash` with
 `PUT /api/v1/dir/Trash/item/{itemName}?move_from={dirName}/{itemName}`.
+If that move fails because an item already exists at `Trash/{itemName}`, retry
+with `Trash/{itemName} {created_at}` where `created_at` is the source item's
+original creation timestamp. If that also exists, retry once more with
+`Trash/{itemName} {created_at} {dddddd}` where `dddddd` is six random decimal
+digits. Long item names are truncated as needed so generated Trash names remain
+within the API item-name limit.
 If the source item is already in `Trash`, the command skips the move and
 permanently deletes it instead.
 With `--force`, permanently delete the item with

@@ -11,7 +11,7 @@ use crate::conceal::inferred_concealed;
 use crate::config::Config;
 use crate::secret::SecretString;
 
-use super::client::{AuthMode, Client, api_path, path_component, query_value};
+use super::client::{ApiError, AuthMode, Client, api_path, path_component, query_value};
 use super::models::{
     CreateField, CreateFileResponse, CreateItemRequest, FieldType, FileInput, ItemResponse,
     ItemVersionSummaryResponse, PaginatedResponse, RemoveEntry, UpdateFieldEntry, UpdateFieldSet,
@@ -354,13 +354,71 @@ fn remove_item(client: &Client<'_>, dir: &str, item: &str, force: bool) -> AppRe
             path_component(item)
         )))
     } else {
-        client.put_empty(&api_path(&format!(
-            "/dir/Trash/item/{}?move_from={}/{}",
-            path_component(item),
-            query_value(dir),
-            query_value(item)
-        )))
+        let source = item_metadata(client, dir, item)?;
+        match move_item_to_trash(client, dir, item, item) {
+            Ok(()) => Ok(()),
+            Err(error) if is_item_exists_conflict(error.as_ref()) => {
+                let fallback = trash_fallback_name(item, &source.created_at, None);
+                match move_item_to_trash(client, dir, item, &fallback) {
+                    Ok(()) => Ok(()),
+                    Err(error) if is_item_exists_conflict(error.as_ref()) => {
+                        let fallback =
+                            trash_fallback_name(item, &source.created_at, Some(&random_digits()?));
+                        move_item_to_trash(client, dir, item, &fallback)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn item_metadata(client: &Client<'_>, dir: &str, item: &str) -> AppResult<ItemResponse> {
+    client.get_json(&api_path(&format!(
+        "/dir/{}/item/{}",
+        path_component(dir),
+        path_component(item)
+    )))
+}
+
+fn move_item_to_trash(
+    client: &Client<'_>,
+    source_dir: &str,
+    source_item: &str,
+    destination_item: &str,
+) -> AppResult {
+    client.put_empty(&api_path(&format!(
+        "/dir/Trash/item/{}?move_from={}/{}",
+        path_component(destination_item),
+        query_value(source_dir),
+        query_value(source_item)
+    )))
+}
+
+fn is_item_exists_conflict(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<ApiError>().is_some_and(|error| {
+        error.status == 409 && error.code == "conflict" && error.message == "item already exists"
+    })
+}
+
+fn trash_fallback_name(item: &str, created_at: &str, random_suffix: Option<&str>) -> String {
+    const MAX_ITEM_NAME_CHARS: usize = 255;
+
+    let suffix = match random_suffix {
+        Some(random_suffix) => format!(" {created_at} {random_suffix}"),
+        None => format!(" {created_at}"),
+    };
+    let suffix_chars = suffix.chars().count();
+    let max_item_chars = MAX_ITEM_NAME_CHARS.saturating_sub(suffix_chars);
+    let truncated_item: String = item.chars().take(max_item_chars).collect();
+    format!("{truncated_item}{suffix}")
+}
+
+fn random_digits() -> io::Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(format!("{:06}", u64::from_ne_bytes(bytes) % 1_000_000))
 }
 
 fn build_create_request(
@@ -641,11 +699,13 @@ fn prompt_confirmed_password() -> io::Result<Zeroizing<String>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::client::ApiError;
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
-        FieldType, build_fields, human_size, remove_item_is_permanent_delete,
-        validate_field_and_file_name_overlap, write_human_item,
+        FieldType, build_fields, human_size, is_item_exists_conflict, random_digits,
+        remove_item_is_permanent_delete, trash_fallback_name, validate_field_and_file_name_overlap,
+        write_human_item,
     };
     use crate::secret::SecretString;
 
@@ -668,6 +728,66 @@ mod tests {
     fn recursive_trash_remove_empties_without_deleting_trash_dir() {
         assert!(!super::remove_dir_after_recursive_delete("Trash"));
         assert!(super::remove_dir_after_recursive_delete("Personal"));
+    }
+
+    #[test]
+    fn detects_item_exists_conflicts() {
+        let error = ApiError {
+            status: 409,
+            code: "conflict".to_owned(),
+            message: "item already exists".to_owned(),
+        };
+
+        assert!(is_item_exists_conflict(&error));
+    }
+
+    #[test]
+    fn ignores_other_api_errors_for_trash_retry() {
+        let wrong_message = ApiError {
+            status: 409,
+            code: "conflict".to_owned(),
+            message: "directory already exists".to_owned(),
+        };
+        let wrong_status = ApiError {
+            status: 404,
+            code: "not_found".to_owned(),
+            message: "item not found".to_owned(),
+        };
+
+        assert!(!is_item_exists_conflict(&wrong_message));
+        assert!(!is_item_exists_conflict(&wrong_status));
+    }
+
+    #[test]
+    fn trash_fallback_name_uses_created_at() {
+        assert_eq!(
+            "test 2026-06-07T01:23:45Z",
+            trash_fallback_name("test", "2026-06-07T01:23:45Z", None)
+        );
+    }
+
+    #[test]
+    fn trash_fallback_name_uses_created_at_and_random_digits() {
+        assert_eq!(
+            "test 2026-06-07T01:23:45Z 123456",
+            trash_fallback_name("test", "2026-06-07T01:23:45Z", Some("123456"))
+        );
+    }
+
+    #[test]
+    fn trash_fallback_name_truncates_long_item_names() {
+        let name = trash_fallback_name(&"a".repeat(260), "2026-06-07T01:23:45Z", Some("123456"));
+
+        assert_eq!(255, name.chars().count());
+        assert!(name.ends_with(" 2026-06-07T01:23:45Z 123456"));
+    }
+
+    #[test]
+    fn random_suffix_has_six_digits() {
+        let suffix = random_digits().unwrap();
+
+        assert_eq!(6, suffix.len());
+        assert!(suffix.chars().all(|character| character.is_ascii_digit()));
     }
 
     #[test]
