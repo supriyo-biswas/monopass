@@ -244,34 +244,50 @@ are sent as update-only removal entries, for example
 ## remove command
 
 ```
-monopass rm <dir>[/<item>] --force --recursive
+monopass rm [-g|--globoff] [-f|--force] [-r|--recursive] <dir>[/<item-glob>]
 ```
 
-For item paths, the default behavior is a soft delete: move the item to
+For item paths, the item component is a case-sensitive SQLite glob by default.
+The command lists every match before deleting any of them. If there are no
+matches, it fails without mutation. `-g`/`--globoff` treats the item component
+as an exact name, including literal `*`, `?`, and bracket expressions.
+
+The default behavior is a soft delete: move each matched item to
 `Trash` with
 `PUT /api/v1/dir/Trash/item/{itemName}?move_from={dirName}/{itemName}`.
 If that move fails because an item already exists at `Trash/{itemName}`, retry
-with `Trash/{itemName} {created_at}` where `created_at` is the source item's
-original creation timestamp. If that also exists, retry once more with
-`Trash/{itemName} {created_at} {dddddd}` where `dddddd` is six random decimal
-digits. Long item names are truncated as needed so generated Trash names remain
+with `Trash/{itemName} ({created_at})` where `created_at` is the source item's
+original creation timestamp. If that also exists, list matching Trash items in
+descending order with `count=1` and retry with
+`Trash/{itemName} ({created_at},NNN)`, where `NNN` starts at `001` and increments
+to `999`. Concurrent conflicts repeat the lookup. Fail when `999` is already in
+use. Long item names are truncated as needed so generated Trash names remain
 within the API item-name limit.
 If the source item is already in `Trash`, the command skips the move and
 permanently deletes it instead.
 With `--force`, permanently delete the item with
 `DELETE /api/v1/dir/{dirName}/item/{itemName}`.
 
-For directory paths, non-recursive removal uses `rmdir` behavior.
-`--recursive` lists items with `GET /api/v1/dir/{dirName}/items`, soft-deletes
+Directory paths require `--recursive`; use `rmdir` to remove an empty directory
+without recursively removing its contents. Recursive removal lists items with
+`GET /api/v1/dir/{dirName}/items`, soft-deletes
 or permanently deletes each item depending on `--force`, then deletes the
 directory with `DELETE /api/v1/dir/{dirName}`. `rm -r Trash` is the exception:
 it permanently deletes the listed Trash items and leaves the reserved `Trash`
 directory in place.
 
+Quote patterns to prevent shell expansion:
+
+```sh
+monopass rm 'Work/Git*'
+monopass rm --force 'Work/old-??'
+monopass rm --globoff 'Work/literal*[name]'
+```
+
 ## copy command
 
 ```
-monopass cp [-r|--recursive] <source>... <dest>
+monopass cp [-g|--globoff] [-r|--recursive] <source>... <dest>
 ```
 
 Copy item sources with
@@ -279,22 +295,27 @@ Copy item sources with
 The command sends an empty create-item JSON body and relies on the API to copy
 the source item fields and files. Source version history is not copied.
 
-Without `--recursive`, every source must be an item path in `<dir>/<item>`
-form. With `--recursive`, a source may also be a directory path; directory
+Every item source component is a case-sensitive SQLite glob by default and is
+expanded through ListItems before copying starts. `-g`/`--globoff` treats item
+source components as exact names. Directory names and destinations are always
+literal. With `--recursive`, a source may also be a directory path; directory
 sources are expanded by listing non-hidden items through
 `GET /api/v1/dir/{sourceDirName}/items?count=200...`.
+Any glob or recursive directory source matching no items fails before mutation.
+Overlapping source patterns are deduplicated while preserving first-match order.
 
 Destination behavior:
 - one item source plus `<dir>/<item>` destination copies to that exact item path
 - one item source plus `<dir>` destination preserves the source item name
-- multiple sources, or any recursive directory source, require a directory
+- multiple expanded items, or any recursive directory source, require a directory
   destination and preserve each source item name
 
 Examples:
 
 ```sh
 monopass cp Work/Github Personal/Github
-monopass cp Work/Github Fun/Steam Personal
+monopass cp 'Work/Git*' 'Fun/Steam?' Personal
+monopass cp --globoff 'Work/literal*' Personal
 monopass cp -r Work Personal
 ```
 
@@ -303,7 +324,7 @@ No rollback is attempted. If a later copy fails, earlier copies remain applied.
 ## move command
 
 ```
-monopass mv [-r|--recursive] <source>... <dest>
+monopass mv [-g|--globoff] [-r|--recursive] <source>... <dest>
 ```
 
 Move item sources with
@@ -311,7 +332,8 @@ Move item sources with
 The command sends an empty body. The API changes the item directory/name
 without creating a new version.
 
-Path handling is the same as `cp`: non-recursive sources must be item paths;
+Path handling is the same as `cp`: item source components are case-sensitive
+SQLite globs unless `-g`/`--globoff` is set; destinations remain literal;
 recursive directory sources are expanded by listing non-hidden items through
 the agent; multiple sources or recursive directory sources require a directory
 destination and preserve source item names. Recursive move moves the listed
@@ -321,7 +343,8 @@ Examples:
 
 ```sh
 monopass mv Work/Github Personal/Github
-monopass mv Work/Github Fun/Steam Personal
+monopass mv 'Work/Git*' 'Fun/Steam?' Personal
+monopass mv --globoff 'Work/literal*' Personal
 monopass mv -r Work Personal
 ```
 
@@ -330,12 +353,14 @@ No rollback is attempted. If a later move fails, earlier moves remain applied.
 ## list command
 
 ```
-monopass ls [<dir>]
+monopass ls [<dir>[/<glob>]]
 ```
 
 Without an argument, list directories with `GET /api/v1/dirs`. With `<dir>`,
-list item names with `GET /api/v1/dir/{dirName}/items`. Output is one name per
-line.
+list all item names with `GET /api/v1/dir/{dirName}/items`. With `<dir>/<glob>`,
+pass the case-sensitive SQLite glob to ListItems and print only matching names.
+Output is one name per line. Quote patterns to prevent shell expansion, for
+example `monopass ls 'Personal/*Github*'`.
 
 ## list versions command
 

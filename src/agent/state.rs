@@ -27,7 +27,7 @@ use super::models::{
     ContactResponse, CreateContactRequest, CreateField, CreateItemRequest, DirResponse, Field,
     FieldEntry, FieldType, FileInput, FileMetadata, FileMetadataEntry, ItemResponse,
     ItemSummaryResponse, ItemVersionSummaryResponse, JobErrorResponse, JobResponse, JobStatus,
-    JobTarget, JobType, PaginatedResponse, UpdateContactRequest, UpdateDirRequest,
+    JobTarget, JobType, ListDirection, PaginatedResponse, UpdateContactRequest, UpdateDirRequest,
     UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
 };
 use super::process::ProcessChainHash;
@@ -807,11 +807,11 @@ impl DbHandle {
     pub async fn list_items(
         &self,
         dir_name: String,
-        page: PageRequest,
+        request: ItemListRequest,
     ) -> Result<PaginatedResponse<ItemSummaryResponse>, DbError> {
         self.request_reader(|reply| DbCommand::ListItems {
             dir_name,
-            page,
+            request,
             reply,
         })
         .await
@@ -1389,12 +1389,24 @@ pub struct PageRequest {
     pub marker: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemListRequest {
+    pub page: PageRequest,
+    pub glob: Option<String>,
+    pub direction: ListDirection,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageMarkerScope {
     Dirs,
     Contacts,
-    Items { dir_id: i64 },
-    ItemVersions { item_id: i64 },
+    Items {
+        dir_id: i64,
+        query_hash: Option<[u8; 32]>,
+    },
+    ItemVersions {
+        item_id: i64,
+    },
 }
 
 impl PageMarkerScope {
@@ -1402,9 +1414,12 @@ impl PageMarkerScope {
         match self {
             Self::Dirs => b"monopass:dirs".to_vec(),
             Self::Contacts => b"monopass:contacts".to_vec(),
-            Self::Items { dir_id } => {
+            Self::Items { dir_id, query_hash } => {
                 let mut data = b"monopass:items:".to_vec();
                 data.extend_from_slice(&dir_id.to_be_bytes());
+                if let Some(query_hash) = query_hash {
+                    data.extend_from_slice(&query_hash);
+                }
                 data
             }
             Self::ItemVersions { item_id } => {
@@ -1489,7 +1504,7 @@ enum DbCommand {
     },
     ListItems {
         dir_name: String,
-        page: PageRequest,
+        request: ItemListRequest,
         reply: oneshot::Sender<Result<PaginatedResponse<ItemSummaryResponse>, DbError>>,
     },
     ListItemVersions {
@@ -1732,10 +1747,10 @@ impl DatabaseWorker {
             }
             DbCommand::ListItems {
                 dir_name,
-                page,
+                request,
                 reply,
             } => {
-                let _ = reply.send(self.list_items(&dir_name, page));
+                let _ = reply.send(self.list_items(&dir_name, request));
             }
             DbCommand::ListItemVersions {
                 dir_name,
@@ -2719,19 +2734,27 @@ impl DatabaseWorker {
     fn list_items(
         &self,
         dir_name: &str,
-        page: PageRequest,
+        request: ItemListRequest,
     ) -> Result<PaginatedResponse<ItemSummaryResponse>, DbError> {
         let dir_id =
             dir_id_in(&self.connection, dir_name)?.ok_or_else(|| dir_not_found(dir_name))?;
-        let limit = page_limit(page.count)?;
-        let marker_name = match page.marker {
+        let limit = page_limit(request.page.count)?;
+        let marker_scope = item_marker_scope(dir_id, request.glob.as_deref(), request.direction);
+        let marker_name = match request.page.marker {
             Some(marker) => {
-                let id = self.decrypt_page_marker(&marker, PageMarkerScope::Items { dir_id })?;
+                let id = self.decrypt_page_marker(&marker, marker_scope)?;
                 Some(
                     self.connection
                         .query_row(
-                            "SELECT name FROM items WHERE dir_id = ?1 AND id = ?2 AND (bitmask & ?3) = 0",
-                            (dir_id, id, ITEM_HIDDEN),
+                            r#"
+                            SELECT name
+                            FROM items
+                            WHERE dir_id = ?1
+                              AND id = ?2
+                              AND (?3 IS NULL OR name GLOB ?3)
+                              AND (bitmask & ?4) = 0
+                            "#,
+                            (dir_id, id, request.glob.as_deref(), ITEM_HIDDEN),
                             |row| row.get::<_, String>(0),
                         )
                         .optional()
@@ -2748,17 +2771,35 @@ impl DatabaseWorker {
                 SELECT id, name, created_at, updated_at
                 FROM items
                 WHERE dir_id = ?1
-                  AND (?2 IS NULL OR name >= ?2)
-                  AND (bitmask & ?4) = 0
-                ORDER BY name
-                LIMIT ?3
+                  AND (
+                    ?2 IS NULL
+                    OR (?5 = 0 AND name >= ?2)
+                    OR (?5 = 1 AND name <= ?2)
+                  )
+                  AND (?3 IS NULL OR name GLOB ?3)
+                  AND (bitmask & ?6) = 0
+                ORDER BY
+                  CASE WHEN ?5 = 0 THEN name END ASC,
+                  CASE WHEN ?5 = 1 THEN name END DESC
+                LIMIT ?4
                 "#,
             )
             .map_err(|_| DbError::Internal)?;
         let sql_limit = i64::try_from(limit + 1).map_err(|_| DbError::Internal)?;
+        let direction = match request.direction {
+            ListDirection::Asc => 0_i64,
+            ListDirection::Desc => 1_i64,
+        };
         let rows = statement
             .query_map(
-                (dir_id, marker_name.as_deref(), sql_limit, ITEM_HIDDEN),
+                (
+                    dir_id,
+                    marker_name.as_deref(),
+                    request.glob.as_deref(),
+                    sql_limit,
+                    direction,
+                    ITEM_HIDDEN,
+                ),
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -2776,7 +2817,7 @@ impl DatabaseWorker {
             .map_err(|_| DbError::Internal)?;
         let next_marker = if rows.len() > limit {
             let (id, _) = rows.pop().ok_or(DbError::Internal)?;
-            Some(self.encrypt_page_marker(id, PageMarkerScope::Items { dir_id })?)
+            Some(self.encrypt_page_marker(id, marker_scope)?)
         } else {
             None
         };
@@ -3394,6 +3435,28 @@ impl DatabaseWorker {
             .map_err(|_| DbError::Internal)?;
         Ok(value != 0)
     }
+}
+
+fn item_marker_scope(dir_id: i64, glob: Option<&str>, direction: ListDirection) -> PageMarkerScope {
+    let query_hash = if glob.is_none() && direction == ListDirection::Asc {
+        None
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(match direction {
+            ListDirection::Asc => b"asc".as_slice(),
+            ListDirection::Desc => b"desc".as_slice(),
+        });
+        hasher.update([0]);
+        match glob {
+            Some(glob) => {
+                hasher.update([1]);
+                hasher.update(glob.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        Some(hasher.finalize().into())
+    };
+    PageMarkerScope::Items { dir_id, query_hash }
 }
 
 fn bitmask_has(bitmask: i64, flag: i64) -> bool {
@@ -4889,8 +4952,9 @@ mod tests {
 
     use super::{
         AgentState, AuthCache, CreateContactRequest, CreateItemRequest, DATABASE_READER_WORKERS,
-        DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES,
-        PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest,
+        DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest, ListDirection,
+        MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PageRequest,
+        UnlockError, UpdateContactRequest,
     };
     use crate::agent::process::ProcessChainHash;
 
@@ -6255,7 +6319,7 @@ mod tests {
             .await
             .unwrap();
         database
-            .list_items("dir".to_owned(), default_page())
+            .list_items("dir".to_owned(), default_item_list_request())
             .await
             .unwrap();
 
@@ -6314,9 +6378,13 @@ mod tests {
         let first = database
             .list_items(
                 "work".to_owned(),
-                PageRequest {
-                    count: 1,
-                    marker: None,
+                ItemListRequest {
+                    page: PageRequest {
+                        count: 1,
+                        marker: None,
+                    },
+                    glob: None,
+                    direction: ListDirection::Asc,
                 },
             )
             .await
@@ -6327,9 +6395,13 @@ mod tests {
         let second = database
             .list_items(
                 "work".to_owned(),
-                PageRequest {
-                    count: 2,
-                    marker: Some(marker.clone()),
+                ItemListRequest {
+                    page: PageRequest {
+                        count: 2,
+                        marker: Some(marker.clone()),
+                    },
+                    glob: None,
+                    direction: ListDirection::Asc,
                 },
             )
             .await
@@ -6340,14 +6412,96 @@ mod tests {
         let error = database
             .list_items(
                 "home".to_owned(),
-                PageRequest {
-                    count: 1,
-                    marker: Some(marker),
+                ItemListRequest {
+                    page: PageRequest {
+                        count: 1,
+                        marker: Some(marker),
+                    },
+                    glob: None,
+                    direction: ListDirection::Asc,
                 },
             )
             .await
             .unwrap_err();
         assert_eq!(DbError::BadRequest("invalid marker".to_owned()), error);
+    }
+
+    #[tokio::test]
+    async fn list_items_filters_globs_and_paginates_descending() {
+        let database = DbHandle::test();
+        database.create_dir("work".to_owned()).await.unwrap();
+        for name in ["Gitlab", "Github 001", "Github 002", "github lower"] {
+            database
+                .create_item(
+                    "work".to_owned(),
+                    name.to_owned(),
+                    item_request(serde_json::json!({})).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = database
+            .list_items(
+                "work".to_owned(),
+                ItemListRequest {
+                    page: PageRequest {
+                        count: 1,
+                        marker: None,
+                    },
+                    glob: Some("*Github*".to_owned()),
+                    direction: ListDirection::Desc,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(vec!["Github 002"], item_names(&first.entries));
+        let marker = first.next_marker.unwrap();
+
+        let second = database
+            .list_items(
+                "work".to_owned(),
+                ItemListRequest {
+                    page: PageRequest {
+                        count: 1,
+                        marker: Some(marker.clone()),
+                    },
+                    glob: Some("*Github*".to_owned()),
+                    direction: ListDirection::Desc,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(vec!["Github 001"], item_names(&second.entries));
+        assert_eq!(None, second.next_marker);
+
+        for request in [
+            ItemListRequest {
+                page: PageRequest {
+                    count: 1,
+                    marker: Some(marker.clone()),
+                },
+                glob: Some("*Git*".to_owned()),
+                direction: ListDirection::Desc,
+            },
+            ItemListRequest {
+                page: PageRequest {
+                    count: 1,
+                    marker: Some(marker.clone()),
+                },
+                glob: Some("*Github*".to_owned()),
+                direction: ListDirection::Asc,
+            },
+        ] {
+            assert_eq!(
+                DbError::BadRequest("invalid marker".to_owned()),
+                database
+                    .list_items("work".to_owned(), request)
+                    .await
+                    .unwrap_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -6392,7 +6546,7 @@ mod tests {
             Vec::<&str>::new(),
             item_names(
                 &database
-                    .list_items("dir".to_owned(), default_page())
+                    .list_items("dir".to_owned(), default_item_list_request())
                     .await
                     .unwrap()
                     .entries
@@ -6915,7 +7069,7 @@ mod tests {
             vec!["item", "moved"],
             item_names(
                 &database
-                    .list_items("hidden".to_owned(), default_page())
+                    .list_items("hidden".to_owned(), default_item_list_request())
                     .await
                     .unwrap()
                     .entries
@@ -6951,7 +7105,7 @@ mod tests {
             vec!["AgePublicKey"],
             item_names(
                 &database
-                    .list_items("_Internal".to_owned(), default_page())
+                    .list_items("_Internal".to_owned(), default_item_list_request())
                     .await
                     .unwrap()
                     .entries
@@ -8995,6 +9149,14 @@ mod tests {
         PageRequest {
             count: 50,
             marker: None,
+        }
+    }
+
+    fn default_item_list_request() -> ItemListRequest {
+        ItemListRequest {
+            page: default_page(),
+            glob: None,
+            direction: ListDirection::Asc,
         }
     }
 

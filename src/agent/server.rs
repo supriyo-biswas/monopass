@@ -1579,7 +1579,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        for name in ["zulu", "alpha"] {
+        for name in ["zulu", "alpha", "github-match"] {
             router
                 .clone()
                 .oneshot(json_request_with_hash(
@@ -1605,6 +1605,7 @@ mod tests {
         let marker = body["next_marker"].as_str().unwrap();
 
         let response = router
+            .clone()
             .oneshot(request_with_hash(
                 &format!("/api/v1/dir/personal/items?count=1&marker={marker}"),
                 ProcessChainHash::test(1),
@@ -1612,8 +1613,29 @@ mod tests {
             .await
             .unwrap();
         let body = json_body(response).await;
-        assert_eq!("zulu", body["entries"][0]["name"]);
+        assert_eq!("github-match", body["entries"][0]["name"]);
+        assert!(body["next_marker"].is_string());
+
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
+                "/api/v1/dir/personal/items?glob=*github*&dir=desc",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        assert_eq!("github-match", body["entries"][0]["name"]);
         assert_eq!(serde_json::Value::Null, body["next_marker"]);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/dir/personal/items?dir=sideways",
+                ProcessChainHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
     }
 
     #[tokio::test]

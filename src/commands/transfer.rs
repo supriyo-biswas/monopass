@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 
 use clap::Args as ClapArgs;
@@ -17,6 +18,12 @@ pub struct Args {
         help = "Expand directory sources and transfer their items"
     )]
     recursive: bool,
+    #[arg(
+        short = 'g',
+        long,
+        help = "Treat item source names literally instead of as SQLite globs"
+    )]
+    globoff: bool,
     #[arg(
         required = true,
         num_args = 2..,
@@ -48,8 +55,8 @@ pub fn move_(config: &Config, args: Args) -> AppResult {
 
 fn run(config: &Config, args: Args, operation: Operation) -> AppResult {
     let client = Client::new(config);
-    let transfers = plan_transfers(args.paths, args.recursive, |dir| {
-        Ok(super::dir::list_all_items(&client, dir)?
+    let transfers = plan_transfers(args.paths, args.recursive, args.globoff, |dir, glob| {
+        Ok(super::dir::list_all_matching_items(&client, dir, glob)?
             .into_iter()
             .map(|item| item.name)
             .collect())
@@ -88,10 +95,11 @@ fn execute_transfer(client: &Client<'_>, operation: Operation, transfer: &Transf
 fn plan_transfers<F>(
     paths: Vec<String>,
     recursive: bool,
+    globoff: bool,
     mut list_items: F,
 ) -> AppResult<Vec<Transfer>>
 where
-    F: FnMut(&str) -> AppResult<Vec<String>>,
+    F: FnMut(&str, Option<&str>) -> AppResult<Vec<String>>,
 {
     if paths.len() < 2 {
         return Err(io::Error::new(
@@ -105,6 +113,7 @@ where
         .split_last()
         .expect("paths length checked before splitting");
     let mut expanded = Vec::new();
+    let mut seen = HashSet::new();
     let mut expanded_directory = false;
 
     for source in sources {
@@ -118,18 +127,30 @@ where
                     .into());
                 }
                 expanded_directory = true;
-                for item in list_items(&dir)? {
-                    expanded.push(ItemPath {
-                        dir: dir.clone(),
-                        item,
-                    });
+                let items = list_items(&dir, None)?;
+                if items.is_empty() {
+                    return Err(no_source_matches(source));
+                }
+                for item in items {
+                    push_unique_source(&mut expanded, &mut seen, &dir, item);
                 }
             }
-            Err(path) => expanded.push(path),
+            Err(path) if globoff => {
+                push_unique_source(&mut expanded, &mut seen, &path.dir, path.item);
+            }
+            Err(path) => {
+                let items = list_items(&path.dir, Some(&path.item))?;
+                if items.is_empty() {
+                    return Err(no_source_matches(source));
+                }
+                for item in items {
+                    push_unique_source(&mut expanded, &mut seen, &path.dir, item);
+                }
+            }
         }
     }
 
-    let dest_is_dir = sources.len() > 1 || expanded_directory;
+    let dest_is_dir = expanded.len() > 1 || expanded_directory;
     if dest_is_dir {
         let dest_dir = parse_dir_path(dest)?;
         return Ok(expanded
@@ -158,6 +179,28 @@ where
     Ok(vec![Transfer { source, dest }])
 }
 
+fn push_unique_source(
+    expanded: &mut Vec<ItemPath>,
+    seen: &mut HashSet<(String, String)>,
+    dir: &str,
+    item: String,
+) {
+    if seen.insert((dir.to_owned(), item.clone())) {
+        expanded.push(ItemPath {
+            dir: dir.to_owned(),
+            item,
+        });
+    }
+}
+
+fn no_source_matches(source: &str) -> Box<dyn std::error::Error> {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("source matched no items: {source}"),
+    )
+    .into()
+}
+
 fn parse_dir_path(input: &str) -> io::Result<String> {
     match parse_dir_or_item_path(input)? {
         Ok(dir) => Ok(dir),
@@ -173,13 +216,13 @@ mod tests {
     use super::{ItemPath, Transfer, plan_transfers};
     use crate::AppResult;
 
-    fn no_dirs(_: &str) -> AppResult<Vec<String>> {
+    fn no_lists(_: &str, _: Option<&str>) -> AppResult<Vec<String>> {
         panic!("directory listing should not be used")
     }
 
     #[test]
     fn rejects_fewer_than_two_paths() {
-        let error = plan_transfers(vec!["Personal/github".to_owned()], false, no_dirs)
+        let error = plan_transfers(vec!["Personal/github".to_owned()], false, true, no_lists)
             .expect_err("single path should fail");
 
         assert!(error.to_string().contains("at least one source"));
@@ -190,7 +233,8 @@ mod tests {
         let plan = plan_transfers(
             vec!["Work/Github".to_owned(), "Personal/GitHub".to_owned()],
             false,
-            no_dirs,
+            true,
+            no_lists,
         )
         .unwrap();
 
@@ -214,7 +258,8 @@ mod tests {
         let plan = plan_transfers(
             vec!["Work/Github".to_owned(), "Personal".to_owned()],
             false,
-            no_dirs,
+            true,
+            no_lists,
         )
         .unwrap();
 
@@ -236,7 +281,8 @@ mod tests {
                 "Personal/Github".to_owned(),
             ],
             false,
-            no_dirs,
+            true,
+            no_lists,
         )
         .expect_err("item destination should fail for multiple sources");
 
@@ -256,7 +302,8 @@ mod tests {
                 "Personal".to_owned(),
             ],
             false,
-            no_dirs,
+            true,
+            no_lists,
         )
         .unwrap();
 
@@ -292,7 +339,8 @@ mod tests {
         let error = plan_transfers(
             vec!["Work".to_owned(), "Personal".to_owned()],
             false,
-            no_dirs,
+            true,
+            no_lists,
         )
         .expect_err("directory source should require recursion");
 
@@ -304,8 +352,10 @@ mod tests {
         let plan = plan_transfers(
             vec!["Work".to_owned(), "Personal".to_owned()],
             true,
-            |dir| {
+            false,
+            |dir, glob| {
                 assert_eq!(dir, "Work");
+                assert_eq!(glob, None);
                 Ok(vec!["Github".to_owned(), "Gitlab".to_owned()])
             },
         )
@@ -336,5 +386,112 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn single_glob_match_can_use_item_destination() {
+        let plan = plan_transfers(
+            vec!["Work/Git*".to_owned(), "Personal/Renamed".to_owned()],
+            false,
+            false,
+            |dir, glob| {
+                assert_eq!((dir, glob), ("Work", Some("Git*")));
+                Ok(vec!["Github".to_owned()])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan[0].source.item, "Github");
+        assert_eq!(plan[0].dest.item, "Renamed");
+    }
+
+    #[test]
+    fn multiple_glob_matches_require_directory_destination() {
+        let error = plan_transfers(
+            vec!["Work/Git*".to_owned(), "Personal/Renamed".to_owned()],
+            false,
+            false,
+            |_, _| Ok(vec!["Github".to_owned(), "Gitlab".to_owned()]),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("destination must be a directory")
+        );
+    }
+
+    #[test]
+    fn glob_and_recursive_sources_must_match_before_planning() {
+        for (paths, recursive) in [
+            (
+                vec!["Work/Missing*".to_owned(), "Personal".to_owned()],
+                false,
+            ),
+            (vec!["Work".to_owned(), "Personal".to_owned()], true),
+        ] {
+            let error = plan_transfers(paths, recursive, false, |_, _| Ok(Vec::new()))
+                .expect_err("empty source should fail");
+            assert!(error.to_string().contains("matched no items"));
+        }
+    }
+
+    #[test]
+    fn overlapping_patterns_are_deduplicated_in_first_match_order() {
+        let plan = plan_transfers(
+            vec![
+                "Work/Git*".to_owned(),
+                "Work/*hub".to_owned(),
+                "Personal".to_owned(),
+            ],
+            false,
+            false,
+            |_, glob| match glob {
+                Some("Git*") => Ok(vec!["Github".to_owned(), "Gitlab".to_owned()]),
+                Some("*hub") => Ok(vec!["Github".to_owned(), "Codehub".to_owned()]),
+                _ => unreachable!(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.iter()
+                .map(|transfer| transfer.source.item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Github", "Gitlab", "Codehub"]
+        );
+    }
+
+    #[test]
+    fn globoff_keeps_metacharacters_literal_and_destination_is_never_listed() {
+        let plan = plan_transfers(
+            vec!["Work/literal*[x]".to_owned(), "Personal/dest*".to_owned()],
+            false,
+            true,
+            no_lists,
+        )
+        .unwrap();
+
+        assert_eq!(plan[0].source.item, "literal*[x]");
+        assert_eq!(plan[0].dest.item, "dest*");
+    }
+
+    #[test]
+    fn destination_is_literal_when_source_globbing_is_enabled() {
+        let mut calls = Vec::new();
+        let plan = plan_transfers(
+            vec!["Work/Git*".to_owned(), "Personal/dest*".to_owned()],
+            false,
+            false,
+            |dir, glob| {
+                calls.push((dir.to_owned(), glob.map(str::to_owned)));
+                Ok(vec!["Github".to_owned()])
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, vec![("Work".to_owned(), Some("Git*".to_owned()))]);
+        assert_eq!(plan[0].dest.item, "dest*");
     }
 }

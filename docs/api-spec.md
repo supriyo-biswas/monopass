@@ -527,7 +527,7 @@ including the latest version, after any cleanup.
 ### List Items
 
 ```http
-GET /api/v1/dir/{dirName}/items?count=50&marker={next_marker}
+GET /api/v1/dir/{dirName}/items?count=50&marker={next_marker}&glob=*github*&dir=asc
 
 HTTP/1.1 200 OK
 {
@@ -544,9 +544,12 @@ HTTP/1.1 200 OK
 ```
 
 List items intentionally returns metadata only: `name`, `created_at`,
-`updated_at`. Items are sorted by `name`. `count` is optional, defaults to `50`,
-and must be between `1` and `200`. `marker` is an optional opaque value returned
-as `next_marker` from the previous page. Invalid `count` or `marker` values
+`updated_at`. `glob` optionally filters item names using SQLite's case-sensitive
+glob syntax (`*`, `?`, and bracket expressions). `dir` controls lexical name
+ordering and accepts `asc` or `desc`, defaulting to `asc`. `count` is optional,
+defaults to `50`, and must be between `1` and `200`. `marker` is an optional
+opaque value returned as `next_marker` from the previous page and is scoped to
+the directory, glob, and direction. Invalid `count`, `dir`, or `marker` values
 return `400 bad_request`.
 
 ### List Item Versions

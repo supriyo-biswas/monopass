@@ -5,6 +5,7 @@ use crate::config::Config;
 
 use super::client::{Client, api_path, path_component};
 use super::models::{DirResponse, ItemSummaryResponse, PaginatedResponse};
+use super::path::parse_dir_or_item_path;
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct MkdirArgs {
@@ -22,8 +23,14 @@ pub struct RmdirArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct ListArgs {
-    #[arg(help = "Optional directory path")]
-    dir: Option<String>,
+    #[arg(help = "Optional directory or <dir>/<glob> path")]
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListTarget {
+    Dirs,
+    Items { dir: String, glob: Option<String> },
 }
 
 pub fn mkdir(config: &Config, args: MkdirArgs) -> AppResult {
@@ -43,16 +50,72 @@ pub fn rmdir(config: &Config, args: RmdirArgs) -> AppResult {
 
 pub fn list(config: &Config, args: ListArgs) -> AppResult {
     let client = Client::new(config);
-    if let Some(dir) = args.dir {
-        for item in list_all_items(&client, &dir)? {
-            println!("{}", item.name);
+    match parse_list_target(args.path.as_deref())? {
+        ListTarget::Items { dir, glob } => {
+            for item in list_all_matching_items(&client, &dir, glob.as_deref())? {
+                println!("{}", item.name);
+            }
         }
-    } else {
-        for dir in list_all_dirs(&client)? {
-            println!("{}", dir.name);
+        ListTarget::Dirs => {
+            for dir in list_all_dirs(&client)? {
+                println!("{}", dir.name);
+            }
         }
     }
     Ok(())
+}
+
+fn parse_list_target(path: Option<&str>) -> std::io::Result<ListTarget> {
+    match path {
+        None => Ok(ListTarget::Dirs),
+        Some(path) => match parse_dir_or_item_path(path)? {
+            Ok(dir) => Ok(ListTarget::Items { dir, glob: None }),
+            Err(path) => Ok(ListTarget::Items {
+                dir: path.dir,
+                glob: Some(path.item),
+            }),
+        },
+    }
+}
+
+pub(crate) fn list_all_matching_items(
+    client: &Client<'_>,
+    dir: &str,
+    glob: Option<&str>,
+) -> AppResult<Vec<ItemSummaryResponse>> {
+    let mut entries = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let page = list_items_page(client, dir, 200, marker.as_deref(), glob, false)?;
+        entries.extend(page.entries);
+        match page.next_marker {
+            Some(next) => marker = Some(next),
+            None => return Ok(entries),
+        }
+    }
+}
+
+pub fn list_items_page(
+    client: &Client<'_>,
+    dir: &str,
+    count: u64,
+    marker: Option<&str>,
+    glob: Option<&str>,
+    descending: bool,
+) -> AppResult<PaginatedResponse<ItemSummaryResponse>> {
+    let mut path = format!("/dir/{}/items?count={count}", path_component(dir));
+    if let Some(marker) = marker {
+        path.push_str("&marker=");
+        path.push_str(&super::client::query_value(marker));
+    }
+    if let Some(glob) = glob {
+        path.push_str("&glob=");
+        path.push_str(&super::client::query_value(glob));
+    }
+    if descending {
+        path.push_str("&dir=desc");
+    }
+    client.get_json(&api_path(&path))
 }
 
 pub fn list_all_dirs(client: &Client<'_>) -> AppResult<Vec<DirResponse>> {
@@ -75,29 +138,32 @@ pub fn list_all_dirs(client: &Client<'_>) -> AppResult<Vec<DirResponse>> {
     }
 }
 
-pub fn list_all_items(client: &Client<'_>, dir: &str) -> AppResult<Vec<ItemSummaryResponse>> {
-    let mut entries = Vec::new();
-    let mut marker: Option<String> = None;
-    loop {
-        let path = match &marker {
-            Some(marker) => api_path(&format!(
-                "/dir/{}/items?count=200&marker={}",
-                path_component(dir),
-                super::client::query_value(marker)
-            )),
-            None => api_path(&format!("/dir/{}/items?count=200", path_component(dir))),
-        };
-        let page: PaginatedResponse<ItemSummaryResponse> = client.get_json(&path)?;
-        entries.extend(page.entries);
-        match page.next_marker {
-            Some(next) => marker = Some(next),
-            None => return Ok(entries),
-        }
-    }
-}
-
 fn is_conflict(error: &Box<dyn std::error::Error>) -> bool {
     error
         .downcast_ref::<super::client::ApiError>()
         .is_some_and(|error| error.status == 409 && error.code == "conflict")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListTarget, parse_list_target};
+
+    #[test]
+    fn list_target_supports_directories_and_item_globs() {
+        assert_eq!(ListTarget::Dirs, parse_list_target(None).unwrap());
+        assert_eq!(
+            ListTarget::Items {
+                dir: "Personal".to_owned(),
+                glob: None,
+            },
+            parse_list_target(Some("Personal")).unwrap()
+        );
+        assert_eq!(
+            ListTarget::Items {
+                dir: "Personal".to_owned(),
+                glob: Some("*Github*".to_owned()),
+            },
+            parse_list_target(Some("Personal/*Github*")).unwrap()
+        );
+    }
 }

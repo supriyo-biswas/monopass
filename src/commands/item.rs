@@ -17,7 +17,7 @@ use super::models::{
     ItemVersionSummaryResponse, PaginatedResponse, RemoveEntry, UpdateFieldEntry, UpdateFieldSet,
     UpdateFileEntry, UpdateFileSet, UpdateItemRequest,
 };
-use super::path::{parse_dir_or_item_path, parse_item_path};
+use super::path::{ItemPath, parse_dir_or_item_path, parse_item_path};
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct AddArgs {
@@ -113,6 +113,12 @@ pub struct EditArgs {
 pub struct RemoveArgs {
     #[arg(help = "Directory or item path in <dir>[/<item>] form")]
     path: String,
+    #[arg(
+        short = 'g',
+        long,
+        help = "Treat an item source name literally instead of as a SQLite glob"
+    )]
+    globoff: bool,
     #[arg(
         short,
         long,
@@ -215,20 +221,87 @@ pub fn edit(config: &Config, args: EditArgs) -> AppResult {
 
 pub fn remove(config: &Config, args: RemoveArgs) -> AppResult {
     let client = Client::new(config);
-    match parse_dir_or_item_path(&args.path)? {
-        Ok(dir) => {
-            if args.recursive {
-                for item in super::dir::list_all_items(&client, &dir)? {
-                    remove_item(&client, &dir, &item.name, args.force)?;
-                }
-                if !remove_dir_after_recursive_delete(&dir) {
-                    return Ok(());
-                }
+    let target = plan_removal(&args.path, args.recursive, args.globoff, |dir, glob| {
+        Ok(super::dir::list_all_matching_items(&client, dir, glob)?
+            .into_iter()
+            .map(|item| item.name)
+            .collect())
+    })?;
+    match target {
+        RemovalPlan::Directory { dir, items } => {
+            for item in items {
+                remove_item(&client, &dir, &item, args.force)?;
+            }
+            if !remove_dir_after_recursive_delete(&dir) {
+                return Ok(());
             }
             client.delete_empty(&api_path(&format!("/dir/{}", path_component(&dir))))
         }
-        Err(path) => remove_item(&client, &path.dir, &path.item, args.force),
+        RemovalPlan::Items(items) => {
+            for path in items {
+                remove_item(&client, &path.dir, &path.item, args.force)?;
+            }
+            Ok(())
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemovalPlan {
+    Directory { dir: String, items: Vec<String> },
+    Items(Vec<ItemPath>),
+}
+
+fn plan_removal<F>(
+    path: &str,
+    recursive: bool,
+    globoff: bool,
+    mut list_items: F,
+) -> AppResult<RemovalPlan>
+where
+    F: FnMut(&str, Option<&str>) -> AppResult<Vec<String>>,
+{
+    let target = parse_dir_or_item_path(path)?;
+    match target {
+        Ok(dir) => {
+            if !recursive {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory removal requires --recursive",
+                )
+                .into());
+            }
+            let items = list_items(&dir, None)?;
+            if items.is_empty() {
+                return Err(no_remove_matches(path));
+            }
+            Ok(RemovalPlan::Directory { dir, items })
+        }
+        Err(path) if globoff => Ok(RemovalPlan::Items(vec![path])),
+        Err(item_glob) => {
+            let items = list_items(&item_glob.dir, Some(&item_glob.item))?;
+            if items.is_empty() {
+                return Err(no_remove_matches(path));
+            }
+            Ok(RemovalPlan::Items(
+                items
+                    .into_iter()
+                    .map(|item| ItemPath {
+                        dir: item_glob.dir.clone(),
+                        item,
+                    })
+                    .collect(),
+            ))
+        }
+    }
+}
+
+fn no_remove_matches(source: &str) -> Box<dyn std::error::Error> {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("source matched no items: {source}"),
+    )
+    .into()
 }
 
 pub fn list_versions(config: &Config, args: ListVersionsArgs) -> AppResult {
@@ -362,9 +435,7 @@ fn remove_item(client: &Client<'_>, dir: &str, item: &str, force: bool) -> AppRe
                 match move_item_to_trash(client, dir, item, &fallback) {
                     Ok(()) => Ok(()),
                     Err(error) if is_item_exists_conflict(error.as_ref()) => {
-                        let fallback =
-                            trash_fallback_name(item, &source.created_at, Some(&random_digits()?));
-                        move_item_to_trash(client, dir, item, &fallback)
+                        move_item_to_numbered_trash_name(client, dir, item, &source.created_at)
                     }
                     Err(error) => Err(error),
                 }
@@ -402,12 +473,12 @@ fn is_item_exists_conflict(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-fn trash_fallback_name(item: &str, created_at: &str, random_suffix: Option<&str>) -> String {
+fn trash_fallback_name(item: &str, created_at: &str, number: Option<u16>) -> String {
     const MAX_ITEM_NAME_CHARS: usize = 255;
 
-    let suffix = match random_suffix {
-        Some(random_suffix) => format!(" {created_at} {random_suffix}"),
-        None => format!(" {created_at}"),
+    let suffix = match number {
+        Some(number) => format!(" ({created_at},{number:03})"),
+        None => format!(" ({created_at})"),
     };
     let suffix_chars = suffix.chars().count();
     let max_item_chars = MAX_ITEM_NAME_CHARS.saturating_sub(suffix_chars);
@@ -415,10 +486,82 @@ fn trash_fallback_name(item: &str, created_at: &str, random_suffix: Option<&str>
     format!("{truncated_item}{suffix}")
 }
 
-fn random_digits() -> io::Result<String> {
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(format!("{:06}", u64::from_ne_bytes(bytes) % 1_000_000))
+fn move_item_to_numbered_trash_name(
+    client: &Client<'_>,
+    source_dir: &str,
+    source_item: &str,
+    created_at: &str,
+) -> AppResult {
+    loop {
+        let pattern = trash_numbered_glob(source_item, created_at);
+        let page = super::dir::list_items_page(client, "Trash", 1, None, Some(&pattern), true)?;
+        let next = next_trash_number(
+            page.entries.first().map(|item| item.name.as_str()),
+            source_item,
+            created_at,
+        )?;
+        let destination = trash_fallback_name(source_item, created_at, Some(next));
+        match move_item_to_trash(client, source_dir, source_item, &destination) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_item_exists_conflict(error.as_ref()) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn trash_numbered_glob(item: &str, created_at: &str) -> String {
+    let numbered = trash_fallback_name(item, created_at, Some(0));
+    let prefix = numbered
+        .strip_suffix("000)")
+        .expect("numbered Trash name has a fixed suffix");
+    format!("{}[0-9][0-9][0-9])", escape_sqlite_glob(prefix))
+}
+
+fn trash_number(name: &str, item: &str, created_at: &str) -> io::Result<u16> {
+    let numbered = trash_fallback_name(item, created_at, Some(0));
+    let prefix = numbered
+        .strip_suffix("000)")
+        .expect("numbered Trash name has a fixed suffix");
+    let value = name
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(')'))
+        .filter(|value| value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Trash suffix"))?;
+    value
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Trash suffix"))
+}
+
+fn next_trash_number(latest: Option<&str>, item: &str, created_at: &str) -> io::Result<u16> {
+    let latest = match latest {
+        Some(name) => trash_number(name, item, created_at)?,
+        None => return Ok(1),
+    };
+    if latest >= 999 {
+        Err(trash_suffix_limit_error())
+    } else {
+        Ok(latest + 1)
+    }
+}
+
+fn escape_sqlite_glob(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn trash_suffix_limit_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "moving to trash failed: suffix limit 999 reached",
+    )
 }
 
 fn build_create_request(
@@ -703,9 +846,10 @@ mod tests {
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
-        FieldType, build_fields, human_size, is_item_exists_conflict, random_digits,
-        remove_item_is_permanent_delete, trash_fallback_name, validate_field_and_file_name_overlap,
-        write_human_item,
+        FieldType, RemovalPlan, build_fields, escape_sqlite_glob, human_size,
+        is_item_exists_conflict, next_trash_number, plan_removal, remove_item_is_permanent_delete,
+        trash_fallback_name, trash_number, trash_numbered_glob,
+        validate_field_and_file_name_overlap, write_human_item,
     };
     use crate::secret::SecretString;
 
@@ -722,6 +866,69 @@ mod tests {
     #[test]
     fn force_still_performs_permanent_delete() {
         assert!(remove_item_is_permanent_delete("Personal", true));
+    }
+
+    #[test]
+    fn directory_remove_requires_recursive() {
+        let error = plan_removal("Personal", false, false, |_, _| unreachable!())
+            .expect_err("directory removal should require recursion");
+
+        assert_eq!("directory removal requires --recursive", error.to_string());
+    }
+
+    #[test]
+    fn recursive_directory_and_item_globs_expand_before_removal() {
+        assert_eq!(
+            plan_removal("Personal", true, false, |dir, glob| {
+                assert_eq!((dir, glob), ("Personal", None));
+                Ok(vec!["Github".to_owned()])
+            })
+            .unwrap(),
+            RemovalPlan::Directory {
+                dir: "Personal".to_owned(),
+                items: vec!["Github".to_owned()],
+            }
+        );
+        assert_eq!(
+            plan_removal("Personal/Git*", false, false, |dir, glob| {
+                assert_eq!((dir, glob), ("Personal", Some("Git*")));
+                Ok(vec!["Github".to_owned(), "Gitlab".to_owned()])
+            })
+            .unwrap(),
+            RemovalPlan::Items(vec![
+                super::ItemPath {
+                    dir: "Personal".to_owned(),
+                    item: "Github".to_owned(),
+                },
+                super::ItemPath {
+                    dir: "Personal".to_owned(),
+                    item: "Gitlab".to_owned(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn removal_globs_and_recursive_directories_must_match() {
+        for (path, recursive) in [("Personal/Missing*", false), ("Personal", true)] {
+            let error = plan_removal(path, recursive, false, |_, _| Ok(Vec::new()))
+                .expect_err("empty source should fail");
+            assert!(error.to_string().contains("matched no items"));
+        }
+    }
+
+    #[test]
+    fn removal_globoff_keeps_metacharacters_literal() {
+        assert_eq!(
+            plan_removal("Personal/literal*[x]", false, true, |_, _| {
+                panic!("literal item removal must not list items")
+            })
+            .unwrap(),
+            RemovalPlan::Items(vec![super::ItemPath {
+                dir: "Personal".to_owned(),
+                item: "literal*[x]".to_owned(),
+            }])
+        );
     }
 
     #[test]
@@ -761,33 +968,57 @@ mod tests {
     #[test]
     fn trash_fallback_name_uses_created_at() {
         assert_eq!(
-            "test 2026-06-07T01:23:45Z",
+            "test (2026-06-07T01:23:45Z)",
             trash_fallback_name("test", "2026-06-07T01:23:45Z", None)
         );
     }
 
     #[test]
-    fn trash_fallback_name_uses_created_at_and_random_digits() {
+    fn trash_fallback_name_uses_created_at_and_incrementing_suffix() {
         assert_eq!(
-            "test 2026-06-07T01:23:45Z 123456",
-            trash_fallback_name("test", "2026-06-07T01:23:45Z", Some("123456"))
+            "test (2026-06-07T01:23:45Z,123)",
+            trash_fallback_name("test", "2026-06-07T01:23:45Z", Some(123))
         );
     }
 
     #[test]
     fn trash_fallback_name_truncates_long_item_names() {
-        let name = trash_fallback_name(&"a".repeat(260), "2026-06-07T01:23:45Z", Some("123456"));
+        let name = trash_fallback_name(&"a".repeat(260), "2026-06-07T01:23:45Z", Some(123));
 
         assert_eq!(255, name.chars().count());
-        assert!(name.ends_with(" 2026-06-07T01:23:45Z 123456"));
+        assert!(name.ends_with(" (2026-06-07T01:23:45Z,123)"));
     }
 
     #[test]
-    fn random_suffix_has_six_digits() {
-        let suffix = random_digits().unwrap();
+    fn numbered_trash_glob_is_literal_and_suffix_is_parsed() {
+        let pattern = trash_numbered_glob("test*[", "2026-06-07T01:23:45Z");
+        assert_eq!("test[*][[] (2026-06-07T01:23:45Z,[0-9][0-9][0-9])", pattern);
+        assert_eq!("literal[*][?][[]", escape_sqlite_glob("literal*?["));
+        assert_eq!(
+            42,
+            trash_number(
+                "test*[ (2026-06-07T01:23:45Z,042)",
+                "test*[",
+                "2026-06-07T01:23:45Z"
+            )
+            .unwrap()
+        );
+    }
 
-        assert_eq!(6, suffix.len());
-        assert!(suffix.chars().all(|character| character.is_ascii_digit()));
+    #[test]
+    fn next_trash_suffix_starts_at_one_increments_and_stops_at_999() {
+        let created_at = "2026-06-07T01:23:45Z";
+        assert_eq!(1, next_trash_number(None, "test", created_at).unwrap());
+        assert_eq!(
+            43,
+            next_trash_number(Some("test (2026-06-07T01:23:45Z,042)"), "test", created_at).unwrap()
+        );
+        assert_eq!(
+            "moving to trash failed: suffix limit 999 reached",
+            next_trash_number(Some("test (2026-06-07T01:23:45Z,999)"), "test", created_at)
+                .unwrap_err()
+                .to_string()
+        );
     }
 
     #[test]

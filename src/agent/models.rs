@@ -123,6 +123,22 @@ pub struct ListPageQuery {
     pub marker: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ListItemsQuery {
+    pub count: Option<u64>,
+    pub marker: Option<String>,
+    pub glob: Option<String>,
+    pub dir: Option<ListDirection>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateDirRequest {
     pub name: String,

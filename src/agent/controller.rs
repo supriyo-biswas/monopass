@@ -23,14 +23,14 @@ use zeroize::Zeroizing;
 use super::error::ApiError;
 use super::models::{
     AuthStatusResponse, ContactResponse, CreateContactRequest, CreateFileResponse,
-    CreateItemRequest, JobAcceptedResponse, JobResponse, JobStatus, ListPageQuery,
+    CreateItemRequest, JobAcceptedResponse, JobResponse, JobStatus, ListItemsQuery, ListPageQuery,
     PaginatedResponse, UpdateContactRequest, UpdateDirRequest, UpdateItemRequest,
     UpdateSettingRequest,
 };
 use super::process::ProcessChainHash;
 use super::state::{
-    AgentState, CopySource, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemSource,
-    PageRequest, ReferenceBody, UnlockError, validate_file_upload_size,
+    AgentState, CopySource, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
+    ItemSource, PageRequest, ReferenceBody, UnlockError, validate_file_upload_size,
 };
 
 const DEFAULT_PAGE_COUNT: u64 = 50;
@@ -651,11 +651,22 @@ pub async fn update_item(
 pub async fn list_items(
     Extension(database): Extension<DbHandle>,
     Path(dir_name): Path<String>,
-    query: Result<Query<ListPageQuery>, QueryRejection>,
+    query: Result<Query<ListItemsQuery>, QueryRejection>,
 ) -> Result<Json<PaginatedResponse<super::models::ItemSummaryResponse>>, ApiError> {
-    let page = page_request(query)?;
+    let Query(query) = query.map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let count = validated_page_count(query.count)?;
     database
-        .list_items(dir_name, page)
+        .list_items(
+            dir_name,
+            ItemListRequest {
+                page: PageRequest {
+                    count,
+                    marker: query.marker,
+                },
+                glob: query.glob,
+                direction: query.dir.unwrap_or_default(),
+            },
+        )
         .await
         .map(Json)
         .map_err(ApiError::from)
@@ -678,14 +689,19 @@ fn page_request(
     query: Result<Query<ListPageQuery>, QueryRejection>,
 ) -> Result<PageRequest, ApiError> {
     let Query(query) = query.map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let count = query.count.unwrap_or(DEFAULT_PAGE_COUNT);
-    if !(1..=MAX_PAGE_COUNT).contains(&count) {
-        return Err(ApiError::bad_request("count must be between 1 and 200"));
-    }
+    let count = validated_page_count(query.count)?;
     Ok(PageRequest {
         count,
         marker: query.marker,
     })
+}
+
+fn validated_page_count(count: Option<u64>) -> Result<u64, ApiError> {
+    let count = count.unwrap_or(DEFAULT_PAGE_COUNT);
+    if !(1..=MAX_PAGE_COUNT).contains(&count) {
+        return Err(ApiError::bad_request("count must be between 1 and 200"));
+    }
+    Ok(count)
 }
 
 pub async fn delete_item(
