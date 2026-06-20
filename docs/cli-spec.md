@@ -55,6 +55,18 @@ it is null.
 
 # Commands
 
+## agent command
+
+```
+monopass agent
+```
+
+Before binding its socket, the agent disables core dumps. Release builds also
+deny debugger attachment: macOS uses `PT_DENY_ATTACH`, while Linux marks the
+process non-dumpable with `PR_SET_DUMPABLE` and refuses startup when
+`/proc/self/status` reports a nonzero `TracerPid`. Linux startup fails closed if
+the tracer status cannot be read or parsed.
+
 ## lock command
 
 ```

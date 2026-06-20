@@ -42,7 +42,10 @@ fn harden_agent_process() -> io::Result<()> {
     disable_core_dumps()?;
 
     #[cfg(not(debug_assertions))]
-    deny_debug_attach()?;
+    {
+        deny_debug_attach()?;
+        ensure_not_traced()?;
+    }
 
     Ok(())
 }
@@ -83,6 +86,42 @@ fn deny_debug_attach() -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(all(target_os = "linux", not(debug_assertions)))]
+fn ensure_not_traced() -> io::Result<()> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    let tracer_pid = parse_tracer_pid(&status)?;
+
+    if tracer_pid == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "debugger detected; refusing to start agent",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_tracer_pid(status: &str) -> io::Result<u32> {
+    let value = status
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| (name.trim() == "TracerPid").then_some(value.trim()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TracerPid is missing from /proc/self/status",
+            )
+        })?;
+
+    value.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TracerPid in /proc/self/status is invalid",
+        )
+    })
 }
 
 async fn serve(config: &Config) -> AppResult {
@@ -264,6 +303,46 @@ fn remove_stale_socket(listen_path: &Path) -> io::Result<()> {
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tracer_pid_tests {
+    use std::io;
+
+    #[test]
+    fn parses_zero_tracer_pid() {
+        assert_eq!(
+            0,
+            super::parse_tracer_pid("Name:\tmonopass\nTracerPid:\t0\n").unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_nonzero_tracer_pid() {
+        assert_eq!(1234, super::parse_tracer_pid("TracerPid:\t1234\n").unwrap());
+    }
+
+    #[test]
+    fn rejects_missing_tracer_pid() {
+        let error = super::parse_tracer_pid("Name:\tmonopass\n").unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn rejects_malformed_tracer_pid() {
+        let error = super::parse_tracer_pid("TracerPid:\tunknown\n").unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[test]
+    fn parses_whitespace_formatted_tracer_pid() {
+        assert_eq!(
+            42,
+            super::parse_tracer_pid("  TracerPid :  42  \n").unwrap()
+        );
     }
 }
 
