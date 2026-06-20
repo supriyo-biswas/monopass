@@ -30,7 +30,7 @@ use super::models::{
     JobTarget, JobType, ListDirection, PaginatedResponse, UpdateContactRequest, UpdateDirRequest,
     UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
 };
-use super::process::ProcessChainHash;
+use super::process::ScopeHash;
 use crate::conceal::inferred_concealed;
 use crate::config::Config;
 use crate::db;
@@ -123,7 +123,7 @@ impl AgentState {
     pub async fn unlock(
         &self,
         password: Zeroizing<String>,
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
     ) -> Result<(), UnlockError> {
         let mut inner = self.inner.lock().await;
 
@@ -147,7 +147,7 @@ impl AgentState {
                 return Err(UnlockError::AccessDenied);
             }
             let now = Instant::now();
-            inner.authorized_processes.insert(process_hash, now);
+            inner.authorized_scopes.insert(scope_hash, now);
             inner.record_authorization_expiry(now + auth_ttl);
             return Ok(());
         }
@@ -176,7 +176,7 @@ impl AgentState {
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
         let now = Instant::now();
         inner.last_authorized_database_access = Some(now);
-        inner.authorized_processes.insert(process_hash, now);
+        inner.authorized_scopes.insert(scope_hash, now);
         inner.record_authorization_expiry(now + auth_ttl);
         Ok(())
     }
@@ -184,7 +184,7 @@ impl AgentState {
     pub async fn lock(&self, now: Instant) {
         let mut inner = self.inner.lock().await;
         inner.invalidate_auth_epoch();
-        inner.authorized_processes.clear();
+        inner.authorized_scopes.clear();
         inner.max_authorization_expires_at = Some(now);
     }
 
@@ -194,25 +194,22 @@ impl AgentState {
     }
 
     #[cfg(test)]
-    pub async fn is_authorized(&self, process_hash: &ProcessChainHash) -> bool {
-        self.authorization_expires_at(process_hash).await.is_some()
+    pub async fn is_authorized(&self, scope_hash: &ScopeHash) -> bool {
+        self.authorization_expires_at(scope_hash).await.is_some()
     }
 
-    pub async fn authorization_expires_at(
-        &self,
-        process_hash: &ProcessChainHash,
-    ) -> Option<Instant> {
+    pub async fn authorization_expires_at(&self, scope_hash: &ScopeHash) -> Option<Instant> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
             .user_setting_duration(AUTH_TTL_SETTING)
             .await
             .ok()?;
 
-        self.inner.lock().await.authorized_processes.expires_at(
-            process_hash,
-            Instant::now(),
-            auth_ttl,
-        )
+        self.inner
+            .lock()
+            .await
+            .authorized_scopes
+            .expires_at(scope_hash, Instant::now(), auth_ttl)
     }
 
     pub async fn verify_settings_password(&self, password: &str) -> bool {
@@ -224,10 +221,7 @@ impl AgentState {
                 .is_some_and(|verifier| verifier.verify(password))
     }
 
-    pub async fn authorize_database_access(
-        &self,
-        process_hash: &ProcessChainHash,
-    ) -> Option<DbHandle> {
+    pub async fn authorize_database_access(&self, scope_hash: &ScopeHash) -> Option<DbHandle> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
             .user_setting_duration(AUTH_TTL_SETTING)
@@ -237,10 +231,8 @@ impl AgentState {
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         let database = inner.database.clone();
-        let authorized = database.is_some()
-            && inner
-                .authorized_processes
-                .contains(process_hash, now, auth_ttl);
+        let authorized =
+            database.is_some() && inner.authorized_scopes.contains(scope_hash, now, auth_ttl);
 
         if authorized {
             inner.last_authorized_database_access = Some(now);
@@ -269,9 +261,8 @@ impl AgentState {
             if self.has_active_database_work_locked(&inner) {
                 return false;
             }
-            inner.authorized_processes.retain_unexpired(now, auth_ttl);
-            inner.max_authorization_expires_at =
-                inner.authorized_processes.max_expires_at(auth_ttl);
+            inner.authorized_scopes.retain_unexpired(now, auth_ttl);
+            inner.max_authorization_expires_at = inner.authorized_scopes.max_expires_at(auth_ttl);
             let should_unload =
                 inner.database.is_some() && inner.max_authorization_expires_at.is_none();
 
@@ -316,7 +307,7 @@ impl AgentState {
         inner.invalidate_auth_epoch();
         inner.database = None;
         inner.password_verifier = None;
-        inner.authorized_processes.clear();
+        inner.authorized_scopes.clear();
         inner.last_authorized_database_access = None;
         inner.max_authorization_expires_at = None;
     }
@@ -340,21 +331,21 @@ impl AgentState {
     }
 
     #[cfg(test)]
-    pub async fn authorize_process_hash(&self, process_hash: ProcessChainHash) {
+    pub async fn authorize_scope_hash(&self, scope_hash: ScopeHash) {
         self.inner
             .lock()
             .await
-            .authorized_processes
-            .insert(process_hash, Instant::now());
+            .authorized_scopes
+            .insert(scope_hash, Instant::now());
     }
 
     #[cfg(test)]
-    pub async fn authorize_process_hash_at(&self, process_hash: ProcessChainHash, now: Instant) {
+    pub async fn authorize_scope_hash_at(&self, scope_hash: ScopeHash, now: Instant) {
         self.inner
             .lock()
             .await
-            .authorized_processes
-            .insert(process_hash, now);
+            .authorized_scopes
+            .insert(scope_hash, now);
     }
 
     #[cfg(test)]
@@ -443,7 +434,7 @@ pub enum UnlockError {
 struct InnerState {
     database: Option<DbHandle>,
     password_verifier: Option<PasswordVerifier>,
-    authorized_processes: AuthCache,
+    authorized_scopes: AuthCache,
     last_authorized_database_access: Option<Instant>,
     max_authorization_expires_at: Option<Instant>,
     last_cleanup_at: Option<Instant>,
@@ -506,11 +497,10 @@ struct AuthCache {
 }
 
 impl AuthCache {
-    fn insert(&mut self, process_hash: ProcessChainHash, now: Instant) {
-        self.entries
-            .retain(|entry| entry.process_hash != process_hash);
+    fn insert(&mut self, scope_hash: ScopeHash, now: Instant) {
+        self.entries.retain(|entry| entry.scope_hash != scope_hash);
         self.entries.push(AuthCacheEntry {
-            process_hash,
+            scope_hash,
             inserted_at: now,
         });
 
@@ -519,13 +509,13 @@ impl AuthCache {
         }
     }
 
-    fn contains(&mut self, process_hash: &ProcessChainHash, now: Instant, ttl: Duration) -> bool {
+    fn contains(&mut self, scope_hash: &ScopeHash, now: Instant, ttl: Duration) -> bool {
         self.retain_unexpired(now, ttl);
 
         let Some(index) = self
             .entries
             .iter()
-            .position(|entry| &entry.process_hash == process_hash)
+            .position(|entry| &entry.scope_hash == scope_hash)
         else {
             return false;
         };
@@ -535,16 +525,11 @@ impl AuthCache {
         true
     }
 
-    fn expires_at(
-        &self,
-        process_hash: &ProcessChainHash,
-        now: Instant,
-        ttl: Duration,
-    ) -> Option<Instant> {
+    fn expires_at(&self, scope_hash: &ScopeHash, now: Instant, ttl: Duration) -> Option<Instant> {
         let entry = self
             .entries
             .iter()
-            .find(|entry| &entry.process_hash == process_hash)?;
+            .find(|entry| &entry.scope_hash == scope_hash)?;
         let expires_at = entry.inserted_at + ttl;
 
         (expires_at > now).then_some(expires_at)
@@ -569,7 +554,7 @@ impl AuthCache {
 
 #[derive(Debug)]
 struct AuthCacheEntry {
-    process_hash: ProcessChainHash,
+    scope_hash: ScopeHash,
     inserted_at: Instant,
 }
 
@@ -3740,16 +3725,12 @@ fn merge_request_fields_and_files(
     validate_file_inputs(request.files)
 }
 
+type UpdatedFileInputs = (HashMap<String, Vec<u8>>, HashSet<String>);
+
 fn merge_update_fields_and_files(
-    fields: &mut std::collections::HashMap<String, Field>,
+    fields: &mut HashMap<String, Field>,
     request: UpdateItemRequest,
-) -> Result<
-    (
-        std::collections::HashMap<String, Vec<u8>>,
-        std::collections::HashSet<String>,
-    ),
-    DbError,
-> {
+) -> Result<UpdatedFileInputs, DbError> {
     let mut field_names = std::collections::HashSet::new();
     for entry in request.fields {
         let name = update_field_name(&entry);
@@ -4956,7 +4937,7 @@ mod tests {
         MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PageRequest,
         UnlockError, UpdateContactRequest,
     };
-    use crate::agent::process::ProcessChainHash;
+    use crate::agent::process::ScopeHash;
 
     const AUTH_TTL: Duration = Duration::from_secs(900);
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -5158,7 +5139,7 @@ mod tests {
 
         assert!(
             state
-                .unlock(password("wrong"), ProcessChainHash::test(1))
+                .unlock(password("wrong"), ScopeHash::test(1))
                 .await
                 .is_err()
         );
@@ -5174,7 +5155,7 @@ mod tests {
 
         assert!(
             state
-                .unlock(password("correct"), ProcessChainHash::test(1))
+                .unlock(password("correct"), ScopeHash::test(1))
                 .await
                 .is_ok()
         );
@@ -5182,7 +5163,7 @@ mod tests {
         assert!(state.has_password_verifier().await);
         assert!(state.last_authorized_database_access().await.is_some());
         assert!(state.max_authorization_expires_at().await.is_some());
-        assert!(state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
     }
 
     #[tokio::test]
@@ -5223,7 +5204,7 @@ mod tests {
 
         assert!(state.verify_settings_password("correct").await);
 
-        assert!(!state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
         assert_eq!(
             Some(original_expiry),
             state.max_authorization_expires_at().await
@@ -5239,7 +5220,7 @@ mod tests {
         let before = Instant::now();
 
         state
-            .unlock(password("correct"), ProcessChainHash::test(1))
+            .unlock(password("correct"), ScopeHash::test(1))
             .await
             .unwrap();
 
@@ -5256,25 +5237,25 @@ mod tests {
         let state = AgentState::from_database_path(file.path());
 
         state
-            .unlock(password("correct"), ProcessChainHash::test(1))
+            .unlock(password("correct"), ScopeHash::test(1))
             .await
             .unwrap();
         let first_handle = state.database_handle().await.unwrap();
 
         assert!(
             state
-                .unlock(password("wrong"), ProcessChainHash::test(2))
+                .unlock(password("wrong"), ScopeHash::test(2))
                 .await
                 .is_err()
         );
         state
-            .unlock(password("correct"), ProcessChainHash::test(2))
+            .unlock(password("correct"), ScopeHash::test(2))
             .await
             .unwrap();
         let second_handle = state.database_handle().await.unwrap();
 
         assert!(first_handle.ptr_eq(&second_handle));
-        assert!(state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert!(state.is_authorized(&ScopeHash::test(2)).await);
     }
 
     #[tokio::test]
@@ -5285,7 +5266,7 @@ mod tests {
         let state = AgentState::from_database_path(file.path());
 
         state
-            .unlock(password("correct"), ProcessChainHash::test(1))
+            .unlock(password("correct"), ScopeHash::test(1))
             .await
             .unwrap();
         let original_expiry = Instant::now() + Duration::from_secs(1);
@@ -5294,7 +5275,7 @@ mod tests {
             .await;
 
         state
-            .unlock(password("correct"), ProcessChainHash::test(2))
+            .unlock(password("correct"), ScopeHash::test(2))
             .await
             .unwrap();
 
@@ -5308,14 +5289,14 @@ mod tests {
 
         let state = AgentState::from_database_path(file.path());
         state
-            .unlock(password("correct"), ProcessChainHash::test(1))
+            .unlock(password("correct"), ScopeHash::test(1))
             .await
             .unwrap();
         let original_expiry = state.max_authorization_expires_at().await;
 
         assert!(
             state
-                .unlock(password("wrong"), ProcessChainHash::test(1))
+                .unlock(password("wrong"), ScopeHash::test(1))
                 .await
                 .is_err()
         );
@@ -5330,16 +5311,14 @@ mod tests {
         let database = DbHandle::test();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
             .await;
 
         state.lock(now).await;
 
-        assert!(!state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
         assert_eq!(Some(now), state.max_authorization_expires_at().await);
         assert!(
             state
@@ -5356,9 +5335,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state.lock(now).await;
 
         assert!(state.unload_if_authorization_expired(now).await);
@@ -5375,9 +5352,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
             .await;
@@ -5386,7 +5361,7 @@ mod tests {
         let unlock_state = state.clone();
         let unlock_task = tokio::spawn(async move {
             unlock_state
-                .unlock(password("correct"), ProcessChainHash::test(2))
+                .unlock(password("correct"), ScopeHash::test(2))
                 .await
         });
         wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
@@ -5398,7 +5373,7 @@ mod tests {
         for blocker in blockers {
             assert!(blocker.await.unwrap().is_ok());
         }
-        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(2)).await);
         assert_eq!(Some(lock_time), state.max_authorization_expires_at().await);
     }
 
@@ -5409,9 +5384,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
             .await;
@@ -5420,7 +5393,7 @@ mod tests {
         let unlock_state = state.clone();
         let unlock_task = tokio::spawn(async move {
             unlock_state
-                .unlock(password("correct"), ProcessChainHash::test(2))
+                .unlock(password("correct"), ScopeHash::test(2))
                 .await
         });
         wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
@@ -5434,7 +5407,7 @@ mod tests {
         }
         assert!(state.database_handle().await.is_none());
         assert!(!state.has_password_verifier().await);
-        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(2)).await);
     }
 
     #[tokio::test]
@@ -5448,9 +5421,7 @@ mod tests {
         for _ in 0..8 {
             let state = state.clone();
             tasks.push(tokio::spawn(async move {
-                state
-                    .unlock(password("correct"), ProcessChainHash::test(1))
-                    .await
+                state.unlock(password("correct"), ScopeHash::test(1)).await
             }));
         }
 
@@ -5466,16 +5437,14 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let old_access = Instant::now() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
             .set_last_authorized_database_access(Some(old_access))
             .await;
 
         assert!(
             state
-                .authorize_database_access(&ProcessChainHash::test(1))
+                .authorize_database_access(&ScopeHash::test(1))
                 .await
                 .is_some()
         );
@@ -5488,14 +5457,12 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let old_access = Instant::now() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
             .set_last_authorized_database_access(Some(old_access))
             .await;
 
-        assert!(state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
 
         assert_eq!(
             Some(old_access),
@@ -5508,29 +5475,23 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let inserted_at = Instant::now();
         state
-            .authorize_process_hash_at(ProcessChainHash::test(1), inserted_at)
+            .authorize_scope_hash_at(ScopeHash::test(1), inserted_at)
             .await;
 
         assert_eq!(
             None,
-            state
-                .authorization_expires_at(&ProcessChainHash::test(1))
-                .await
+            state.authorization_expires_at(&ScopeHash::test(1)).await
         );
 
         state.store_database_handle(DbHandle::test()).await;
 
         assert_eq!(
             Some(inserted_at + AUTH_TTL),
-            state
-                .authorization_expires_at(&ProcessChainHash::test(1))
-                .await
+            state.authorization_expires_at(&ScopeHash::test(1)).await
         );
         assert_eq!(
             None,
-            state
-                .authorization_expires_at(&ProcessChainHash::test(2))
-                .await
+            state.authorization_expires_at(&ScopeHash::test(2)).await
         );
     }
 
@@ -5544,17 +5505,12 @@ mod tests {
             .unwrap();
         state.store_database_handle(database).await;
         state
-            .authorize_process_hash_at(
-                ProcessChainHash::test(1),
-                Instant::now() - Duration::from_secs(2),
-            )
+            .authorize_scope_hash_at(ScopeHash::test(1), Instant::now() - Duration::from_secs(2))
             .await;
 
         assert_eq!(
             None,
-            state
-                .authorization_expires_at(&ProcessChainHash::test(1))
-                .await
+            state.authorization_expires_at(&ScopeHash::test(1)).await
         );
     }
 
@@ -5564,9 +5520,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state.set_last_authorized_database_access(Some(now)).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
@@ -5580,7 +5534,7 @@ mod tests {
 
         assert!(state.database_handle().await.is_some());
         assert!(state.has_password_verifier().await);
-        assert!(state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
         assert_eq!(
             Some(now + AUTH_TTL),
             state.max_authorization_expires_at().await
@@ -5593,9 +5547,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state.set_last_authorized_database_access(Some(now)).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
@@ -5607,7 +5559,7 @@ mod tests {
         assert!(!state.has_password_verifier().await);
         assert_eq!(None, state.last_authorized_database_access().await);
         assert_eq!(None, state.max_authorization_expires_at().await);
-        assert!(!state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
     }
 
     #[tokio::test]
@@ -5616,9 +5568,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state.set_last_authorized_database_access(Some(now)).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
@@ -5646,9 +5596,7 @@ mod tests {
         let now = Instant::now();
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now)
-            .await;
+        state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
         state.set_last_authorized_database_access(Some(now)).await;
         state
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
@@ -5674,7 +5622,7 @@ mod tests {
         let state = AgentState::from_database_path(file.path());
         let now = Instant::now();
         state
-            .unlock(password("correct"), ProcessChainHash::test(1))
+            .unlock(password("correct"), ScopeHash::test(1))
             .await
             .unwrap();
         let first_handle = state.database_handle().await.unwrap();
@@ -5686,13 +5634,13 @@ mod tests {
             .await;
 
         state
-            .unlock(password("correct"), ProcessChainHash::test(2))
+            .unlock(password("correct"), ScopeHash::test(2))
             .await
             .unwrap();
         let second_handle = state.database_handle().await.unwrap();
 
         assert!(!first_handle.ptr_eq(&second_handle));
-        assert!(state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert!(state.is_authorized(&ScopeHash::test(2)).await);
     }
 
     #[tokio::test]
@@ -5705,7 +5653,7 @@ mod tests {
         state.set_last_authorized_database_access(Some(now)).await;
         state.set_max_authorization_expires_at(Some(now)).await;
         state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now - AUTH_TTL)
+            .authorize_scope_hash_at(ScopeHash::test(1), now - AUTH_TTL)
             .await;
         state.set_last_cleanup_at(Some(now)).await;
         let before = database.dispatch_counts();
@@ -5731,7 +5679,7 @@ mod tests {
         state.set_last_authorized_database_access(Some(now)).await;
         state.set_max_authorization_expires_at(Some(now)).await;
         state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now - AUTH_TTL)
+            .authorize_scope_hash_at(ScopeHash::test(1), now - AUTH_TTL)
             .await;
         state
             .set_last_cleanup_at(Some(now - Duration::from_secs(119)))
@@ -5754,7 +5702,7 @@ mod tests {
         state.set_last_authorized_database_access(Some(now)).await;
         state.set_max_authorization_expires_at(Some(now)).await;
         state
-            .authorize_process_hash_at(ProcessChainHash::test(1), now - AUTH_TTL)
+            .authorize_scope_hash_at(ScopeHash::test(1), now - AUTH_TTL)
             .await;
         state
             .set_last_cleanup_at(Some(now - CLEANUP_INTERVAL))
@@ -9040,34 +8988,34 @@ mod tests {
         let now = Instant::now();
 
         for value in 0..32 {
-            cache.insert(ProcessChainHash::test(value), now);
+            cache.insert(ScopeHash::test(value), now);
         }
-        assert!(cache.contains(&ProcessChainHash::test(0), now, AUTH_TTL));
+        assert!(cache.contains(&ScopeHash::test(0), now, AUTH_TTL));
 
-        cache.insert(ProcessChainHash::test(32), now);
+        cache.insert(ScopeHash::test(32), now);
 
-        assert!(cache.contains(&ProcessChainHash::test(0), now, AUTH_TTL));
-        assert!(!cache.contains(&ProcessChainHash::test(1), now, AUTH_TTL));
+        assert!(cache.contains(&ScopeHash::test(0), now, AUTH_TTL));
+        assert!(!cache.contains(&ScopeHash::test(1), now, AUTH_TTL));
     }
 
     #[test]
     fn auth_cache_expires_after_fixed_ttl() {
         let mut cache = AuthCache::default();
         let now = Instant::now();
-        cache.insert(ProcessChainHash::test(1), now);
+        cache.insert(ScopeHash::test(1), now);
 
-        assert!(!cache.contains(&ProcessChainHash::test(1), now + AUTH_TTL, AUTH_TTL));
+        assert!(!cache.contains(&ScopeHash::test(1), now + AUTH_TTL, AUTH_TTL));
     }
 
     #[test]
     fn auth_cache_expires_at_returns_insertion_plus_ttl() {
         let mut cache = AuthCache::default();
         let now = Instant::now();
-        cache.insert(ProcessChainHash::test(1), now);
+        cache.insert(ScopeHash::test(1), now);
 
         assert_eq!(
             Some(now + AUTH_TTL),
-            cache.expires_at(&ProcessChainHash::test(1), now, AUTH_TTL)
+            cache.expires_at(&ScopeHash::test(1), now, AUTH_TTL)
         );
     }
 
@@ -9075,16 +9023,16 @@ mod tests {
     fn auth_cache_expires_at_returns_none_at_or_after_expiry() {
         let mut cache = AuthCache::default();
         let now = Instant::now();
-        cache.insert(ProcessChainHash::test(1), now);
+        cache.insert(ScopeHash::test(1), now);
 
         assert_eq!(
             None,
-            cache.expires_at(&ProcessChainHash::test(1), now + AUTH_TTL, AUTH_TTL)
+            cache.expires_at(&ScopeHash::test(1), now + AUTH_TTL, AUTH_TTL)
         );
         assert_eq!(
             None,
             cache.expires_at(
-                &ProcessChainHash::test(1),
+                &ScopeHash::test(1),
                 now + AUTH_TTL + Duration::from_secs(1),
                 AUTH_TTL
             )
@@ -9097,44 +9045,41 @@ mod tests {
         let now = Instant::now();
 
         for value in 0..32 {
-            cache.insert(ProcessChainHash::test(value), now);
+            cache.insert(ScopeHash::test(value), now);
         }
 
         assert_eq!(
             Some(now + AUTH_TTL),
-            cache.expires_at(&ProcessChainHash::test(0), now, AUTH_TTL)
+            cache.expires_at(&ScopeHash::test(0), now, AUTH_TTL)
         );
-        cache.insert(ProcessChainHash::test(32), now);
+        cache.insert(ScopeHash::test(32), now);
 
-        assert!(!cache.contains(&ProcessChainHash::test(0), now, AUTH_TTL));
-        assert!(cache.contains(&ProcessChainHash::test(1), now, AUTH_TTL));
+        assert!(!cache.contains(&ScopeHash::test(0), now, AUTH_TTL));
+        assert!(cache.contains(&ScopeHash::test(1), now, AUTH_TTL));
     }
 
     #[test]
     fn auth_cache_lookup_does_not_extend_expiration() {
         let mut cache = AuthCache::default();
         let now = Instant::now();
-        cache.insert(ProcessChainHash::test(1), now);
+        cache.insert(ScopeHash::test(1), now);
 
         assert!(cache.contains(
-            &ProcessChainHash::test(1),
+            &ScopeHash::test(1),
             now + AUTH_TTL - Duration::from_secs(1),
             AUTH_TTL
         ));
-        assert!(!cache.contains(&ProcessChainHash::test(1), now + AUTH_TTL, AUTH_TTL));
+        assert!(!cache.contains(&ScopeHash::test(1), now + AUTH_TTL, AUTH_TTL));
     }
 
     #[test]
     fn auth_cache_reinsert_refreshes_insertion_time() {
         let mut cache = AuthCache::default();
         let now = Instant::now();
-        cache.insert(ProcessChainHash::test(1), now);
-        cache.insert(
-            ProcessChainHash::test(1),
-            now + AUTH_TTL - Duration::from_secs(1),
-        );
+        cache.insert(ScopeHash::test(1), now);
+        cache.insert(ScopeHash::test(1), now + AUTH_TTL - Duration::from_secs(1));
 
-        assert!(cache.contains(&ProcessChainHash::test(1), now + AUTH_TTL, AUTH_TTL));
+        assert!(cache.contains(&ScopeHash::test(1), now + AUTH_TTL, AUTH_TTL));
     }
 
     fn create_encrypted_database(path: &std::path::Path, password: &str) {

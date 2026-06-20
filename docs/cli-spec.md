@@ -33,7 +33,7 @@ as a diagnostic, but never as a keepalive because it intentionally refreshes
 neither authorization nor idle state.
 
 Secret-bearing item reads can require the same bearer password on the original
-read request, even after process-chain authorization succeeds. If `read`,
+read request, even after process-lineage authorization succeeds. If `read`,
 secret-bearing `show --reveal`, or any raw item read gets `403 access_denied`,
 prompt/unlock as above and retry the original read once with
 `Authorization: Bearer <standard-base64 UTF-8 password>`.
@@ -73,7 +73,7 @@ the tracer status cannot be read or parsed.
 monopass lock
 ```
 
-Use `POST /api/v1/auth/lock` to clear cached process authorizations and
+Use `POST /api/v1/auth/lock` to clear cached process-lineage authorizations and
 schedule the unlocked database for unload on the agent's next authorization
 expiry sweep. The command does not prompt for the master password when the
 agent returns `403 access_denied`.

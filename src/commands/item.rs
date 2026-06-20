@@ -168,13 +168,15 @@ pub fn add(config: &Config, args: AddArgs) -> AppResult {
     let client = Client::new(config);
     let request = build_create_request(
         &client,
-        args.username,
-        args.password_prompt,
-        args.generate_password.as_deref(),
-        args.totp.as_deref(),
-        args.fields,
-        args.concealed_fields,
-        args.files,
+        ItemInput {
+            username: args.username,
+            password_prompt: args.password_prompt,
+            generate_password: args.generate_password,
+            totp: args.totp,
+            fields: args.fields,
+            concealed_fields: args.concealed_fields,
+            files: args.files,
+        },
     )?;
     client.put_json(
         &api_path(&format!(
@@ -191,13 +193,15 @@ pub fn edit(config: &Config, args: EditArgs) -> AppResult {
     let client = Client::new(config);
     let mut request = build_update_request(
         &client,
-        args.username,
-        args.password_prompt,
-        args.generate_password.as_deref(),
-        args.totp.as_deref(),
-        args.fields,
-        args.concealed_fields,
-        args.files,
+        ItemInput {
+            username: args.username,
+            password_prompt: args.password_prompt,
+            generate_password: args.generate_password,
+            totp: args.totp,
+            fields: args.fields,
+            concealed_fields: args.concealed_fields,
+            files: args.files,
+        },
     )?;
     for name in args.remove_fields {
         request
@@ -564,53 +568,66 @@ fn trash_suffix_limit_error() -> io::Error {
     )
 }
 
-fn build_create_request(
-    client: &Client<'_>,
+struct ItemInput {
     username: Option<String>,
     password_prompt: bool,
-    generate_password: Option<&str>,
-    totp: Option<&str>,
+    generate_password: Option<String>,
+    totp: Option<String>,
     fields: Vec<String>,
     concealed_fields: Option<Vec<String>>,
     files: Vec<String>,
-) -> AppResult<CreateItemRequest> {
-    let file_inputs = parse_file_inputs(files)?;
-    let mut request = CreateItemRequest::default();
-    request.fields = build_fields(
+}
+
+fn build_create_request(client: &Client<'_>, input: ItemInput) -> AppResult<CreateItemRequest> {
+    let ItemInput {
         username,
         password_prompt,
         generate_password,
         totp,
         fields,
         concealed_fields,
+        files,
+    } = input;
+    let file_inputs = parse_file_inputs(files)?;
+    let fields = build_fields(
+        username,
+        password_prompt,
+        generate_password.as_deref(),
+        totp.as_deref(),
+        fields,
+        concealed_fields,
     )?;
     validate_field_and_file_name_overlap(
-        request.fields.iter().map(|field| field.name.as_str()),
+        fields.iter().map(|field| field.name.as_str()),
         file_inputs.iter().map(|file| file.name.as_str()),
     )?;
+    let mut request = CreateItemRequest {
+        fields,
+        ..CreateItemRequest::default()
+    };
     for (name, id) in upload_files(client, file_inputs)? {
         request.files.push(FileInput { name, id });
     }
     Ok(request)
 }
 
-fn build_update_request(
-    client: &Client<'_>,
-    username: Option<String>,
-    password_prompt: bool,
-    generate_password: Option<&str>,
-    totp: Option<&str>,
-    fields: Vec<String>,
-    concealed_fields: Option<Vec<String>>,
-    files: Vec<String>,
-) -> AppResult<UpdateItemRequest> {
+fn build_update_request(client: &Client<'_>, input: ItemInput) -> AppResult<UpdateItemRequest> {
+    let ItemInput {
+        username,
+        password_prompt,
+        generate_password,
+        totp,
+        fields,
+        concealed_fields,
+        files,
+    } = input;
     let file_inputs = parse_file_inputs(files)?;
     let mut request = UpdateItemRequest::default();
     for field in build_fields(
         username,
         password_prompt,
-        generate_password,
-        totp,
+        generate_password.as_deref(),
+        totp.as_deref(),
         fields,
         concealed_fields,
     )? {
@@ -838,6 +855,15 @@ fn prompt_confirmed_password() -> io::Result<Zeroizing<String>> {
         ));
     }
     Ok(password)
+}
+
+#[cfg(test)]
+fn remove_item_is_permanent_delete(dir: &str, force: bool) -> bool {
+    force || dir == "Trash"
+}
+
+fn remove_dir_after_recursive_delete(dir: &str) -> bool {
+    dir != "Trash"
 }
 
 #[cfg(test)]
@@ -1156,13 +1182,4 @@ mod tests {
         assert_eq!("1.0 KB", human_size(1024));
         assert_eq!("1.2 MB", human_size(1_258_291));
     }
-}
-
-#[cfg(test)]
-fn remove_item_is_permanent_delete(dir: &str, force: bool) -> bool {
-    force || dir == "Trash"
-}
-
-fn remove_dir_after_recursive_delete(dir: &str) -> bool {
-    dir != "Trash"
 }

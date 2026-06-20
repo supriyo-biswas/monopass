@@ -1,11 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::fs::Metadata;
 
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ProcessChainHash([u8; 32]);
+const MAX_PROCESS_CHAIN_DEPTH: usize = 256;
 
-impl ProcessChainHash {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ScopeHash([u8; 32]);
+
+impl ScopeHash {
     #[cfg(test)]
     pub(crate) fn test(value: u8) -> Self {
         let mut hash = [0u8; 32];
@@ -14,156 +16,311 @@ impl ProcessChainHash {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcessElement {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessStartTime {
+    primary: u64,
+    secondary: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessInstanceIdentity {
     pid: i32,
-    exe: ProcessExe,
+    start_time: ProcessStartTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecutableIdentity {
+    device: u64,
+    inode: u64,
+    generation: Option<u32>,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StableProcessIdentity {
+    Executable(ExecutableIdentity),
+    Instance(ProcessInstanceIdentity),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ProcessExe {
-    Path(PathBuf),
-    Missing,
+struct ProcessInfo {
+    instance: ProcessInstanceIdentity,
+    parent_pid: i32,
+    uid: u32,
+    session_id: i32,
+    executable: Option<ExecutableIdentity>,
 }
 
-pub(crate) fn hash_verified_client_chain(peer_pid: i32) -> Option<ProcessChainHash> {
+impl ProcessInfo {
+    fn stable_identity(&self) -> StableProcessIdentity {
+        self.executable
+            .map(StableProcessIdentity::Executable)
+            .unwrap_or(StableProcessIdentity::Instance(self.instance))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorizationScope {
+    uid: u32,
+    session_id: i32,
+    anchor: ProcessInstanceIdentity,
+    chain: Vec<StableProcessIdentity>,
+}
+
+pub(crate) fn resolve_authorization_scope_hash(peer_pid: i32, peer_uid: u32) -> Option<ScopeHash> {
     let resolver = PlatformProcessResolver;
-    hash_verified_client_chain_with_resolver(peer_pid, std::env::current_exe().ok()?, &resolver)
+    resolve_authorization_scope_hash_with_resolver(peer_pid, peer_uid, &resolver)
 }
 
 trait ProcessResolver {
-    fn parent_pid(&self, pid: i32) -> Option<i32>;
-    fn exe_path(&self, pid: i32) -> Option<PathBuf>;
+    fn process_info(&self, pid: i32) -> Option<ProcessInfo>;
+    fn process_uid(&self, pid: i32) -> Option<u32>;
 }
 
-fn hash_verified_client_chain_with_resolver(
+fn resolve_authorization_scope_hash_with_resolver(
     peer_pid: i32,
-    agent_exe: impl AsRef<Path>,
+    peer_uid: u32,
     resolver: &impl ProcessResolver,
-) -> Option<ProcessChainHash> {
-    let mut chain = client_ancestor_chain(peer_pid, resolver)?;
-    chain.reverse();
-
-    if client_executable_matches_agent(&chain, agent_exe.as_ref()) {
-        chain.pop();
-    }
-
-    Some(hash_client_chain(&chain))
-}
-
-fn client_ancestor_chain(
-    peer_pid: i32,
-    resolver: &impl ProcessResolver,
-) -> Option<Vec<ProcessElement>> {
-    let mut pid = peer_pid;
-    let mut chain = Vec::new();
-    let mut reached_root = false;
-
-    for _ in 0..256 {
-        if chain
-            .iter()
-            .any(|element: &ProcessElement| element.pid == pid)
-        {
-            return None;
-        }
-        let exe = resolver
-            .exe_path(pid)
-            .map(ProcessExe::Path)
-            .unwrap_or(ProcessExe::Missing);
-        chain.push(ProcessElement { pid, exe });
-
-        let parent = resolver.parent_pid(pid)?;
-        if parent <= 0 {
-            reached_root = true;
-            break;
-        }
-        if parent == pid {
-            return None;
-        }
-        pid = parent;
-    }
-
-    if !reached_root {
+) -> Option<ScopeHash> {
+    let mut current = resolver.process_info(peer_pid)?;
+    if current.uid != peer_uid {
         return None;
     }
 
-    Some(chain)
-}
+    let session_id = current.session_id;
+    let mut chain = Vec::new();
 
-fn client_executable_matches_agent(chain: &[ProcessElement], agent_exe: &Path) -> bool {
-    matches!(
-        chain.last().map(|element| &element.exe),
-        Some(ProcessExe::Path(client_exe)) if same_executable(client_exe, agent_exe)
-    )
-}
-
-fn same_executable(left: &Path, right: &Path) -> bool {
-    let left = left.canonicalize().unwrap_or_else(|_| left.to_owned());
-    let right = right.canonicalize().unwrap_or_else(|_| right.to_owned());
-    left == right
-}
-
-fn hash_client_chain(chain: &[ProcessElement]) -> ProcessChainHash {
-    let mut hasher = Sha256::new();
-    for element in chain {
-        hasher.update(element.pid.to_ne_bytes());
-        hasher.update([0]);
-        match &element.exe {
-            ProcessExe::Path(path) => {
-                hasher.update([1]);
-                hasher.update(path.as_os_str().as_encoded_bytes());
-            }
-            ProcessExe::Missing => {
-                hasher.update([2]);
-                hasher.update(b"<missing-executable-path>");
-            }
+    for _ in 0..MAX_PROCESS_CHAIN_DEPTH {
+        if current.uid != peer_uid || current.session_id != session_id {
+            break;
         }
-        hasher.update([0xff]);
+        if chain
+            .iter()
+            .any(|element: &ProcessInfo| element.instance.pid == current.instance.pid)
+        {
+            return None;
+        }
+
+        let parent_pid = current.parent_pid;
+        chain.push(current);
+        if parent_pid <= 0 {
+            break;
+        }
+
+        let parent_uid = resolver.process_uid(parent_pid)?;
+        if parent_uid != peer_uid {
+            break;
+        }
+
+        let parent = resolver.process_info(parent_pid)?;
+        if parent.uid != peer_uid || parent.session_id != session_id {
+            break;
+        }
+        current = parent;
     }
 
-    ProcessChainHash(hasher.finalize().into())
+    if chain.is_empty() {
+        return None;
+    }
+    if chain.len() == MAX_PROCESS_CHAIN_DEPTH
+        && chain.last().is_some_and(|process| process.parent_pid > 0)
+    {
+        return None;
+    }
+
+    chain.reverse();
+    let anchor = chain.first()?.instance;
+    let scope = AuthorizationScope {
+        uid: peer_uid,
+        session_id,
+        anchor,
+        chain: chain.iter().map(ProcessInfo::stable_identity).collect(),
+    };
+
+    Some(hash_authorization_scope(&scope))
+}
+
+fn hash_authorization_scope(scope: &AuthorizationScope) -> ScopeHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"monopass-authorization-scope-v1\0");
+    hasher.update(scope.uid.to_le_bytes());
+    hasher.update(scope.session_id.to_le_bytes());
+    hash_instance(&mut hasher, scope.anchor);
+    hasher.update((scope.chain.len() as u64).to_le_bytes());
+
+    for identity in &scope.chain {
+        match identity {
+            StableProcessIdentity::Executable(executable) => {
+                hasher.update([1]);
+                hasher.update(executable.device.to_le_bytes());
+                hasher.update(executable.inode.to_le_bytes());
+                match executable.generation {
+                    Some(generation) => {
+                        hasher.update([1]);
+                        hasher.update(generation.to_le_bytes());
+                    }
+                    None => hasher.update([0]),
+                }
+                hasher.update(executable.size.to_le_bytes());
+                hasher.update(executable.modified_seconds.to_le_bytes());
+                hasher.update(executable.modified_nanoseconds.to_le_bytes());
+                hasher.update(executable.changed_seconds.to_le_bytes());
+                hasher.update(executable.changed_nanoseconds.to_le_bytes());
+            }
+            StableProcessIdentity::Instance(instance) => {
+                hasher.update([2]);
+                hash_instance(&mut hasher, *instance);
+            }
+        }
+    }
+
+    ScopeHash(hasher.finalize().into())
+}
+
+fn hash_instance(hasher: &mut Sha256, instance: ProcessInstanceIdentity) {
+    hasher.update(instance.pid.to_le_bytes());
+    hasher.update(instance.start_time.primary.to_le_bytes());
+    hasher.update(instance.start_time.secondary.to_le_bytes());
+}
+
+fn executable_identity(metadata: &Metadata) -> ExecutableIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    ExecutableIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        generation: executable_generation(metadata),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn executable_generation(_metadata: &Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn executable_generation(metadata: &Metadata) -> Option<u32> {
+    Some(std::os::darwin::fs::MetadataExt::st_gen(metadata))
 }
 
 struct PlatformProcessResolver;
 
 #[cfg(target_os = "linux")]
 impl ProcessResolver for PlatformProcessResolver {
-    fn parent_pid(&self, pid: i32) -> Option<i32> {
-        linux_parent_pid_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    fn process_info(&self, pid: i32) -> Option<ProcessInfo> {
+        use std::os::unix::fs::MetadataExt;
+
+        let process_dir = std::fs::metadata(format!("/proc/{pid}")).ok()?;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let stat = parse_linux_process_stat(&stat)?;
+
+        Some(ProcessInfo {
+            instance: ProcessInstanceIdentity {
+                pid,
+                start_time: ProcessStartTime {
+                    primary: stat.start_time,
+                    secondary: 0,
+                },
+            },
+            parent_pid: stat.parent_pid,
+            uid: process_dir.uid(),
+            session_id: stat.session_id,
+            executable: std::fs::metadata(format!("/proc/{pid}/exe"))
+                .ok()
+                .map(|metadata| executable_identity(&metadata)),
+        })
     }
 
-    fn exe_path(&self, pid: i32) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    fn process_uid(&self, pid: i32) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt;
+
+        Some(std::fs::metadata(format!("/proc/{pid}")).ok()?.uid())
     }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_parent_pid_from_stat(stat: &str) -> Option<i32> {
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxProcessStat {
+    parent_pid: i32,
+    session_id: i32,
+    start_time: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
     let close = stat.rfind(')')?;
     let after_comm = stat.get(close + 2..)?;
     let mut fields = after_comm.split_whitespace();
     let _state = fields.next()?;
-    fields.next()?.parse().ok()
+    let parent_pid = fields.next()?.parse().ok()?;
+    let _process_group = fields.next()?;
+    let session_id = fields.next()?.parse().ok()?;
+    for _ in 7..=21 {
+        fields.next()?;
+    }
+    let start_time = fields.next()?.parse().ok()?;
+
+    Some(LinuxProcessStat {
+        parent_pid,
+        session_id,
+        start_time,
+    })
 }
 
 #[cfg(target_os = "macos")]
 impl ProcessResolver for PlatformProcessResolver {
-    fn parent_pid(&self, pid: i32) -> Option<i32> {
-        macos_parent_pid_from_bsd_info(pid)
-            .or_else(|| macos_parent_pid_from_short_bsd_info(pid))
-            .or_else(|| (pid == 1).then_some(0))
-    }
-
-    fn exe_path(&self, pid: i32) -> Option<PathBuf> {
-        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        let len = unsafe { proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
-        if len <= 0 {
+    fn process_info(&self, pid: i32) -> Option<ProcessInfo> {
+        let info = macos_bsd_info(pid)?;
+        let session_id = unsafe { libc::getsid(pid) };
+        if session_id < 0 {
             return None;
         }
 
-        buffer.truncate(len as usize);
-        Some(PathBuf::from(String::from_utf8(buffer).ok()?))
+        Some(ProcessInfo {
+            instance: ProcessInstanceIdentity {
+                pid,
+                start_time: ProcessStartTime {
+                    primary: info.pbi_start_tvsec,
+                    secondary: info.pbi_start_tvusec,
+                },
+            },
+            parent_pid: i32::try_from(info.pbi_ppid).ok()?,
+            uid: info.pbi_uid,
+            session_id,
+            executable: macos_executable_metadata(pid)
+                .map(|metadata| executable_identity(&metadata)),
+        })
     }
+
+    fn process_uid(&self, pid: i32) -> Option<u32> {
+        macos_bsd_info(pid)
+            .map(|info| info.pbi_uid)
+            .or_else(|| macos_short_bsd_info(pid).map(|info| info.pbsi_uid))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_executable_metadata(pid: i32) -> Option<Metadata> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+
+    buffer.truncate(len as usize);
+    let path = std::ffi::OsString::from_vec(buffer);
+    std::fs::metadata(path).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -172,7 +329,7 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_parent_pid_from_bsd_info(pid: i32) -> Option<i32> {
+fn macos_bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
     let result = unsafe {
@@ -185,31 +342,30 @@ fn macos_parent_pid_from_bsd_info(pid: i32) -> Option<i32> {
         )
     };
 
-    (result == size)
-        .then(|| i32::try_from(unsafe { info.assume_init() }.pbi_ppid).ok())
-        .flatten()
+    (result == size).then(|| unsafe { info.assume_init() })
 }
 
 #[cfg(target_os = "macos")]
-fn macos_parent_pid_from_short_bsd_info(pid: i32) -> Option<i32> {
-    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pbsi_pid: u32,
+    pbsi_ppid: u32,
+    pbsi_pgid: u32,
+    pbsi_status: u32,
+    pbsi_comm: [libc::c_char; libc::MAXCOMLEN],
+    pbsi_flags: u32,
+    pbsi_uid: libc::uid_t,
+    pbsi_gid: libc::gid_t,
+    pbsi_ruid: libc::uid_t,
+    pbsi_rgid: libc::gid_t,
+    pbsi_svuid: libc::uid_t,
+    pbsi_svgid: libc::gid_t,
+    pbsi_rfu: u32,
+}
 
-    #[repr(C)]
-    struct ProcBsdShortInfo {
-        pbsi_pid: u32,
-        pbsi_ppid: u32,
-        pbsi_pgid: u32,
-        pbsi_status: u32,
-        pbsi_comm: [libc::c_char; libc::MAXCOMLEN],
-        pbsi_flags: u32,
-        pbsi_uid: libc::uid_t,
-        pbsi_gid: libc::gid_t,
-        pbsi_ruid: libc::uid_t,
-        pbsi_rgid: libc::gid_t,
-        pbsi_svuid: libc::uid_t,
-        pbsi_svgid: libc::gid_t,
-        pbsi_rfu: u32,
-    }
+#[cfg(target_os = "macos")]
+fn macos_short_bsd_info(pid: i32) -> Option<ProcBsdShortInfo> {
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
 
     let mut info = std::mem::MaybeUninit::<ProcBsdShortInfo>::uninit();
     let size = std::mem::size_of::<ProcBsdShortInfo>() as i32;
@@ -223,273 +379,289 @@ fn macos_parent_pid_from_short_bsd_info(pid: i32) -> Option<i32> {
         )
     };
 
-    (result == size)
-        .then(|| i32::try_from(unsafe { info.assume_init() }.pbsi_ppid).ok())
-        .flatten()
+    (result == size).then(|| unsafe { info.assume_init() })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("process-chain authorization is supported only on Linux and macOS");
+compile_error!("process-lineage authorization is supported only on Linux and macOS");
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
-    use super::{ProcessElement, ProcessExe, ProcessResolver};
+    use super::{
+        ExecutableIdentity, ProcessInfo, ProcessInstanceIdentity, ProcessResolver, ProcessStartTime,
+    };
+
+    const UID: u32 = 501;
+    const SID: i32 = 9;
 
     #[derive(Default)]
     struct FakeResolver {
-        parents: HashMap<i32, i32>,
-        paths: HashMap<i32, PathBuf>,
+        processes: HashMap<i32, ProcessInfo>,
+        visible_uids: HashMap<i32, u32>,
     }
 
     impl FakeResolver {
-        fn with(mut self, pid: i32, parent: i32, path: &str) -> Self {
-            self.parents.insert(pid, parent);
-            self.paths.insert(pid, PathBuf::from(path));
+        fn with(mut self, pid: i32, parent: i32, uid: u32, sid: i32, exe: u64) -> Self {
+            let process = process(pid, parent, uid, sid, Some(exe));
+            self.visible_uids.insert(pid, uid);
+            self.processes.insert(pid, process);
             self
         }
 
-        fn with_missing_path(mut self, pid: i32, parent: i32) -> Self {
-            self.parents.insert(pid, parent);
+        fn with_missing_executable(mut self, pid: i32, parent: i32, uid: u32, sid: i32) -> Self {
+            let process = process(pid, parent, uid, sid, None);
+            self.visible_uids.insert(pid, uid);
+            self.processes.insert(pid, process);
+            self
+        }
+
+        fn with_uid_only(mut self, pid: i32, uid: u32) -> Self {
+            self.visible_uids.insert(pid, uid);
             self
         }
     }
 
     impl ProcessResolver for FakeResolver {
-        fn parent_pid(&self, pid: i32) -> Option<i32> {
-            self.parents.get(&pid).copied()
+        fn process_info(&self, pid: i32) -> Option<ProcessInfo> {
+            self.processes.get(&pid).cloned()
         }
 
-        fn exe_path(&self, pid: i32) -> Option<PathBuf> {
-            self.paths.get(&pid).cloned()
+        fn process_uid(&self, pid: i32) -> Option<u32> {
+            self.visible_uids.get(&pid).copied()
         }
     }
 
     #[test]
-    fn independent_client_chain_no_longer_needs_to_reach_agent() {
-        let resolver = FakeResolver::default()
-            .with(10, 9, "/client")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
-
-        assert!(super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).is_some());
-    }
-
-    #[test]
-    fn root_to_client_chain_is_hashed_in_ancestor_order() {
-        let resolver = FakeResolver::default()
-            .with(10, 9, "/client")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
-
-        let verified =
-            super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).unwrap();
-        let direct = super::hash_client_chain(&[
-            path_element(1, "/init"),
-            path_element(9, "/shell"),
-            path_element(10, "/client"),
-        ]);
-
-        assert_eq!(direct, verified);
-    }
-
-    #[test]
-    fn same_binary_client_executable_is_excluded_from_hash() {
-        let resolver = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
-
-        let verified =
-            super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).unwrap();
-        let direct =
-            super::hash_client_chain(&[path_element(1, "/init"), path_element(9, "/shell")]);
-
-        assert_eq!(direct, verified);
-    }
-
-    #[test]
-    fn same_binary_client_executable_exclusion_allows_independent_invocations_from_same_shell() {
+    fn transient_process_pids_are_ignored_when_executables_match() {
         let first = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
+            .with(12, 11, UID, SID, 3)
+            .with(11, 10, UID, SID, 2)
+            .with(10, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with(1, 0, 0, 1, 8);
         let second = FakeResolver::default()
-            .with(11, 9, "/agent")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
+            .with(22, 21, UID, SID, 3)
+            .with(21, 20, UID, SID, 2)
+            .with(20, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with(1, 0, 0, 1, 8);
 
-        let first_hash = super::hash_verified_client_chain_with_resolver(10, "/agent", &first);
-        let second_hash = super::hash_verified_client_chain_with_resolver(11, "/agent", &second);
+        let first = super::resolve_authorization_scope_hash_with_resolver(12, UID, &first);
+        let second = super::resolve_authorization_scope_hash_with_resolver(22, UID, &second);
 
-        assert_eq!(first_hash, second_hash);
+        assert_eq!(first, second);
     }
 
     #[test]
-    fn different_client_executable_is_included_in_hash() {
+    fn direct_client_executable_is_included() {
         let first = FakeResolver::default()
-            .with(10, 9, "/client")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
+            .with(10, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with(11, 9, "/other-client")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
+            .with(11, 9, UID, SID, 2)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
 
-        let first_hash =
-            super::hash_verified_client_chain_with_resolver(10, "/agent", &first).unwrap();
-        let second_hash =
-            super::hash_verified_client_chain_with_resolver(11, "/agent", &second).unwrap();
-
-        assert_ne!(first_hash, second_hash);
+        assert_ne!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(11, UID, &second)
+        );
     }
 
     #[test]
-    fn different_shell_ancestor_pids_produce_different_hashes() {
+    fn different_anchor_instances_are_distinct() {
         let first = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with(9, 1, "/shell")
-            .with(1, 0, "/init");
+            .with(10, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with(11, 8, "/agent")
-            .with(8, 1, "/shell")
-            .with(1, 0, "/init");
+            .with(10, 8, UID, SID, 1)
+            .with(8, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
 
-        let first_hash =
-            super::hash_verified_client_chain_with_resolver(10, "/agent", &first).unwrap();
-        let second_hash =
-            super::hash_verified_client_chain_with_resolver(11, "/agent", &second).unwrap();
-
-        assert_ne!(first_hash, second_hash);
+        assert_ne!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &second)
+        );
     }
 
     #[test]
-    fn missing_ancestor_executable_path_hashes_marker_instead_of_rejecting() {
+    fn different_sessions_are_distinct() {
+        let first = FakeResolver::default()
+            .with(10, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with(10, 9, UID, 8, 1)
+            .with(9, 1, UID, 8, 9)
+            .with_uid_only(1, 0);
+
+        assert_ne!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &second)
+        );
+    }
+
+    #[test]
+    fn missing_executable_falls_back_to_process_instance() {
+        let first = FakeResolver::default()
+            .with_missing_executable(10, 9, UID, SID)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with_missing_executable(11, 9, UID, SID)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
+
+        assert_ne!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(11, UID, &second)
+        );
+    }
+
+    #[test]
+    fn changed_executable_metadata_changes_scope() {
+        let first = FakeResolver::default()
+            .with(10, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with(10, 9, UID, SID, 2)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
+
+        assert_ne!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &second)
+        );
+    }
+
+    #[test]
+    fn different_user_parent_is_a_successful_boundary() {
         let resolver = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with_missing_path(9, 1)
-            .with(1, 0, "/init");
-
-        let verified =
-            super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).unwrap();
-        let direct = super::hash_client_chain(&[path_element(1, "/init"), missing_element(9)]);
-
-        assert_eq!(direct, verified);
-    }
-
-    #[test]
-    fn missing_parent_pid_is_rejected() {
-        let resolver = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with(9, 1, "/shell");
-
-        assert!(super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).is_none());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_platform_resolver_hashes_current_process_chain() {
-        let resolver = super::PlatformProcessResolver;
+            .with(10, 9, UID, SID, 1)
+            .with(9, 1, UID, SID, 9)
+            .with_uid_only(1, 0);
 
         assert!(
-            super::hash_verified_client_chain_with_resolver(
-                std::process::id() as i32,
-                "/not/the/current/test/binary",
-                &resolver,
-            )
-            .is_some()
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_some()
+        );
+    }
+
+    #[test]
+    fn different_session_parent_is_a_successful_boundary() {
+        let resolver = FakeResolver::default()
+            .with(10, 9, UID, SID, 1)
+            .with(9, 8, UID, SID, 9)
+            .with(8, 1, UID, 8, 8);
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_some()
+        );
+    }
+
+    #[test]
+    fn inaccessible_same_user_parent_is_rejected() {
+        let resolver = FakeResolver::default()
+            .with(10, 9, UID, SID, 1)
+            .with_uid_only(9, UID);
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_none()
+        );
+    }
+
+    #[test]
+    fn missing_parent_uid_is_rejected() {
+        let resolver = FakeResolver::default().with(10, 9, UID, SID, 1);
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_none()
         );
     }
 
     #[test]
     fn parent_loop_is_rejected() {
         let resolver = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with(9, 8, "/shell")
-            .with(8, 9, "/login");
+            .with(10, 9, UID, SID, 1)
+            .with(9, 10, UID, SID, 9);
 
-        assert!(super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).is_none());
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_none()
+        );
     }
 
     #[test]
     fn chain_deeper_than_traversal_limit_is_rejected() {
         let mut resolver = FakeResolver::default();
         for pid in 1..=257 {
-            resolver = resolver.with(pid, pid - 1, "/process");
+            resolver = resolver.with(pid, pid - 1, UID, SID, pid as u64);
         }
 
         assert!(
-            super::hash_verified_client_chain_with_resolver(257, "/agent", &resolver).is_none()
+            super::resolve_authorization_scope_hash_with_resolver(257, UID, &resolver).is_none()
         );
     }
 
     #[test]
-    fn direct_self_parent_loop_is_rejected() {
-        let resolver = FakeResolver::default()
-            .with(10, 9, "/agent")
-            .with(9, 9, "/shell");
+    fn parses_linux_process_stat() {
+        let stat = "123 (name with ) paren) S 456 444 333 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 999";
 
-        assert!(super::hash_verified_client_chain_with_resolver(10, "/agent", &resolver).is_none());
-    }
-
-    #[test]
-    fn different_pid_chains_produce_different_hashes() {
-        let first = super::hash_client_chain(&[ProcessElement {
-            pid: 10,
-            exe: ProcessExe::Path(PathBuf::from("/client")),
-        }]);
-        let second = super::hash_client_chain(&[ProcessElement {
-            pid: 11,
-            exe: ProcessExe::Path(PathBuf::from("/client")),
-        }]);
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn different_paths_produce_different_hashes() {
-        let first = super::hash_client_chain(&[ProcessElement {
-            pid: 10,
-            exe: ProcessExe::Path(PathBuf::from("/client")),
-        }]);
-        let second = super::hash_client_chain(&[ProcessElement {
-            pid: 10,
-            exe: ProcessExe::Path(PathBuf::from("/other-client")),
-        }]);
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn missing_path_marker_produces_different_hash_from_same_pid_path() {
-        let missing = super::hash_client_chain(&[missing_element(10)]);
-        let resolved = super::hash_client_chain(&[path_element(10, "/client")]);
-
-        assert_ne!(missing, resolved);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parses_linux_stat_parent_pid() {
         assert_eq!(
-            Some(456),
-            super::linux_parent_pid_from_stat("123 (name with ) paren) S 456 1 1 0")
+            Some(super::LinuxProcessStat {
+                parent_pid: 456,
+                session_id: 333,
+                start_time: 999,
+            }),
+            super::parse_linux_process_stat(stat)
         );
     }
 
-    fn path_element(pid: i32, path: &str) -> ProcessElement {
-        ProcessElement {
-            pid,
-            exe: ProcessExe::Path(PathBuf::from(path)),
+    #[test]
+    fn platform_resolver_hashes_current_process_scope() {
+        assert!(
+            super::resolve_authorization_scope_hash(std::process::id() as i32, unsafe {
+                libc::geteuid()
+            },)
+            .is_some()
+        );
+    }
+
+    fn process(
+        pid: i32,
+        parent_pid: i32,
+        uid: u32,
+        session_id: i32,
+        executable: Option<u64>,
+    ) -> ProcessInfo {
+        ProcessInfo {
+            instance: ProcessInstanceIdentity {
+                pid,
+                start_time: ProcessStartTime {
+                    primary: pid as u64 * 10,
+                    secondary: 0,
+                },
+            },
+            parent_pid,
+            uid,
+            session_id,
+            executable: executable.map(test_executable),
         }
     }
 
-    fn missing_element(pid: i32) -> ProcessElement {
-        ProcessElement {
-            pid,
-            exe: ProcessExe::Missing,
+    fn test_executable(inode: u64) -> ExecutableIdentity {
+        ExecutableIdentity {
+            device: 1,
+            inode,
+            generation: Some(1),
+            size: 100,
+            modified_seconds: 1,
+            modified_nanoseconds: 2,
+            changed_seconds: 3,
+            changed_nanoseconds: 4,
         }
     }
 }

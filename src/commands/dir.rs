@@ -38,7 +38,7 @@ pub fn mkdir(config: &Config, args: MkdirArgs) -> AppResult {
     let path = api_path(&format!("/dir/{}", path_component(&args.dir)));
     match client.put_empty(&path) {
         Ok(()) => Ok(()),
-        Err(error) if args.parents && is_conflict(&error) => Ok(()),
+        Err(error) if args.parents && is_conflict(error.as_ref()) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -138,7 +138,7 @@ pub fn list_all_dirs(client: &Client<'_>) -> AppResult<Vec<DirResponse>> {
     }
 }
 
-fn is_conflict(error: &Box<dyn std::error::Error>) -> bool {
+fn is_conflict(error: &(dyn std::error::Error + 'static)) -> bool {
     error
         .downcast_ref::<super::client::ApiError>()
         .is_some_and(|error| error.status == 409 && error.code == "conflict")

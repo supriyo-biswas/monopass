@@ -10,6 +10,20 @@ Timestamps are stored as Unix seconds and returned as RFC3339 UTC strings.
 
 ## Auth
 
+The agent derives an authorization scope from the Unix peer credentials and the
+peer's process lineage. A scope contains the caller UID and session ID, the PID
+and start time of the oldest accessible same-user process in that session, and
+the ordered identity of every process from that anchor through the direct
+client. The direct `monopass` process is included.
+
+Each lineage element uses executable file identity (device, inode, available
+generation, size, modification time, and change time) when available. If the
+executable cannot be inspected, the element falls back to PID plus process
+start time. A different scope, changed executable, changed ordered lineage, or
+PID/start-time fallback from a new process requires reauthorization. Traversal
+stops before a different-user or different-session ancestor and otherwise
+fails closed when required process identity cannot be resolved.
+
 ### Unlock
 
 ```http
@@ -31,7 +45,7 @@ POST /api/v1/auth/lock
 HTTP/1.1 200 OK
 ```
 
-Clears cached process-chain authorizations immediately and schedules the
+Clears cached process-lineage authorizations immediately and schedules the
 unlocked database for unload on the agent's next authorization-expiry sweep.
 The request does not close the database synchronously; active database requests
 and active jobs continue to delay unload as normal.
@@ -53,9 +67,9 @@ Content-Type: application/json
 ```
 
 Returns `200 OK` only when the database is unlocked and the current process
-chain is authorized. `reauth_timestamp` is an RFC3339 UTC timestamp for when the
-current process-chain authorization expires. Does not refresh the process-chain
-authorization expiry or database idle timer.
+lineage is authorized. `reauth_timestamp` is an RFC3339 UTC timestamp for when
+the current process-lineage authorization expires. Does not refresh the
+process-lineage authorization expiry or database idle timer.
 
 Failure:
 - `403 access_denied`
@@ -63,7 +77,7 @@ Failure:
 ## Settings
 
 Settings routes are database-backed and require the same unlocked database and
-authorized process chain as item, dir, and file routes. Every settings request
+authorized process lineage as item, dir, and file routes. Every settings request
 also requires `Authorization: Bearer <standard-base64 UTF-8 password>` with the
 master password. Missing, malformed, invalid, or wrong settings passwords return
 `403 access_denied`.
@@ -85,7 +99,7 @@ under `user.*` names:
 | `user.authTtlSeconds` | `900` | integer seconds, `1..=604800` |
 | `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
 
-`user.authTtlSeconds` controls process-chain authorization TTL. Changes take
+`user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
 effect immediately for new and existing cached authorizations. `user.gcSeconds`
 controls the best-effort idle cleanup cadence.
 
@@ -635,7 +649,7 @@ The archive `fields.json` uses the same item shape as `GET Item`: `fields` and
 `files` are arrays with unique `name` values. Export file entries replace item
 file metadata with `{ "name": "...", "sha256": "..." }`.
 
-The endpoint requires the same unlocked database and authorized process chain
+The endpoint requires the same unlocked database and authorized process lineage
 as other database routes. Initial submit errors use normal structured API
 errors. Archive, decrypt, missing target directory, file write, and item
 conflict failures after acceptance are recorded in the job status.
@@ -714,7 +728,7 @@ deleted. Orphan file rows are `files` rows that have no matching rows in
 
 The authorization-expiry unload path also performs file cleanup while the
 database is still unlocked. Immediately before unloading the database after all
-cached process-chain authorizations expire, the agent deletes non-latest item
+cached process-lineage authorizations expire, the agent deletes non-latest item
 versions whose `created_at` timestamp is more than 90 days old, repairs each
 affected item's `oldest_version_id`, then deletes orphan file rows and encrypted
 external blobs whose `created_at` timestamp is more than 1 day old. Recent

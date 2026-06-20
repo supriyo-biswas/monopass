@@ -12,12 +12,12 @@ use http_body::{Frame, SizeHint};
 use tokio::net::UnixListener;
 
 use super::error::ApiError;
-use super::process::{ProcessChainHash, hash_verified_client_chain};
+use super::process::{ScopeHash, resolve_authorization_scope_hash};
 use super::state::{ActiveDatabaseRequest, AgentState};
 
 #[derive(Debug, Clone)]
 pub struct PeerConnectInfo {
-    process_hash: Option<ProcessChainHash>,
+    scope_hash: Option<ScopeHash>,
 }
 
 impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
@@ -29,12 +29,12 @@ impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
 impl PeerConnectInfo {
     fn from_peer_credentials(credentials: Option<PeerCredentials>) -> Self {
         Self {
-            process_hash: authorized_peer_process_hash(credentials.as_ref()),
+            scope_hash: authorized_peer_scope_hash(credentials.as_ref()),
         }
     }
 
-    fn process_hash(&self) -> Option<&ProcessChainHash> {
-        self.process_hash.as_ref()
+    fn scope_hash(&self) -> Option<&ScopeHash> {
+        self.scope_hash.as_ref()
     }
 }
 
@@ -60,8 +60,8 @@ pub async fn require_same_uid_and_gid(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if let Some(process_hash) = connect_info.process_hash() {
-        request.extensions_mut().insert(process_hash.clone());
+    if let Some(scope_hash) = connect_info.scope_hash() {
+        request.extensions_mut().insert(scope_hash.clone());
         Ok(next.run(request).await)
     } else {
         Err(ApiError::access_denied())
@@ -73,11 +73,11 @@ pub async fn require_unlocked_database(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let Some(process_hash) = request.extensions().get::<ProcessChainHash>() else {
+    let Some(scope_hash) = request.extensions().get::<ScopeHash>() else {
         return Err(ApiError::access_denied());
     };
 
-    if let Some(database) = state.authorize_database_access(process_hash).await {
+    if let Some(database) = state.authorize_database_access(scope_hash).await {
         let active_request = state.begin_active_database_request();
         request.extensions_mut().insert(database);
         let response = next.run(request).await;
@@ -117,13 +117,13 @@ impl HttpBody for GuardedBody {
     }
 }
 
-fn authorized_peer_process_hash(credentials: Option<&PeerCredentials>) -> Option<ProcessChainHash> {
+fn authorized_peer_scope_hash(credentials: Option<&PeerCredentials>) -> Option<ScopeHash> {
     let credentials = credentials?;
     if !peer_credentials_are_authorized(Some(credentials)) {
         return None;
     }
 
-    hash_verified_client_chain(credentials.pid?)
+    resolve_authorization_scope_hash(credentials.pid?, credentials.uid)
 }
 
 fn peer_credentials_are_authorized(credentials: Option<&PeerCredentials>) -> bool {
@@ -154,7 +154,7 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
-    use crate::agent::process::ProcessChainHash;
+    use crate::agent::process::ScopeHash;
 
     use super::{PeerConnectInfo, PeerCredentials, current_process_gid, current_process_uid};
 
@@ -208,61 +208,61 @@ mod tests {
     }
 
     #[test]
-    fn missing_credentials_produce_no_process_hash() {
+    fn missing_credentials_produce_no_scope_hash() {
         let connect_info = PeerConnectInfo::from_peer_credentials(None);
 
-        assert_eq!(None, connect_info.process_hash());
+        assert_eq!(None, connect_info.scope_hash());
     }
 
     #[test]
-    fn mismatched_uid_produces_no_process_hash() {
+    fn mismatched_uid_produces_no_scope_hash() {
         let connect_info = PeerConnectInfo::from_peer_credentials(Some(PeerCredentials {
             pid: Some(std::process::id() as i32),
             uid: current_process_uid().wrapping_add(1),
             gid: current_process_gid(),
         }));
 
-        assert_eq!(None, connect_info.process_hash());
+        assert_eq!(None, connect_info.scope_hash());
     }
 
     #[test]
-    fn mismatched_gid_produces_no_process_hash() {
+    fn mismatched_gid_produces_no_scope_hash() {
         let connect_info = PeerConnectInfo::from_peer_credentials(Some(PeerCredentials {
             pid: Some(std::process::id() as i32),
             uid: current_process_uid(),
             gid: current_process_gid().wrapping_add(1),
         }));
 
-        assert_eq!(None, connect_info.process_hash());
+        assert_eq!(None, connect_info.scope_hash());
     }
 
     #[test]
-    fn missing_pid_produces_no_process_hash() {
+    fn missing_pid_produces_no_scope_hash() {
         let connect_info = PeerConnectInfo::from_peer_credentials(Some(PeerCredentials {
             pid: None,
             uid: current_process_uid(),
             gid: current_process_gid(),
         }));
 
-        assert_eq!(None, connect_info.process_hash());
+        assert_eq!(None, connect_info.scope_hash());
     }
 
     #[test]
-    fn matching_credentials_precompute_process_hash() {
+    fn matching_credentials_precompute_scope_hash() {
         let connect_info = PeerConnectInfo::from_peer_credentials(Some(PeerCredentials {
             pid: Some(std::process::id() as i32),
             uid: current_process_uid(),
             gid: current_process_gid(),
         }));
 
-        assert!(connect_info.process_hash().is_some());
+        assert!(connect_info.scope_hash().is_some());
     }
 
     #[tokio::test]
     async fn middleware_with_no_precomputed_hash_returns_access_denied() {
         let response = router()
             .oneshot(request_with_connect_info(PeerConnectInfo {
-                process_hash: None,
+                scope_hash: None,
             }))
             .await
             .unwrap();
@@ -274,7 +274,7 @@ mod tests {
     async fn middleware_inserts_precomputed_hash_into_request_extensions() {
         let response = router()
             .oneshot(request_with_connect_info(PeerConnectInfo {
-                process_hash: Some(ProcessChainHash::test(1)),
+                scope_hash: Some(ScopeHash::test(1)),
             }))
             .await
             .unwrap();
@@ -288,13 +288,9 @@ mod tests {
             .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
     }
 
-    async fn hash_required_handler(
-        process_hash: Option<axum::Extension<ProcessChainHash>>,
-    ) -> StatusCode {
-        match process_hash {
-            Some(axum::Extension(process_hash)) if process_hash == ProcessChainHash::test(1) => {
-                StatusCode::OK
-            }
+    async fn hash_required_handler(scope_hash: Option<axum::Extension<ScopeHash>>) -> StatusCode {
+        match scope_hash {
+            Some(axum::Extension(scope_hash)) if scope_hash == ScopeHash::test(1) => StatusCode::OK,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

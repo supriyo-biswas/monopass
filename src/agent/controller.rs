@@ -27,7 +27,7 @@ use super::models::{
     PaginatedResponse, UpdateContactRequest, UpdateDirRequest, UpdateItemRequest,
     UpdateSettingRequest,
 };
-use super::process::ProcessChainHash;
+use super::process::ScopeHash;
 use super::state::{
     AgentState, CopySource, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
     ItemSource, PageRequest, ReferenceBody, UnlockError, validate_file_upload_size,
@@ -39,14 +39,14 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 
 pub async fn unlock(
     State(state): State<AgentState>,
-    process_hash: Option<Extension<ProcessChainHash>>,
+    scope_hash: Option<Extension<ScopeHash>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let Extension(process_hash) = process_hash.ok_or_else(ApiError::access_denied)?;
+    let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
     let password = bearer_password(&headers)?;
 
     state
-        .unlock(password, process_hash)
+        .unlock(password, scope_hash)
         .await
         .map(|()| StatusCode::OK)
         .map_err(|error| match error {
@@ -57,20 +57,20 @@ pub async fn unlock(
 
 pub async fn lock(
     State(state): State<AgentState>,
-    process_hash: Option<Extension<ProcessChainHash>>,
+    scope_hash: Option<Extension<ScopeHash>>,
 ) -> Result<StatusCode, ApiError> {
-    let Extension(_) = process_hash.ok_or_else(ApiError::access_denied)?;
+    let Extension(_) = scope_hash.ok_or_else(ApiError::access_denied)?;
     state.lock(Instant::now()).await;
     Ok(StatusCode::OK)
 }
 
 pub async fn status(
     State(state): State<AgentState>,
-    process_hash: Option<Extension<ProcessChainHash>>,
+    scope_hash: Option<Extension<ScopeHash>>,
 ) -> Result<Json<AuthStatusResponse>, ApiError> {
-    let Extension(process_hash) = process_hash.ok_or_else(ApiError::access_denied)?;
+    let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
     let expires_at = state
-        .authorization_expires_at(&process_hash)
+        .authorization_expires_at(&scope_hash)
         .await
         .ok_or_else(ApiError::access_denied)?;
     let reauth_timestamp = reauth_timestamp(expires_at).ok_or_else(ApiError::access_denied)?;
@@ -756,7 +756,7 @@ pub async fn get_reference(
             let stream = ReceiverStream::new(receiver).map(|result| {
                 result
                     .map(|mut bytes| Bytes::from(std::mem::take(&mut *bytes)))
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "file decrypt failed"))
+                    .map_err(|_| io::Error::other("file decrypt failed"))
             });
             Body::from_stream(stream)
         }
@@ -856,7 +856,7 @@ mod tests {
         bearer_password, export_item, import_item, lock, send_upload_body_bytes, status, unlock,
     };
     use crate::agent::models::{CreateContactRequest, CreateItemRequest};
-    use crate::agent::process::ProcessChainHash;
+    use crate::agent::process::ScopeHash;
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
 
     #[tokio::test]
@@ -864,7 +864,7 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let error = unlock(
             axum::extract::State(state),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
             HeaderMap::new(),
         )
         .await
@@ -881,7 +881,7 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let error = unlock(
             axum::extract::State(state),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
             headers,
         )
         .await
@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlock_missing_process_hash_returns_access_denied() {
+    async fn unlock_missing_scope_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = unlock(
             axum::extract::State(state),
@@ -912,7 +912,7 @@ mod tests {
         let state = AgentState::from_database_path(file.path());
         let error = unlock(
             axum::extract::State(state),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
             authorization_headers("wrong"),
         )
         .await
@@ -929,7 +929,7 @@ mod tests {
         let state = AgentState::from_database_path(file.path());
         let status = unlock(
             axum::extract::State(state.clone()),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
             authorization_headers("correct"),
         )
         .await
@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_missing_process_hash_returns_access_denied() {
+    async fn lock_missing_scope_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = lock(axum::extract::State(state), None).await.unwrap_err();
 
@@ -951,19 +951,17 @@ mod tests {
     async fn lock_success_returns_ok_and_clears_authorization() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
 
         let response = lock(
             axum::extract::State(state.clone()),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
         )
         .await
         .unwrap();
 
         assert_eq!(StatusCode::OK, response);
-        assert!(!state.is_authorized(&ProcessChainHash::test(1)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
     }
 
     #[tokio::test]
@@ -1027,7 +1025,7 @@ mod tests {
 
         let error = unlock(
             axum::extract::State(state),
-            Some(axum::Extension(ProcessChainHash::test(2))),
+            Some(axum::Extension(ScopeHash::test(2))),
             authorization_headers("wrong"),
         )
         .await
@@ -1044,27 +1042,25 @@ mod tests {
 
         let response = unlock(
             axum::extract::State(state.clone()),
-            Some(axum::Extension(ProcessChainHash::test(2))),
+            Some(axum::Extension(ScopeHash::test(2))),
             authorization_headers("correct"),
         )
         .await
         .unwrap();
 
         assert_eq!(StatusCode::OK, response);
-        assert!(state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert!(state.is_authorized(&ScopeHash::test(2)).await);
     }
 
     #[tokio::test]
     async fn status_returns_ok_only_for_unlocked_authorized_hash() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
 
         let response = status(
             axum::extract::State(state.clone()),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
         )
         .await
         .unwrap();
@@ -1079,7 +1075,7 @@ mod tests {
             StatusCode::FORBIDDEN,
             status(
                 axum::extract::State(state),
-                Some(axum::Extension(ProcessChainHash::test(2))),
+                Some(axum::Extension(ScopeHash::test(2))),
             )
             .await
             .unwrap_err()
@@ -1094,12 +1090,12 @@ mod tests {
         let before = Utc::now();
         state.store_database_handle(DbHandle::test()).await;
         state
-            .authorize_process_hash_at(ProcessChainHash::test(1), authorized_at)
+            .authorize_scope_hash_at(ScopeHash::test(1), authorized_at)
             .await;
 
         let response = status(
             axum::extract::State(state),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
         )
         .await
         .unwrap();
@@ -1116,16 +1112,14 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let last_access = Instant::now() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
             .set_last_authorized_database_access(Some(last_access))
             .await;
 
         let _ = status(
             axum::extract::State(state.clone()),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
         )
         .await
         .unwrap();
@@ -1143,28 +1137,26 @@ mod tests {
         let max_expires_at = authorized_at + Duration::from_secs(1);
         state.store_database_handle(DbHandle::test()).await;
         state
-            .authorize_process_hash_at(ProcessChainHash::test(1), authorized_at)
+            .authorize_scope_hash_at(ScopeHash::test(1), authorized_at)
             .await;
         state
             .set_max_authorization_expires_at(Some(max_expires_at))
             .await;
         let expires_at_before = state
-            .authorization_expires_at(&ProcessChainHash::test(1))
+            .authorization_expires_at(&ScopeHash::test(1))
             .await
             .unwrap();
 
         let _ = status(
             axum::extract::State(state.clone()),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
         )
         .await
         .unwrap();
 
         assert_eq!(
             Some(expires_at_before),
-            state
-                .authorization_expires_at(&ProcessChainHash::test(1))
-                .await
+            state.authorization_expires_at(&ScopeHash::test(1)).await
         );
         assert_eq!(
             Some(max_expires_at),
@@ -1177,15 +1169,15 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
         state
-            .authorize_process_hash_at(
-                ProcessChainHash::test(1),
+            .authorize_scope_hash_at(
+                ScopeHash::test(1),
                 Instant::now() - Duration::from_secs(900),
             )
             .await;
 
         let error = status(
             axum::extract::State(state),
-            Some(axum::Extension(ProcessChainHash::test(1))),
+            Some(axum::Extension(ScopeHash::test(1))),
         )
         .await
         .unwrap_err();
@@ -1273,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_missing_process_hash_returns_access_denied() {
+    async fn status_missing_scope_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = status(axum::extract::State(state), None).await.unwrap_err();
 
@@ -1300,7 +1292,7 @@ mod tests {
                 .test_slow_write(Duration::from_secs(3))
                 .await
         });
-        wait_for_writer_dispatches(&database, before + 1).await;
+        wait_for_writer_dispatches(database, before + 1).await;
         task
     }
 

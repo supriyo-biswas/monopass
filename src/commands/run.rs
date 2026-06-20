@@ -46,10 +46,10 @@ pub fn run(config: &Config, args: Args) -> AppResult {
         let Some(value) = env.get(&key) else {
             continue;
         };
-        if !is_reference_value(&value) {
+        if !is_reference_value(value) {
             continue;
         }
-        let reference = parse_reference_path(&value)?;
+        let reference = parse_reference_path(value)?;
         let item = super::item::raw_item(&client, &reference.dir, &reference.item)?;
         let mut bytes = super::read::fetch_reference(config, &reference)?;
         if item.files.iter().any(|file| file.name == reference.name) {

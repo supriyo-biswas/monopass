@@ -29,7 +29,7 @@ blocking database work directly in Tokio request handlers.
 - Keep agent behavior split by responsibility:
   - `server.rs`: routes and middleware
   - `auth.rs`: Unix peer credentials and request authorization
-  - `process.rs`: process-chain validation and authorization cache keys
+  - `process.rs`: process-lineage validation and authorization scope keys
   - `controller.rs`: HTTP handlers, body streaming, bearer parsing
   - `state.rs`: unlocked database state, workers, verifier, cache, file crypto,
     and authorization-expiry unload
@@ -50,7 +50,7 @@ The shared client keeps JSON request bodies, file upload bodies, response bodies
 raw HTTP responses, and bearer request headers in `Zeroizing` buffers. Avoid
 bypassing `Client` or reimplementing socket requests in individual commands.
 
-The agent handles peer credentials and process-chain authorization before route
+The agent handles peer credentials and process-lineage authorization before route
 handlers run. Controllers should validate request shape, stream bodies, and
 delegate work to `AgentState`/`DbHandle`. Database reads and writes are executed
 by state workers; handlers must not perform blocking SQLCipher work.
@@ -63,12 +63,13 @@ file or reference flows.
 ## Agent Security Invariants
 
 Fail closed. Deny requests when peer credentials are missing, peer PID is
-unavailable, process-chain validation fails, the chain does not reach the agent,
-or the cached process-chain authorization is absent or expired.
+unavailable, required same-user/session process identity cannot be resolved, or
+the cached process-lineage authorization is absent or expired. Lineage traversal
+stops successfully before a different-user or different-session ancestor.
 
 Authorization must stay local to the Unix socket. Do not add network listeners,
 bearer-only fallbacks, or route exceptions that bypass peer credential and
-process-chain checks.
+process-lineage checks.
 
 Startup hardening must happen before binding the socket. Core dumps are disabled
 with `setrlimit(RLIMIT_CORE, 0)`. Release builds also deny debugger attachment
@@ -86,19 +87,19 @@ Unlock is two-stage:
 
 1. The client connects over the Unix socket with matching UID/GID and a peer
    PID.
-2. The agent validates the process chain, then
+2. The agent validates the process lineage, then
    `POST /api/v1/auth/unlock` verifies the bearer password.
 
 On first unlock, open and validate the SQLCipher database, store the handle,
 create the in-memory PBKDF2-HMAC-SHA256 verifier, and cache the validated
-process-chain hash for 15 minutes. Later unlocks against an already-unlocked
-database verify against the in-memory verifier and authorize the new
-process-chain hash without replacing the database handle.
+process-lineage scope hash for 15 minutes. Later unlocks against an
+already-unlocked database verify against the in-memory verifier and authorize
+the new scope hash without replacing the database handle.
 
 Database-backed routes and `GET /api/v1/auth/status` require both an unlocked
-database and an unexpired process-chain cache entry. Successful status responses
+database and an unexpired process-lineage cache entry. Successful status responses
 include `reauthTimestamp`, the RFC3339 UTC expiry timestamp for the current
-process-chain authorization.
+process-lineage authorization.
 
 Idle unload is the inverse of unlock. After 1 hour without successful
 database-backed route access, unload the database handle, password verifier,

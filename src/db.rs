@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(super::ITEM_HIDDEN | super::ITEM_READ_MUSTAUTH, bitmask);
         let value: serde_json::Value = serde_json::from_str(&fields).unwrap();
         let key = value["key"]["data"].as_str().unwrap();
-        assert_eq!(true, value["key"]["concealed"].as_bool().unwrap());
+        assert!(value["key"]["concealed"].as_bool().unwrap());
         assert_eq!(64, key.len());
         assert!(key.chars().all(|character| character.is_ascii_hexdigit()));
     }
@@ -634,7 +634,7 @@ mod tests {
         let (public_bitmask, public_fields) = internal_item(conn, "AgePublicKey");
         assert_eq!(0, public_bitmask);
         let public_fields: serde_json::Value = serde_json::from_str(&public_fields).unwrap();
-        assert_eq!(false, public_fields["key"]["concealed"].as_bool().unwrap());
+        assert!(!public_fields["key"]["concealed"].as_bool().unwrap());
         let public_key = public_fields["key"]["data"].as_str().unwrap();
         assert!(public_key.starts_with("age1"), "{public_key}");
 
@@ -644,7 +644,7 @@ mod tests {
             private_bitmask
         );
         let private_fields: serde_json::Value = serde_json::from_str(&private_fields).unwrap();
-        assert_eq!(true, private_fields["key"]["concealed"].as_bool().unwrap());
+        assert!(private_fields["key"]["concealed"].as_bool().unwrap());
         let private_key = private_fields["key"]["data"].as_str().unwrap();
         assert!(private_key.starts_with("AGE-SECRET-KEY-"), "{private_key}");
 

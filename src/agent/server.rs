@@ -110,7 +110,7 @@ mod tests {
     use tempfile::NamedTempFile;
     use tower::ServiceExt;
 
-    use crate::agent::process::ProcessChainHash;
+    use crate::agent::process::ScopeHash;
     use crate::agent::state::{AgentState, DbHandle, ITEM_READ_MUSTAUTH, MAX_FILE_UPLOAD_BYTES};
 
     #[tokio::test]
@@ -119,7 +119,7 @@ mod tests {
         let router = super::database_routes(state.clone()).with_state(state);
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
 
@@ -133,7 +133,7 @@ mod tests {
         let router = super::database_routes(state.clone()).with_state(state);
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
 
@@ -144,13 +144,11 @@ mod tests {
     async fn unlocked_database_route_with_cached_hash_reaches_handler() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         let router = super::database_routes(state.clone()).with_state(state);
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
 
@@ -171,7 +169,7 @@ mod tests {
             .clone()
             .oneshot(post_request_with_hash_and_password(
                 "/api/v1/auth/unlock",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -179,7 +177,7 @@ mod tests {
         assert_eq!(StatusCode::OK, response.status());
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -199,7 +197,7 @@ mod tests {
             .clone()
             .oneshot(post_request_with_hash_and_password(
                 "/api/v1/auth/unlock",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -208,7 +206,7 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -217,14 +215,14 @@ mod tests {
             .clone()
             .oneshot(post_request_with_hash(
                 "/api/v1/auth/lock",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::FORBIDDEN, response.status());
@@ -235,16 +233,14 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let last_access = Instant::now() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
             .set_last_authorized_database_access(Some(last_access))
             .await;
         let router = super::database_routes(state.clone()).with_state(state.clone());
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
 
@@ -258,7 +254,7 @@ mod tests {
         let router = super::database_routes(state.clone()).with_state(state.clone());
 
         let response = router
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -281,7 +277,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -291,7 +287,7 @@ mod tests {
                 "PUT",
                 "/api/v1/file/upload",
                 b"stream me",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -302,7 +298,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/personal/item/github",
                 json!({"files": {"notes": {"id": file_id}}}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -312,7 +308,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/notes",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -337,7 +333,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -346,7 +342,7 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(request_with_hash("/api/v1/dirs", ProcessChainHash::test(1)))
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -368,7 +364,7 @@ mod tests {
                 "PATCH",
                 "/api/v1/dir/personal",
                 json!({"name":"renamed"}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -376,10 +372,7 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(request_with_hash(
-                "/api/v1/dir/renamed",
-                ProcessChainHash::test(1),
-            ))
+            .oneshot(request_with_hash("/api/v1/dir/renamed", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -388,7 +381,7 @@ mod tests {
         let response = router
             .oneshot(delete_request_with_hash(
                 "/api/v1/dir/renamed",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -404,7 +397,7 @@ mod tests {
                 .clone()
                 .oneshot(put_request_with_hash(
                     &format!("/api/v1/dir/{name}"),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -414,7 +407,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dirs?count=1",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -428,7 +421,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 &format!("/api/v1/dirs?count=1&marker={marker}"),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -444,7 +437,7 @@ mod tests {
         ] {
             let response = router
                 .clone()
-                .oneshot(request_with_hash(path, ProcessChainHash::test(1)))
+                .oneshot(request_with_hash(path, ScopeHash::test(1)))
                 .await
                 .unwrap();
             assert_eq!(StatusCode::BAD_REQUEST, response.status(), "{path}");
@@ -468,7 +461,7 @@ mod tests {
                     "age_public_key": public_key,
                     "description": "Personal laptop",
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -485,7 +478,7 @@ mod tests {
                     "age_public_key": public_key,
                     "description": "Personal laptop",
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -493,10 +486,7 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(request_with_hash(
-                "/api/v1/contacts",
-                ProcessChainHash::test(1),
-            ))
+            .oneshot(request_with_hash("/api/v1/contacts", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -518,7 +508,7 @@ mod tests {
             .clone()
             .oneshot(delete_request_with_hash(
                 "/api/v1/contact/alice@example.com",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -527,7 +517,7 @@ mod tests {
         let response = router
             .oneshot(delete_request_with_hash(
                 "/api/v1/contact/alice@example.com",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -551,7 +541,7 @@ mod tests {
                     "age_public_key": original_key,
                     "description": null,
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -566,7 +556,7 @@ mod tests {
                     "name": "Alice Renamed",
                     "age_public_key": updated_key,
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -574,10 +564,7 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(request_with_hash(
-                "/api/v1/contacts",
-                ProcessChainHash::test(1),
-            ))
+            .oneshot(request_with_hash("/api/v1/contacts", ScopeHash::test(1)))
             .await
             .unwrap();
         let body = json_body(response).await;
@@ -594,7 +581,7 @@ mod tests {
                     "age_public_key": age::x25519::Identity::generate().to_public().to_string(),
                     "description": null,
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -606,7 +593,7 @@ mod tests {
                 json!({
                     "email": "bob@example.com",
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -621,7 +608,7 @@ mod tests {
                     "email": "missing-renamed@example.com",
                     "name": null,
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -635,7 +622,7 @@ mod tests {
                     "email": "alice.renamed@example.com",
                     "age_public_key": "not-an-age-key",
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -658,7 +645,7 @@ mod tests {
                         "age_public_key": public_key,
                         "description": null,
                     }),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -668,7 +655,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/contacts?count=1",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -683,7 +670,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 &format!("/api/v1/contacts?count=1&marker={marker}"),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -699,7 +686,7 @@ mod tests {
         ] {
             let response = router
                 .clone()
-                .oneshot(request_with_hash(path, ProcessChainHash::test(1)))
+                .oneshot(request_with_hash(path, ScopeHash::test(1)))
                 .await
                 .unwrap();
             assert_eq!(StatusCode::BAD_REQUEST, response.status(), "{path}");
@@ -728,7 +715,7 @@ mod tests {
                     "PUT",
                     path,
                     body,
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -746,7 +733,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -757,7 +744,7 @@ mod tests {
                 "PUT",
                 "/api/v1/file/upload",
                 b"hello",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -779,7 +766,7 @@ mod tests {
                         "notes": {"id": file_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -789,7 +776,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/items",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -801,7 +788,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -821,7 +808,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?reveal=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -835,7 +822,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -856,7 +843,7 @@ mod tests {
         ] {
             let response = router
                 .clone()
-                .oneshot(request_with_hash(path, ProcessChainHash::test(1)))
+                .oneshot(request_with_hash(path, ScopeHash::test(1)))
                 .await
                 .unwrap();
             let body = json_body(response).await;
@@ -868,7 +855,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/otp_code",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -885,7 +872,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/otp_code?raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -899,7 +886,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/password",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -915,7 +902,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/notes",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -930,7 +917,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github/file/notes",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -946,7 +933,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -958,7 +945,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"notes",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -974,7 +961,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"new notes",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -997,7 +984,7 @@ mod tests {
                         "password": {"id": file_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1022,7 +1009,7 @@ mod tests {
                         "notes": {"id": file_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1036,7 +1023,7 @@ mod tests {
                         "password": {"id": second_file_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1059,7 +1046,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/Me/item/foo",
                 json!({"fields": {}, "files": {}}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1079,7 +1066,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1091,7 +1078,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"old notes",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -1107,7 +1094,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"new notes",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -1131,7 +1118,7 @@ mod tests {
                         "notes": {"id": old_notes_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1149,7 +1136,7 @@ mod tests {
                         "notes": {"id": new_notes_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1159,7 +1146,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1171,7 +1158,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/notes",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1187,7 +1174,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1199,7 +1186,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"old notes",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -1215,7 +1202,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"attachment",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -1240,7 +1227,7 @@ mod tests {
                         "attachment": {"id": attachment_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1258,7 +1245,7 @@ mod tests {
                         "notes": {"remove": true}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1268,7 +1255,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1282,7 +1269,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/notes",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1292,7 +1279,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?version=1&raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1303,7 +1290,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/ref/personal/github/attachment",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1322,7 +1309,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1332,7 +1319,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/personal/item/github",
                 json!({}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1349,7 +1336,7 @@ mod tests {
                     "PATCH",
                     "/api/v1/dir/personal/item/github",
                     body,
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -1367,7 +1354,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1378,7 +1365,7 @@ mod tests {
                     "PUT",
                     "/api/v1/file/upload",
                     b"guarded notes",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap(),
@@ -1400,7 +1387,7 @@ mod tests {
                         "notes": {"id": file_id}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1419,7 +1406,7 @@ mod tests {
         ] {
             let response = router
                 .clone()
-                .oneshot(request_with_hash(path, ProcessChainHash::test(1)))
+                .oneshot(request_with_hash(path, ScopeHash::test(1)))
                 .await
                 .unwrap();
             assert_eq!(StatusCode::FORBIDDEN, response.status());
@@ -1434,7 +1421,7 @@ mod tests {
                     .clone()
                     .oneshot(request_with_hash_and_authorization(
                         path,
-                        ProcessChainHash::test(1),
+                        ScopeHash::test(1),
                         &authorization,
                     ))
                     .await
@@ -1448,7 +1435,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/guarded",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1462,7 +1449,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash_and_password(
                 "/api/v1/dir/personal/item/guarded?reveal=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -1477,7 +1464,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash_and_password(
                 "/api/v1/dir/personal/item/guarded?raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -1492,7 +1479,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash_and_password(
                 "/api/v1/ref/personal/guarded/notes",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -1507,7 +1494,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/_Internal/item/AgePublicKey?raw=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1516,7 +1503,7 @@ mod tests {
             "age1unused",
             json_field(&json_body(response).await, "key")["data"]
         );
-        assert!(!state.is_authorized(&ProcessChainHash::test(2)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(2)).await);
     }
 
     #[tokio::test]
@@ -1528,7 +1515,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1538,7 +1525,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/personal/item/github",
                 json!({}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1547,7 +1534,7 @@ mod tests {
             .clone()
             .oneshot(delete_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1560,7 +1547,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1575,7 +1562,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1586,7 +1573,7 @@ mod tests {
                     "PUT",
                     &format!("/api/v1/dir/personal/item/{name}"),
                     json!({}),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -1596,7 +1583,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/items?count=1",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1608,7 +1595,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 &format!("/api/v1/dir/personal/items?count=1&marker={marker}"),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1620,7 +1607,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/items?glob=*github*&dir=desc",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1631,7 +1618,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/items?dir=sideways",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1646,7 +1633,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1660,7 +1647,7 @@ mod tests {
                         "password": {"type": "string", "concealed": true, "data": "old"}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1674,7 +1661,7 @@ mod tests {
                         "password": {"type": "string", "concealed": true, "data": "new"}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1683,7 +1670,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github/versions?count=1",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1703,7 +1690,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 &format!("/api/v1/dir/personal/item/github/versions?count=1&marker={marker}"),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1715,7 +1702,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?version=1&reveal=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1728,7 +1715,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal/item/github/restore?version=1",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1738,7 +1725,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?reveal=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1756,7 +1743,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1766,7 +1753,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/personal/item/github",
                 json!({}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1780,7 +1767,7 @@ mod tests {
         ] {
             let response = router
                 .clone()
-                .oneshot(request_with_hash(path, ProcessChainHash::test(1)))
+                .oneshot(request_with_hash(path, ScopeHash::test(1)))
                 .await
                 .unwrap();
             assert_eq!(StatusCode::BAD_REQUEST, response.status(), "{path}");
@@ -1790,7 +1777,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal/item/github/restore",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1800,7 +1787,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/personal/item/github?version=99",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1809,7 +1796,7 @@ mod tests {
         let response = router
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal/item/github/restore?version=1",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1826,7 +1813,7 @@ mod tests {
                 .clone()
                 .oneshot(put_request_with_hash(
                     &format!("/api/v1/dir/{dir}"),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -1843,7 +1830,7 @@ mod tests {
                         "password": {"type": "string", "data": "old"}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1858,7 +1845,7 @@ mod tests {
                         "password": {"type": "string", "data": "copied"}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1868,7 +1855,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/dest/item/moved?move_from=source/github",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1878,7 +1865,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/source/item/github",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1888,7 +1875,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/dir/dest/item/moved?reveal=true",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1901,7 +1888,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/dest/item/bad?copy_from=dest/copy&move_from=dest/moved",
                 json!({}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1918,7 +1905,7 @@ mod tests {
                 .clone()
                 .oneshot(put_request_with_hash(
                     &format!("/api/v1/dir/{dir}"),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -1929,7 +1916,7 @@ mod tests {
                 "PUT",
                 "/api/v1/dir/source/item/github",
                 json!({}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1954,7 +1941,7 @@ mod tests {
                     "PUT",
                     path,
                     body,
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -1973,7 +1960,7 @@ mod tests {
                 "PUT",
                 "/api/v1/file/upload",
                 b"hello",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -1985,7 +1972,7 @@ mod tests {
                     "/api/v1/file/lookup/sha256/{}",
                     crate::agent::state::sha256_hex(b"hello")
                 ),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2003,7 +1990,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash(
                 "/api/v1/file/lookup/sha256/ABC",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2015,7 +2002,7 @@ mod tests {
                     "/api/v1/file/lookup/sha256/{}",
                     crate::agent::state::sha256_hex(b"missing")
                 ),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2033,7 +2020,7 @@ mod tests {
                 "PUT",
                 "/api/v1/file/upload",
                 b"hello",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2044,7 +2031,7 @@ mod tests {
                 "PUT",
                 "/api/v1/file/upload",
                 b"hello",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2063,7 +2050,7 @@ mod tests {
             .uri("/api/v1/file/upload")
             .body(Body::from(b"hello".to_vec()))
             .unwrap();
-        request.extensions_mut().insert(ProcessChainHash::test(1));
+        request.extensions_mut().insert(ScopeHash::test(1));
 
         let response = router.oneshot(request).await.unwrap();
 
@@ -2081,9 +2068,7 @@ mod tests {
         let before = database.dispatch_counts();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         let router = super::database_routes(state.clone()).with_state(state);
 
         let mut request = Request::builder()
@@ -2095,7 +2080,7 @@ mod tests {
             )
             .body(Body::empty())
             .unwrap();
-        request.extensions_mut().insert(ProcessChainHash::test(1));
+        request.extensions_mut().insert(ScopeHash::test(1));
 
         let response = router.oneshot(request).await.unwrap();
 
@@ -2119,7 +2104,7 @@ mod tests {
             .header(header::CONTENT_LENGTH, "10")
             .body(Body::from(b"hello".to_vec()))
             .unwrap();
-        request.extensions_mut().insert(ProcessChainHash::test(1));
+        request.extensions_mut().insert(ScopeHash::test(1));
 
         let response = router.oneshot(request).await.unwrap();
 
@@ -2139,7 +2124,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2173,7 +2158,7 @@ mod tests {
                             "totp": {"type": "totp", "data": data}
                         }
                     }),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                 ))
                 .await
                 .unwrap();
@@ -2192,7 +2177,7 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2206,7 +2191,7 @@ mod tests {
                         "notes": {"content": "hello"}
                     }
                 }),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2223,14 +2208,14 @@ mod tests {
             .clone()
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
         let response = router
             .oneshot(put_request_with_hash(
                 "/api/v1/dir/personal",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2248,7 +2233,7 @@ mod tests {
             .clone()
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -2265,7 +2250,7 @@ mod tests {
                 "PUT",
                 "/api/v1/settings/user.authTtlSeconds",
                 json!({"value":"1200"}),
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -2276,7 +2261,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -2291,10 +2276,7 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(request_with_hash(
-                "/api/v1/settings",
-                ProcessChainHash::test(1),
-            ))
+            .oneshot(request_with_hash("/api/v1/settings", ScopeHash::test(1)))
             .await
             .unwrap();
         assert_eq!(StatusCode::FORBIDDEN, response.status());
@@ -2311,7 +2293,7 @@ mod tests {
                 .clone()
                 .oneshot(request_with_hash_and_authorization(
                     "/api/v1/settings",
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                     &authorization,
                 ))
                 .await
@@ -2333,7 +2315,7 @@ mod tests {
                     "PUT",
                     "/api/v1/settings/user.authTtlSeconds",
                     body,
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                     "correct",
                 ))
                 .await
@@ -2352,7 +2334,7 @@ mod tests {
                     "PUT",
                     path,
                     json!({"value":"900"}),
-                    ProcessChainHash::test(1),
+                    ScopeHash::test(1),
                     "correct",
                 ))
                 .await
@@ -2369,7 +2351,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -2384,7 +2366,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
                 "correct",
             ))
             .await
@@ -2401,7 +2383,7 @@ mod tests {
         let response = router
             .oneshot(request_with_hash(
                 "/api/v1/jobs/status/00112233445566778899aabbccddeeff",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2422,7 +2404,7 @@ mod tests {
                 "PUT",
                 "/api/v1/jobs/import/dir/imported",
                 b"not an age export",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2475,7 +2457,7 @@ mod tests {
         let response = router
             .oneshot(put_request_with_hash(
                 "/api/v1/jobs/export/dir/item/alice",
-                ProcessChainHash::test(1),
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();
@@ -2493,27 +2475,27 @@ mod tests {
         assert_eq!(Some("alice".to_owned()), job.target.contact);
     }
 
-    fn request_with_hash(path: &str, process_hash: ProcessChainHash) -> Request<Body> {
+    fn request_with_hash(path: &str, scope_hash: ScopeHash) -> Request<Body> {
         let mut request = Request::builder()
             .method("GET")
             .uri(path)
             .body(Body::empty())
             .unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
     fn request_with_hash_and_password(
         path: &str,
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
         password: &str,
     ) -> Request<Body> {
-        request_with_hash_and_authorization(path, process_hash, &bearer(password))
+        request_with_hash_and_authorization(path, scope_hash, &bearer(password))
     }
 
     fn request_with_hash_and_authorization(
         path: &str,
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
         authorization: &str,
     ) -> Request<Body> {
         let mut request = Request::builder()
@@ -2522,38 +2504,38 @@ mod tests {
             .header(header::AUTHORIZATION, authorization)
             .body(Body::empty())
             .unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
-    fn put_request_with_hash(path: &str, process_hash: ProcessChainHash) -> Request<Body> {
+    fn put_request_with_hash(path: &str, scope_hash: ScopeHash) -> Request<Body> {
         let mut request = Request::put(path).body(Body::empty()).unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
     fn post_request_with_hash_and_password(
         path: &str,
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
         password: &str,
     ) -> Request<Body> {
         let mut request = Request::post(path)
             .header(header::AUTHORIZATION, bearer(password))
             .body(Body::empty())
             .unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
-    fn post_request_with_hash(path: &str, process_hash: ProcessChainHash) -> Request<Body> {
+    fn post_request_with_hash(path: &str, scope_hash: ScopeHash) -> Request<Body> {
         let mut request = Request::post(path).body(Body::empty()).unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
-    fn delete_request_with_hash(path: &str, process_hash: ProcessChainHash) -> Request<Body> {
+    fn delete_request_with_hash(path: &str, scope_hash: ScopeHash) -> Request<Body> {
         let mut request = Request::delete(path).body(Body::empty()).unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
@@ -2561,7 +2543,7 @@ mod tests {
         method: &str,
         path: &str,
         body: serde_json::Value,
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
     ) -> Request<Body> {
         let body = item_json(body);
         let mut request = Request::builder()
@@ -2570,7 +2552,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
@@ -2578,7 +2560,7 @@ mod tests {
         method: &str,
         path: &str,
         body: serde_json::Value,
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
         password: &str,
     ) -> Request<Body> {
         let body = item_json(body);
@@ -2589,7 +2571,7 @@ mod tests {
             .header(header::AUTHORIZATION, bearer(password))
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
@@ -2622,7 +2604,7 @@ mod tests {
         method: &str,
         path: &str,
         body: &[u8],
-        process_hash: ProcessChainHash,
+        scope_hash: ScopeHash,
     ) -> Request<Body> {
         let mut request = Request::builder()
             .method(method)
@@ -2630,7 +2612,7 @@ mod tests {
             .header(header::CONTENT_LENGTH, body.len().to_string())
             .body(Body::from(body.to_vec()))
             .unwrap();
-        request.extensions_mut().insert(process_hash);
+        request.extensions_mut().insert(scope_hash);
         request
     }
 
@@ -2638,9 +2620,7 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
-        state
-            .authorize_process_hash(ProcessChainHash::test(1))
-            .await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
     }
 
