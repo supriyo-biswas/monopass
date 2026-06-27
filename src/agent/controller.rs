@@ -22,22 +22,38 @@ use zeroize::Zeroizing;
 
 use super::error::ApiError;
 use super::models::{
-    AuthStatusResponse, ContactResponse, CreateContactRequest, CreateFileResponse,
-    CreateItemRequest, JobAcceptedResponse, JobResponse, JobStatus, ListItemsQuery, ListPageQuery,
-    PaginatedResponse, UpdateContactRequest, UpdateDirRequest, UpdateItemRequest,
-    UpdateSettingRequest,
+    AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse, ContactResponse,
+    CreateContactRequest, CreateFileResponse, CreateItemRequest, JobAcceptedResponse, JobResponse,
+    JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse, UpdateContactRequest,
+    UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
-use super::process::ScopeHash;
+use super::process::{ProcessDisplay, ScopeHash};
 use super::state::{
     AgentState, CopySource, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
-    ItemSource, PageRequest, ReferenceBody, UnlockError, validate_file_upload_size,
+    ItemSource, PageRequest, ReferenceBody, validate_file_upload_size,
 };
 
 const DEFAULT_PAGE_COUNT: u64 = 50;
 const MAX_PAGE_COUNT: u64 = 200;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
-pub async fn unlock(
+pub async fn unlock_methods() -> Json<AuthUnlockMethodsResponse> {
+    Json(AuthUnlockMethodsResponse {
+        methods: vec![AuthUnlockMethod {
+            #[cfg(target_os = "macos")]
+            url: "/api/v1/auth/unlock/gui".to_owned(),
+            #[cfg(not(target_os = "macos"))]
+            url: "/api/v1/auth/unlock/direct".to_owned(),
+            #[cfg(target_os = "macos")]
+            accepts_master_password: false,
+            #[cfg(not(target_os = "macos"))]
+            accepts_master_password: true,
+        }],
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn unlock_direct(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
     headers: HeaderMap,
@@ -50,9 +66,49 @@ pub async fn unlock(
         .await
         .map(|()| StatusCode::OK)
         .map_err(|error| match error {
-            UnlockError::AccessDenied => ApiError::access_denied(),
-            UnlockError::UnlockFailed => ApiError::unlock_failed(),
+            super::state::UnlockError::AccessDenied => ApiError::access_denied(),
+            super::state::UnlockError::UnlockFailed => ApiError::unlock_failed(),
         })
+}
+
+#[cfg(target_os = "macos")]
+pub async fn unlock_gui(
+    State(state): State<AgentState>,
+    scope_hash: Option<Extension<ScopeHash>>,
+    display: Option<Extension<ProcessDisplay>>,
+) -> Result<StatusCode, ApiError> {
+    unlock_gui_with_prompt(
+        State(state),
+        scope_hash,
+        display,
+        super::gui_auth::prompt_password,
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn unlock_gui_with_prompt<F, Fut>(
+    State(state): State<AgentState>,
+    scope_hash: Option<Extension<ScopeHash>>,
+    display: Option<Extension<ProcessDisplay>>,
+    prompt: F,
+) -> Result<StatusCode, ApiError>
+where
+    F: Fn(Option<ProcessDisplay>) -> Fut,
+    Fut: std::future::Future<Output = Option<Zeroizing<String>>>,
+{
+    let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
+    let display = display.map(|Extension(display)| display);
+
+    let Some(password) = prompt(display).await else {
+        return Err(ApiError::access_denied());
+    };
+
+    state
+        .unlock(password, scope_hash)
+        .await
+        .map(|()| StatusCode::OK)
+        .map_err(|_| ApiError::access_denied())
 }
 
 pub async fn lock(
@@ -842,6 +898,8 @@ impl From<DbError> for ApiError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use axum::body::Body;
@@ -853,16 +911,54 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        bearer_password, export_item, import_item, lock, send_upload_body_bytes, status, unlock,
+        bearer_password, export_item, import_item, lock, send_upload_body_bytes, status,
+        unlock_methods,
     };
     use crate::agent::models::{CreateContactRequest, CreateItemRequest};
-    use crate::agent::process::ScopeHash;
+    use crate::agent::process::{ProcessDisplay, ScopeHash};
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
+    async fn unlock_methods_returns_direct_method() {
+        let response = unlock_methods().await;
+
+        assert_eq!(
+            serde_json::json!({
+                "methods": [
+                    {
+                        "url": "/api/v1/auth/unlock/direct",
+                        "accepts_master_password": true
+                    }
+                ]
+            }),
+            serde_json::to_value(response.0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn unlock_methods_returns_gui_method() {
+        let response = unlock_methods().await;
+
+        assert_eq!(
+            serde_json::json!({
+                "methods": [
+                    {
+                        "url": "/api/v1/auth/unlock/gui",
+                        "accepts_master_password": false
+                    }
+                ]
+            }),
+            serde_json::to_value(response.0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn unlock_missing_bearer_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
-        let error = unlock(
+        let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             HeaderMap::new(),
@@ -874,12 +970,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn unlock_malformed_bearer_returns_access_denied() {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
 
         let state = AgentState::from_database_path("missing.db");
-        let error = unlock(
+        let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             headers,
@@ -891,9 +988,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn unlock_missing_scope_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
-        let error = unlock(
+        let error = super::unlock_direct(
             axum::extract::State(state),
             None,
             authorization_headers("correct"),
@@ -905,12 +1003,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn unlock_failed_sqlcipher_unlock_returns_unlock_failed() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
 
         let state = AgentState::from_database_path(file.path());
-        let error = unlock(
+        let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             authorization_headers("wrong"),
@@ -922,12 +1021,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn unlock_success_returns_ok_and_stores_handle() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
 
         let state = AgentState::from_database_path(file.path());
-        let status = unlock(
+        let status = super::unlock_direct(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
             authorization_headers("correct"),
@@ -937,6 +1037,87 @@ mod tests {
 
         assert_eq!(StatusCode::OK, status);
         assert!(state.database_handle().await.is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn unlock_gui_submits_prompt_password_once() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+
+        let state = AgentState::from_database_path(file.path());
+        let prompts = Arc::new(Mutex::new(0usize));
+        let prompt = {
+            let prompts = Arc::clone(&prompts);
+            move |_display: Option<ProcessDisplay>| {
+                let prompts = Arc::clone(&prompts);
+                async move {
+                    *prompts.lock().unwrap() += 1;
+                    Some(Zeroizing::new("correct".to_owned()))
+                }
+            }
+        };
+
+        let response = super::unlock_gui_with_prompt(
+            axum::extract::State(state.clone()),
+            Some(axum::Extension(ScopeHash::test(1))),
+            None,
+            prompt,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(StatusCode::OK, response);
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
+        assert_eq!(1, *prompts.lock().unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn unlock_gui_wrong_password_returns_access_denied_without_retry() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+
+        let state = AgentState::from_database_path(file.path());
+        let prompts = Arc::new(Mutex::new(0usize));
+        let prompt = {
+            let prompts = Arc::clone(&prompts);
+            move |_display: Option<ProcessDisplay>| {
+                let prompts = Arc::clone(&prompts);
+                async move {
+                    *prompts.lock().unwrap() += 1;
+                    Some(Zeroizing::new("wrong".to_owned()))
+                }
+            }
+        };
+
+        let error = super::unlock_gui_with_prompt(
+            axum::extract::State(state),
+            Some(axum::Extension(ScopeHash::test(1))),
+            None,
+            prompt,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(StatusCode::FORBIDDEN, error.status);
+        assert_eq!(1, *prompts.lock().unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn unlock_gui_cancel_returns_access_denied() {
+        let state = AgentState::from_database_path("missing.db");
+        let error = super::unlock_gui_with_prompt(
+            axum::extract::State(state),
+            Some(axum::Extension(ScopeHash::test(1))),
+            None,
+            |_display| async { None },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(StatusCode::FORBIDDEN, error.status);
     }
 
     #[tokio::test]
@@ -1018,12 +1199,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn already_unlocked_wrong_password_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
 
-        let error = unlock(
+        let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(2))),
             authorization_headers("wrong"),
@@ -1035,12 +1217,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
     async fn already_unlocked_correct_password_caches_new_hash() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
 
-        let response = unlock(
+        let response = super::unlock_direct(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(2))),
             authorization_headers("correct"),
@@ -1272,6 +1455,7 @@ mod tests {
         assert_eq!(StatusCode::FORBIDDEN, error.status);
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn authorization_headers(password: &str) -> HeaderMap {
         let token = general_purpose::STANDARD.encode(password);
         let mut headers = HeaderMap::new();

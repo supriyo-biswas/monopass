@@ -23,8 +23,36 @@ const LAUNCHD_SOCKET_NAME: &str = "monopass-agent";
 pub fn run(config: &Config) -> AppResult {
     harden_agent_process()?;
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(serve(config))
+    #[cfg(target_os = "macos")]
+    {
+        run_with_appkit_dispatcher(config)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(serve(config))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_with_appkit_dispatcher(config: &Config) -> AppResult {
+    let prompt_receiver = agent::install_prompt_dispatcher();
+    let config = config.clone();
+    let server = std::thread::spawn(move || -> Result<(), String> {
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+        runtime
+            .block_on(serve(&config))
+            .map_err(|error| error.to_string())
+    });
+
+    agent::run_prompt_dispatcher(prompt_receiver, &server);
+
+    match server.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err("agent server thread panicked".into()),
+    }
 }
 
 #[cfg(target_os = "macos")]

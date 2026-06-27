@@ -32,10 +32,24 @@ impl Server {
 }
 
 fn auth_routes() -> Router<AgentState> {
-    Router::new()
-        .route("/api/v1/auth/unlock", post(controller::unlock))
+    let routes = Router::new()
+        .route(
+            "/api/v1/auth/unlock/methods",
+            get(controller::unlock_methods),
+        )
         .route("/api/v1/auth/lock", post(controller::lock))
-        .route("/api/v1/auth/status", get(controller::status))
+        .route("/api/v1/auth/status", get(controller::status));
+
+    #[cfg(target_os = "macos")]
+    let routes = routes.route("/api/v1/auth/unlock/gui", post(controller::unlock_gui));
+
+    #[cfg(not(target_os = "macos"))]
+    let routes = routes.route(
+        "/api/v1/auth/unlock/direct",
+        post(controller::unlock_direct),
+    );
+
+    routes
 }
 
 fn database_routes(state: AgentState) -> Router<AgentState> {
@@ -107,6 +121,7 @@ mod tests {
     use base64::engine::general_purpose;
     use http_body_util::BodyExt;
     use serde_json::json;
+    #[cfg(not(target_os = "macos"))]
     use tempfile::NamedTempFile;
     use tower::ServiceExt;
 
@@ -156,7 +171,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlock_authorizes_hash_for_subsequent_database_route() {
+    #[cfg(not(target_os = "macos"))]
+    async fn unlock_methods_returns_direct_master_password_method_on_non_macos() {
+        let state = AgentState::from_database_path("missing.db");
+        let router = super::auth_routes().with_state(state);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/auth/unlock/methods",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(
+            json!({
+                "methods": [
+                    {
+                        "url": "/api/v1/auth/unlock/direct",
+                        "accepts_master_password": true
+                    }
+                ]
+            }),
+            json_body(response).await
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unlock_methods_returns_gui_method_on_macos() {
+        let state = AgentState::from_database_path("missing.db");
+        let router = super::auth_routes().with_state(state);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/auth/unlock/methods",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(
+            json!({
+                "methods": [
+                    {
+                        "url": "/api/v1/auth/unlock/gui",
+                        "accepts_master_password": false
+                    }
+                ]
+            }),
+            json_body(response).await
+        );
+    }
+
+    #[tokio::test]
+    async fn old_unlock_route_is_not_available() {
+        let state = AgentState::from_database_path("missing.db");
+        let router = super::auth_routes().with_state(state);
+
+        let response = router
+            .oneshot(post_request_with_hash_and_password(
+                "/api/v1/auth/unlock",
+                ScopeHash::test(1),
+                "correct",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::NOT_FOUND, response.status());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unlock_direct_route_is_not_available_on_macos() {
+        let state = AgentState::from_database_path("missing.db");
+        let router = super::auth_routes().with_state(state);
+
+        let response = router
+            .oneshot(post_request_with_hash_and_password(
+                "/api/v1/auth/unlock/direct",
+                ScopeHash::test(1),
+                "correct",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::NOT_FOUND, response.status());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn unlock_direct_authorizes_hash_for_subsequent_database_route() {
         let file = NamedTempFile::new().unwrap();
         crate::db::create_encrypted_database_with_password(file.path(), "correct").unwrap();
 
@@ -168,7 +275,7 @@ mod tests {
         let response = router
             .clone()
             .oneshot(post_request_with_hash_and_password(
-                "/api/v1/auth/unlock",
+                "/api/v1/auth/unlock/direct",
                 ScopeHash::test(1),
                 "correct",
             ))
@@ -185,24 +292,12 @@ mod tests {
 
     #[tokio::test]
     async fn lock_clears_hash_for_subsequent_database_route() {
-        let file = NamedTempFile::new().unwrap();
-        crate::db::create_encrypted_database_with_password(file.path(), "correct").unwrap();
-
-        let state = AgentState::from_database_path(file.path());
+        let state = AgentState::from_database_path("missing.db");
+        state.store_database_handle(DbHandle::test()).await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
         let router = super::auth_routes()
             .merge(super::database_routes(state.clone()))
             .with_state(state);
-
-        let response = router
-            .clone()
-            .oneshot(post_request_with_hash_and_password(
-                "/api/v1/auth/unlock",
-                ScopeHash::test(1),
-                "correct",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(StatusCode::OK, response.status());
 
         let response = router
             .clone()

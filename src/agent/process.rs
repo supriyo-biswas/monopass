@@ -1,4 +1,6 @@
 use std::fs::Metadata;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -40,6 +42,14 @@ struct ExecutableIdentity {
     changed_nanoseconds: i64,
 }
 
+impl ExecutableIdentity {
+    fn from_path(path: &Path) -> Option<Self> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| executable_identity(&metadata))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StableProcessIdentity {
     Executable(ExecutableIdentity),
@@ -53,6 +63,8 @@ struct ProcessInfo {
     uid: u32,
     session_id: i32,
     executable: Option<ExecutableIdentity>,
+    executable_path: Option<PathBuf>,
+    executable_modified: Option<SystemTime>,
 }
 
 impl ProcessInfo {
@@ -71,9 +83,31 @@ struct AuthorizationScope {
     chain: Vec<StableProcessIdentity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedAuthorizationScope {
+    pub(crate) hash: ScopeHash,
+    pub(crate) display: Option<ProcessDisplay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessDisplay {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) icon_path: Option<PathBuf>,
+    pub(crate) modified: Option<SystemTime>,
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_authorization_scope_hash(peer_pid: i32, peer_uid: u32) -> Option<ScopeHash> {
+    resolve_authorization_scope(peer_pid, peer_uid).map(|scope| scope.hash)
+}
+
+pub(crate) fn resolve_authorization_scope(
+    peer_pid: i32,
+    peer_uid: u32,
+) -> Option<ResolvedAuthorizationScope> {
     let resolver = PlatformProcessResolver;
-    resolve_authorization_scope_hash_with_resolver(peer_pid, peer_uid, &resolver)
+    resolve_authorization_scope_with_resolver(peer_pid, peer_uid, &resolver)
 }
 
 trait ProcessResolver {
@@ -81,11 +115,20 @@ trait ProcessResolver {
     fn process_uid(&self, pid: i32) -> Option<u32>;
 }
 
+#[cfg(test)]
 fn resolve_authorization_scope_hash_with_resolver(
     peer_pid: i32,
     peer_uid: u32,
     resolver: &impl ProcessResolver,
 ) -> Option<ScopeHash> {
+    resolve_authorization_scope_with_resolver(peer_pid, peer_uid, resolver).map(|scope| scope.hash)
+}
+
+fn resolve_authorization_scope_with_resolver(
+    peer_pid: i32,
+    peer_uid: u32,
+    resolver: &impl ProcessResolver,
+) -> Option<ResolvedAuthorizationScope> {
     let mut current = resolver.process_info(peer_pid)?;
     if current.uid != peer_uid {
         return None;
@@ -141,7 +184,68 @@ fn resolve_authorization_scope_hash_with_resolver(
         chain: chain.iter().map(ProcessInfo::stable_identity).collect(),
     };
 
-    Some(hash_authorization_scope(&scope))
+    Some(ResolvedAuthorizationScope {
+        hash: hash_authorization_scope(&scope),
+        display: process_display_from_chain(&chain),
+    })
+}
+
+fn process_display_from_chain(chain: &[ProcessInfo]) -> Option<ProcessDisplay> {
+    let agent_executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| ExecutableIdentity::from_path(&path));
+
+    process_display_from_chain_with_agent(chain, agent_executable)
+}
+
+fn process_display_from_chain_with_agent(
+    chain: &[ProcessInfo],
+    agent_executable: Option<ExecutableIdentity>,
+) -> Option<ProcessDisplay> {
+    chain
+        .iter()
+        .rev()
+        .find(|process| {
+            process.executable.is_some()
+                && process.executable_path.is_some()
+                && process.executable != agent_executable
+        })
+        .or_else(|| {
+            chain
+                .iter()
+                .rev()
+                .find(|process| process.executable_path.is_some())
+        })
+        .and_then(process_display)
+}
+
+fn process_display(process: &ProcessInfo) -> Option<ProcessDisplay> {
+    let path = process.executable_path.clone()?;
+    let bundle_path = app_bundle_path(&path);
+    let name_path = bundle_path.as_deref().unwrap_or(path.as_path());
+    let name = name_path
+        .file_stem()
+        .or_else(|| name_path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("pid {}", process.instance.pid));
+
+    Some(ProcessDisplay {
+        name,
+        path,
+        icon_path: bundle_path,
+        modified: process.executable_modified,
+    })
+}
+
+fn app_bundle_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .extension()
+                .is_some_and(|extension| extension == "app")
+        })
+        .map(Path::to_path_buf)
 }
 
 fn hash_authorization_scope(scope: &AuthorizationScope) -> ScopeHash {
@@ -223,6 +327,11 @@ impl ProcessResolver for PlatformProcessResolver {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let stat = parse_linux_process_stat(&stat)?;
 
+        let executable_path = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        let executable_metadata = executable_path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok());
+
         Some(ProcessInfo {
             instance: ProcessInstanceIdentity {
                 pid,
@@ -234,9 +343,9 @@ impl ProcessResolver for PlatformProcessResolver {
             parent_pid: stat.parent_pid,
             uid: process_dir.uid(),
             session_id: stat.session_id,
-            executable: std::fs::metadata(format!("/proc/{pid}/exe"))
-                .ok()
-                .map(|metadata| executable_identity(&metadata)),
+            executable: executable_metadata.as_ref().map(executable_identity),
+            executable_path,
+            executable_modified: executable_metadata.and_then(|metadata| metadata.modified().ok()),
         })
     }
 
@@ -285,6 +394,11 @@ impl ProcessResolver for PlatformProcessResolver {
             return None;
         }
 
+        let executable_path = macos_executable_path(pid);
+        let executable_metadata = executable_path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok());
+
         Some(ProcessInfo {
             instance: ProcessInstanceIdentity {
                 pid,
@@ -296,8 +410,9 @@ impl ProcessResolver for PlatformProcessResolver {
             parent_pid: i32::try_from(info.pbi_ppid).ok()?,
             uid: info.pbi_uid,
             session_id,
-            executable: macos_executable_metadata(pid)
-                .map(|metadata| executable_identity(&metadata)),
+            executable: executable_metadata.as_ref().map(executable_identity),
+            executable_path,
+            executable_modified: executable_metadata.and_then(|metadata| metadata.modified().ok()),
         })
     }
 
@@ -309,7 +424,7 @@ impl ProcessResolver for PlatformProcessResolver {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_executable_metadata(pid: i32) -> Option<Metadata> {
+fn macos_executable_path(pid: i32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
     let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
@@ -320,7 +435,7 @@ fn macos_executable_metadata(pid: i32) -> Option<Metadata> {
 
     buffer.truncate(len as usize);
     let path = std::ffi::OsString::from_vec(buffer);
-    std::fs::metadata(path).ok()
+    Some(PathBuf::from(path))
 }
 
 #[cfg(target_os = "macos")]
@@ -388,6 +503,8 @@ compile_error!("process-lineage authorization is supported only on Linux and mac
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use super::{
         ExecutableIdentity, ProcessInfo, ProcessInstanceIdentity, ProcessResolver, ProcessStartTime,
@@ -405,6 +522,23 @@ mod tests {
     impl FakeResolver {
         fn with(mut self, pid: i32, parent: i32, uid: u32, sid: i32, exe: u64) -> Self {
             let process = process(pid, parent, uid, sid, Some(exe));
+            self.visible_uids.insert(pid, uid);
+            self.processes.insert(pid, process);
+            self
+        }
+
+        fn with_path(
+            mut self,
+            pid: i32,
+            parent: i32,
+            uid: u32,
+            sid: i32,
+            exe: u64,
+            path: &str,
+        ) -> Self {
+            let mut process = process(pid, parent, uid, sid, Some(exe));
+            process.executable_path = Some(PathBuf::from(path));
+            process.executable_modified = Some(UNIX_EPOCH + Duration::from_secs(exe));
             self.visible_uids.insert(pid, uid);
             self.processes.insert(pid, process);
             self
@@ -630,6 +764,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn display_uses_nearest_process_path() {
+        let resolver = FakeResolver::default()
+            .with_path(
+                12,
+                11,
+                UID,
+                SID,
+                3,
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            )
+            .with_path(11, 10, UID, SID, 2, "/usr/local/bin/monopass")
+            .with_path(10, 1, UID, SID, 1, "/bin/bash")
+            .with_uid_only(1, 0);
+
+        let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
+        let display = scope.display.unwrap();
+
+        assert_eq!("Google Chrome", display.name);
+        assert_eq!(
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            display.path
+        );
+        assert_eq!(
+            Some(PathBuf::from("/Applications/Google Chrome.app")),
+            display.icon_path
+        );
+        assert_eq!(Some(UNIX_EPOCH + Duration::from_secs(3)), display.modified);
+    }
+
+    #[test]
+    fn display_filters_process_matching_agent_executable_identity() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/monopass")
+            .with_path(
+                11,
+                10,
+                UID,
+                SID,
+                2,
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            )
+            .with_path(10, 1, UID, SID, 1, "/bin/bash")
+            .with_uid_only(1, 0);
+        let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
+        let display = super::process_display_from_chain_with_agent(
+            &chain(&resolver, &[10, 11, 12]),
+            Some(test_executable(3)),
+        )
+        .unwrap();
+
+        assert!(scope.display.is_some());
+        assert_eq!("Google Chrome", display.name);
+    }
+
+    #[test]
+    fn display_falls_back_to_plain_executable() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/example-tool")
+            .with_uid_only(11, 0);
+
+        let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
+        let display = scope.display.unwrap();
+
+        assert_eq!("example-tool", display.name);
+        assert_eq!(PathBuf::from("/usr/local/bin/example-tool"), display.path);
+        assert_eq!(None, display.icon_path);
+    }
+
     fn process(
         pid: i32,
         parent_pid: i32,
@@ -649,7 +852,15 @@ mod tests {
             uid,
             session_id,
             executable: executable.map(test_executable),
+            executable_path: executable.map(|inode| PathBuf::from(format!("/bin/test-{inode}"))),
+            executable_modified: executable.map(|inode| UNIX_EPOCH + Duration::from_secs(inode)),
         }
+    }
+
+    fn chain(resolver: &FakeResolver, pids: &[i32]) -> Vec<ProcessInfo> {
+        pids.iter()
+            .map(|pid| resolver.process_info(*pid).unwrap())
+            .collect()
     }
 
     fn test_executable(inode: u64) -> ExecutableIdentity {

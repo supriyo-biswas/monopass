@@ -9,6 +9,18 @@ pub struct AuthStatusResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUnlockMethodsResponse {
+    pub methods: Vec<AuthUnlockMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUnlockMethod {
+    pub url: String,
+    #[serde(rename = "accepts_master_password")]
+    pub accepts_master_password: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobAcceptedResponse {
     #[serde(rename = "job_id")]
     pub job_id: String,

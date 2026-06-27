@@ -24,19 +24,28 @@ wiring only and put implementation in focused modules, for example:
 Implement a small blocking HTTP client over the Unix socket at
 `Config::listen_path()`. The client should decode structured API errors and
 preserve status codes for command-specific handling. On any auth-required
-request that returns `403 access_denied`, prompt for the master password with
-hidden terminal input, standard-base64 encode the UTF-8 password bytes, call
-`POST /api/v1/auth/unlock`, zeroize the password buffer, then retry the
-original request once. Treat `403 unlock_failed` and a second
-`403 access_denied` as command failure. `GET /api/v1/auth/status` may be used
-as a diagnostic, but never as a keepalive because it intentionally refreshes
-neither authorization nor idle state.
+request that returns `403 access_denied`, select the first advertised unlock
+method through the discovery flow in
+[`flexible-auth-spec.md`](flexible-auth-spec.md). Prompt for the master password
+with hidden terminal input only when the selected method has
+`accepts_master_password: true`; standard-base64 encode the UTF-8 password
+bytes, call the selected unlock method with that bearer value, then zeroize the
+password buffer. When the selected method has `accepts_master_password: false`,
+call it without prompting locally or sending a bearer password. Retry the
+original request once after a successful unlock method call. Treat
+`403 unlock_failed` and a second `403 access_denied` as command failure.
+`GET /api/v1/auth/status` may be used as a diagnostic, but never as a keepalive
+because it intentionally refreshes neither authorization nor idle state.
 
 Secret-bearing item reads can require the same bearer password on the original
 read request, even after process-lineage authorization succeeds. If `read`,
 secret-bearing `show --reveal`, or any raw item read gets `403 access_denied`,
 prompt/unlock as above and retry the original read once with
-`Authorization: Bearer <standard-base64 UTF-8 password>`.
+`Authorization: Bearer <standard-base64 UTF-8 password>` only when the selected
+unlock method supplied a CLI-owned password. Methods such as macOS GUI unlock do
+not expose the password to the CLI, so the retried original request is sent
+without a bearer password and can still fail if the item itself requires bearer
+reauthentication.
 
 Use `zeroize` or `Zeroizing<T>` for owned sensitive values where practical,
 including prompted passwords, decoded bearer material, generated passwords,

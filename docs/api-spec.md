@@ -26,8 +26,63 @@ fails closed when required process identity cannot be resolved.
 
 ### Unlock
 
+Unlock uses the method discovery flow described in
+[`flexible-auth-spec.md`](flexible-auth-spec.md). The agent advertises one
+unlock method for the current platform.
+
 ```http
-POST /api/v1/auth/unlock
+GET /api/v1/auth/unlock/methods
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+```
+
+macOS response:
+
+```json
+{
+  "methods": [
+    {
+      "url": "/api/v1/auth/unlock/gui",
+      "accepts_master_password": false
+    }
+  ]
+}
+```
+
+Linux response:
+
+```json
+{
+  "methods": [
+    {
+      "url": "/api/v1/auth/unlock/direct",
+      "accepts_master_password": true
+    }
+  ]
+}
+```
+
+On macOS, the advertised method is:
+
+```http
+POST /api/v1/auth/unlock/gui
+
+HTTP/1.1 200 OK
+```
+
+The agent displays a password dialog for the requesting application and accepts
+one submitted password for the request. A wrong password, cancelled dialog, or
+closed dialog denies the request. Concurrent GUI unlock requests are displayed
+as separate dialogs.
+
+Failure:
+- `403 access_denied`
+
+On Linux, the advertised method is:
+
+```http
+POST /api/v1/auth/unlock/direct
 Authorization: Bearer <standard-base64 UTF-8 password>
 
 HTTP/1.1 200 OK
