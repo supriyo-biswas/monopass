@@ -156,6 +156,32 @@ def ensure_no_cargo_changes(root: Path) -> None:
         raise RuntimeError("refusing to bump version while Cargo.toml or Cargo.lock has uncommitted changes")
 
 
+def package_version_at_revision(root: Path, revision: str) -> str | None:
+    cargo_toml = subprocess.run(
+        ["git", "show", f"{revision}:Cargo.toml"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if cargo_toml.returncode != 0:
+        return None
+
+    _, version = read_package_metadata(cargo_toml.stdout.splitlines())
+    return version
+
+
+def ensure_head_is_not_version_bump(root: Path) -> None:
+    current_version = package_version_at_revision(root, "HEAD")
+    previous_version = package_version_at_revision(root, "HEAD^")
+
+    if current_version is not None and previous_version is not None and current_version != previous_version:
+        raise RuntimeError(
+            "refusing to bump version because the latest commit already changed "
+            f"the package version from {previous_version} to {current_version}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bump the crate version in Cargo.toml and Cargo.lock")
     parser.add_argument("--part", choices=("major", "minor", "patch"), default="patch")
@@ -167,6 +193,7 @@ def main() -> int:
     cargo_lock = root / "Cargo.lock"
 
     ensure_no_cargo_changes(root)
+    ensure_head_is_not_version_bump(root)
 
     cargo_toml_text = cargo_toml.read_text(encoding="utf-8")
     cargo_toml_lines = cargo_toml_text.splitlines()
