@@ -275,7 +275,7 @@ are sent as update-only removal entries, for example
 monopass rm [-g|--globoff] [-f|--force] [-r|--recursive] <dir>[/<item-glob>]
 ```
 
-For item paths, the item component is a case-sensitive SQLite glob by default.
+For item paths, the item component is a case-sensitive glob pattern by default.
 The command lists every match before deleting any of them. If there are no
 matches, it fails without mutation. `-g`/`--globoff` treats the item component
 as an exact name, including literal `*`, `?`, and bracket expressions.
@@ -323,7 +323,7 @@ Copy item sources with
 The command sends an empty create-item JSON body and relies on the API to copy
 the source item fields and files. Source version history is not copied.
 
-Every item source component is a case-sensitive SQLite glob by default and is
+Every item source component is a case-sensitive glob pattern by default and is
 expanded through ListItems before copying starts. `-g`/`--globoff` treats item
 source components as exact names. Directory names and destinations are always
 literal. With `--recursive`, a source may also be a directory path; directory
@@ -361,7 +361,7 @@ The command sends an empty body. The API changes the item directory/name
 without creating a new version.
 
 Path handling is the same as `cp`: item source components are case-sensitive
-SQLite globs unless `-g`/`--globoff` is set; destinations remain literal;
+glob patterns unless `-g`/`--globoff` is set; destinations remain literal;
 recursive directory sources are expanded by listing non-hidden items through
 the agent; multiple sources or recursive directory sources require a directory
 destination and preserve source item names. Recursive move moves the listed
@@ -381,14 +381,15 @@ No rollback is attempted. If a later move fails, earlier moves remain applied.
 ## list command
 
 ```
-monopass ls [<dir>[/<glob>]]
+monopass ls [-g|--globoff] [<dir>[/<item-glob>]]
 ```
 
 Without an argument, list directories with `GET /api/v1/dirs`. With `<dir>`,
 list all item names with `GET /api/v1/dir/{dirName}/items`. With `<dir>/<glob>`,
-pass the case-sensitive SQLite glob to ListItems and print only matching names.
+pass the case-sensitive glob pattern to ListItems and print only matching names.
 Output is one name per line. Quote patterns to prevent shell expansion, for
-example `monopass ls 'Personal/*Github*'`.
+example `monopass ls 'Personal/*Github*'`. With `-g`/`--globoff`, treat the item
+component as a literal name, including literal `*`, `?`, and bracket expressions.
 
 ## list versions command
 

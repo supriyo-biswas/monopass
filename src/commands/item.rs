@@ -116,7 +116,7 @@ pub struct RemoveArgs {
     #[arg(
         short = 'g',
         long,
-        help = "Treat an item source name literally instead of as a SQLite glob"
+        help = "Treat an item source name literally instead of as a glob pattern"
     )]
     globoff: bool,
     #[arg(
@@ -518,7 +518,7 @@ fn trash_numbered_glob(item: &str, created_at: &str) -> String {
     let prefix = numbered
         .strip_suffix("000)")
         .expect("numbered Trash name has a fixed suffix");
-    format!("{}[0-9][0-9][0-9])", escape_sqlite_glob(prefix))
+    format!("{}[0-9][0-9][0-9])", super::dir::escape_sqlite_glob(prefix))
 }
 
 fn trash_number(name: &str, item: &str, created_at: &str) -> io::Result<u16> {
@@ -546,19 +546,6 @@ fn next_trash_number(latest: Option<&str>, item: &str, created_at: &str) -> io::
     } else {
         Ok(latest + 1)
     }
-}
-
-fn escape_sqlite_glob(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '*' => escaped.push_str("[*]"),
-            '?' => escaped.push_str("[?]"),
-            '[' => escaped.push_str("[[]"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
 }
 
 fn trash_suffix_limit_error() -> io::Error {
@@ -875,8 +862,8 @@ mod tests {
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
-        FieldType, RemovalPlan, build_fields, escape_sqlite_glob, human_size,
-        is_item_exists_conflict, next_trash_number, plan_removal, read_prompted_field_value,
+        FieldType, RemovalPlan, build_fields, human_size, is_item_exists_conflict,
+        next_trash_number, plan_removal, read_prompted_field_value,
         remove_item_is_permanent_delete, trash_fallback_name, trash_number, trash_numbered_glob,
         validate_field_and_file_name_overlap, write_human_item,
     };
@@ -1032,7 +1019,10 @@ mod tests {
     fn numbered_trash_glob_is_literal_and_suffix_is_parsed() {
         let pattern = trash_numbered_glob("test*[", "2026-06-07T01:23:45Z");
         assert_eq!("test[*][[] (2026-06-07T01:23:45Z,[0-9][0-9][0-9])", pattern);
-        assert_eq!("literal[*][?][[]", escape_sqlite_glob("literal*?["));
+        assert_eq!(
+            "literal[*][?][[]",
+            crate::commands::dir::escape_sqlite_glob("literal*?[")
+        );
         assert_eq!(
             42,
             trash_number(

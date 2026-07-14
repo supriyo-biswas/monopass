@@ -23,6 +23,12 @@ pub struct RmdirArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct ListArgs {
+    #[arg(
+        short = 'g',
+        long,
+        help = "Treat an item name literally instead of as a glob pattern"
+    )]
+    globoff: bool,
     #[arg(help = "Optional directory or <dir>/<glob> path")]
     path: Option<String>,
 }
@@ -50,7 +56,7 @@ pub fn rmdir(config: &Config, args: RmdirArgs) -> AppResult {
 
 pub fn list(config: &Config, args: ListArgs) -> AppResult {
     let client = Client::new(config);
-    match parse_list_target(args.path.as_deref())? {
+    match parse_list_target(args.path.as_deref(), args.globoff)? {
         ListTarget::Items { dir, glob } => {
             for item in list_all_matching_items(&client, &dir, glob.as_deref())? {
                 println!("{}", item.name);
@@ -65,17 +71,34 @@ pub fn list(config: &Config, args: ListArgs) -> AppResult {
     Ok(())
 }
 
-fn parse_list_target(path: Option<&str>) -> std::io::Result<ListTarget> {
+fn parse_list_target(path: Option<&str>, globoff: bool) -> std::io::Result<ListTarget> {
     match path {
         None => Ok(ListTarget::Dirs),
         Some(path) => match parse_dir_or_item_path(path)? {
             Ok(dir) => Ok(ListTarget::Items { dir, glob: None }),
             Err(path) => Ok(ListTarget::Items {
                 dir: path.dir,
-                glob: Some(path.item),
+                glob: Some(if globoff {
+                    escape_sqlite_glob(&path.item)
+                } else {
+                    path.item
+                }),
             }),
         },
     }
+}
+
+pub(crate) fn escape_sqlite_glob(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 pub(crate) fn list_all_matching_items(
@@ -150,20 +173,31 @@ mod tests {
 
     #[test]
     fn list_target_supports_directories_and_item_globs() {
-        assert_eq!(ListTarget::Dirs, parse_list_target(None).unwrap());
+        assert_eq!(ListTarget::Dirs, parse_list_target(None, false).unwrap());
         assert_eq!(
             ListTarget::Items {
                 dir: "Personal".to_owned(),
                 glob: None,
             },
-            parse_list_target(Some("Personal")).unwrap()
+            parse_list_target(Some("Personal"), false).unwrap()
         );
         assert_eq!(
             ListTarget::Items {
                 dir: "Personal".to_owned(),
                 glob: Some("*Github*".to_owned()),
             },
-            parse_list_target(Some("Personal/*Github*")).unwrap()
+            parse_list_target(Some("Personal/*Github*"), false).unwrap()
+        );
+    }
+
+    #[test]
+    fn list_globoff_treats_the_item_name_literally() {
+        assert_eq!(
+            ListTarget::Items {
+                dir: "Personal".to_owned(),
+                glob: Some("literal[*][[]name][?]".to_owned()),
+            },
+            parse_list_target(Some("Personal/literal*[name]?"), true).unwrap()
         );
     }
 }

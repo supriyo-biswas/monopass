@@ -21,7 +21,7 @@ pub struct Args {
     #[arg(
         short = 'g',
         long,
-        help = "Treat item source names literally instead of as SQLite globs"
+        help = "Treat item source names literally instead of as glob patterns"
     )]
     globoff: bool,
     #[arg(
