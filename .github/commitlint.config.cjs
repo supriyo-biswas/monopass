@@ -4,8 +4,8 @@ module.exports = {
     {
       rules: {
         "body-required-unless-chore": ({ body, type }) => [
-          type === "chore" || Boolean(body),
-          "commit body must not be empty unless the commit type is chore",
+          (type === "chore" || type === "docs") || Boolean(body),
+          "commit body must not be empty unless the commit type is chore or docs",
         ],
       },
     },
