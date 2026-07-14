@@ -234,8 +234,11 @@ Build a `CreateItemRequest` and send
   decoded, contains no QR code, contains multiple conflicting TOTP QR codes, or
   the decoded QR payload is not an `otpauth://` URL.
 - `--field name=value` creates a string field. If `=value` is omitted, prompt
-  once. If `--concealed-fields` is omitted, the CLI infers concealment from the
-  field name using the same `password`/`secret`/`private`/`key` heuristic as
+  once. Concealed prompts use hidden terminal input when stdin is a terminal;
+  otherwise, read one line from stdin without printing a prompt so callers can
+  pipe a value without placing it in the process argument list. If
+  `--concealed-fields` is omitted, the CLI infers concealment from the field name using the same
+  `password`/`secret`/`private`/`key` heuristic as
   the agent. If `--concealed-fields` is provided, fields listed there are sent
   with `concealed: true`; other fields are sent with `concealed: false`.
 - `--file name=path` uploads each path with `PUT /api/v1/file/upload`, then

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, ValueEnum};
@@ -722,24 +722,27 @@ fn build_fields(
 
 fn prompt_field_value(name: &str, concealed: bool) -> io::Result<(String, SecretString)> {
     let prompt = format!("{name} value: ");
-    if concealed {
-        Ok((
-            name.to_owned(),
-            SecretString::from(Zeroizing::new(rpassword::prompt_password(&prompt)?)),
-        ))
+    let stdin = io::stdin();
+    let stdin_is_terminal = stdin.is_terminal();
+    let value = if concealed && stdin_is_terminal {
+        Zeroizing::new(rpassword::prompt_password(&prompt)?)
     } else {
-        let mut value = String::new();
-        eprint!("{prompt}");
-        io::stderr().flush()?;
-        io::stdin().read_line(&mut value)?;
-        if value.ends_with('\n') {
-            value.pop();
-            if value.ends_with('\r') {
-                value.pop();
-            }
+        if stdin_is_terminal {
+            eprint!("{prompt}");
+            io::stderr().flush()?;
         }
-        Ok((name.to_owned(), SecretString::from(value)))
+        read_prompted_field_value(stdin.lock())?
+    };
+    Ok((name.to_owned(), SecretString::from(value)))
+}
+
+fn read_prompted_field_value(mut input: impl BufRead) -> io::Result<Zeroizing<String>> {
+    let mut value = Zeroizing::new(String::new());
+    input.read_line(&mut value)?;
+    while value.ends_with(['\r', '\n']) {
+        value.pop();
     }
+    Ok(value)
 }
 
 fn concealed_state(name: &str, explicit: Option<&HashSet<String>>) -> bool {
@@ -873,11 +876,21 @@ mod tests {
 
     use super::{
         FieldType, RemovalPlan, build_fields, escape_sqlite_glob, human_size,
-        is_item_exists_conflict, next_trash_number, plan_removal, remove_item_is_permanent_delete,
-        trash_fallback_name, trash_number, trash_numbered_glob,
+        is_item_exists_conflict, next_trash_number, plan_removal, read_prompted_field_value,
+        remove_item_is_permanent_delete, trash_fallback_name, trash_number, trash_numbered_glob,
         validate_field_and_file_name_overlap, write_human_item,
     };
     use crate::secret::SecretString;
+
+    #[test]
+    fn piped_field_values_strip_line_endings() {
+        assert_eq!(
+            "secret",
+            read_prompted_field_value("secret\r\n".as_bytes())
+                .unwrap()
+                .as_str()
+        );
+    }
 
     #[test]
     fn trash_items_are_permanently_deleted_without_force() {
