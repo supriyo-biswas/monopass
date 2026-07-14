@@ -5,8 +5,8 @@ use std::os::unix::net::UnixStream;
 
 use base64::Engine;
 use base64::engine::general_purpose;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::AppResult;
@@ -55,14 +55,37 @@ pub enum AuthMode {
     IncludePassword,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthUnlockMethodsResponse {
+    methods: Vec<AuthUnlockMethod>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthUnlockMethod {
+    url: String,
+    accepts_master_password: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Client<'a> {
     config: &'a Config,
+    capabilities: Option<String>,
 }
 
 impl<'a> Client<'a> {
     pub fn new(config: &'a Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            capabilities: detect_client_capabilities(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_capabilities(config: &'a Config, capabilities: Option<String>) -> Self {
+        Self {
+            config,
+            capabilities,
+        }
     }
 
     pub fn get_json<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
@@ -179,12 +202,40 @@ impl<'a> Client<'a> {
         content_type: Option<&str>,
         auth_mode: AuthMode,
     ) -> AppResult<Response> {
+        self.request_with_unlock_prompt(
+            method,
+            path,
+            body,
+            content_type,
+            auth_mode,
+            prompt_master_password,
+        )
+    }
+
+    fn request_with_unlock_prompt<F>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Zeroizing<Vec<u8>>,
+        content_type: Option<&str>,
+        auth_mode: AuthMode,
+        prompt: F,
+    ) -> AppResult<Response>
+    where
+        F: FnOnce() -> io::Result<Zeroizing<String>>,
+    {
         let mut password: Option<Zeroizing<String>> = None;
         let mut response = self.request(method, path, &body, content_type, None)?;
         if is_access_denied(&response) {
-            let prompted = prompt_master_password()?;
-            self.unlock(&prompted)?;
-            password = Some(prompted);
+            let unlock_method = self.first_unlock_method()?;
+            if unlock_method.accepts_master_password {
+                let prompted = prompt()?;
+                self.unlock(&unlock_method, Some(&prompted))?;
+                password = Some(prompted);
+            } else {
+                self.unlock(&unlock_method, None)?;
+            }
+
             let bearer = match auth_mode {
                 AuthMode::ProcessOnly => None,
                 AuthMode::IncludePassword => password.as_deref().map(String::as_str),
@@ -212,8 +263,40 @@ impl<'a> Client<'a> {
         Ok(response)
     }
 
-    fn unlock(&self, password: &str) -> AppResult<()> {
-        let response = self.request("POST", "/api/v1/auth/unlock", &[], None, Some(password))?;
+    fn first_unlock_method(&self) -> AppResult<AuthUnlockMethod> {
+        let response = self.request_with_client_capabilities(
+            "GET",
+            "/api/v1/auth/unlock/methods",
+            &[],
+            None,
+            None,
+            true,
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(api_error(response).into());
+        }
+
+        let methods: AuthUnlockMethodsResponse = serde_json::from_slice(&response.body)?;
+        methods.methods.into_iter().next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "agent returned no unlock methods",
+            )
+            .into()
+        })
+    }
+
+    fn unlock(&self, method: &AuthUnlockMethod, password: Option<&str>) -> AppResult<()> {
+        let path = unlock_method_api_path(&method.url)?;
+        let include_capabilities = path == "/api/v1/auth/unlock/gui";
+        let response = self.request_with_client_capabilities(
+            "POST",
+            &path,
+            &[],
+            None,
+            password,
+            include_capabilities,
+        )?;
         if response.status == 200 {
             return Ok(());
         }
@@ -228,6 +311,25 @@ impl<'a> Client<'a> {
         content_type: Option<&str>,
         bearer_password: Option<&str>,
     ) -> AppResult<Response> {
+        self.request_with_client_capabilities(
+            method,
+            path,
+            body,
+            content_type,
+            bearer_password,
+            false,
+        )
+    }
+
+    fn request_with_client_capabilities(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        bearer_password: Option<&str>,
+        include_client_capabilities: bool,
+    ) -> AppResult<Response> {
         let mut stream = UnixStream::connect(self.config.listen_path())?;
         let mut request = Zeroizing::new(format!(
             "{method} {path} HTTP/1.1\r\nHost: monopass\r\nConnection: close\r\nContent-Length: {}\r\n",
@@ -237,6 +339,13 @@ impl<'a> Client<'a> {
             request.push_str("Content-Type: ");
             request.push_str(content_type);
             request.push_str("\r\n");
+        }
+        if include_client_capabilities {
+            if let Some(capabilities) = self.capabilities.as_deref() {
+                request.push_str("X-Client-Capabilities: ");
+                request.push_str(capabilities);
+                request.push_str("\r\n");
+            }
         }
         if let Some(password) = bearer_password {
             let token = Zeroizing::new(general_purpose::STANDARD.encode(password.as_bytes()));
@@ -253,6 +362,24 @@ impl<'a> Client<'a> {
         stream.read_to_end(&mut raw)?;
         parse_response(raw)
     }
+}
+
+fn detect_client_capabilities() -> Option<String> {
+    client_capabilities_from_env(|name| std::env::var(name).ok())
+}
+
+fn client_capabilities_from_env<F>(mut get_env: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    get_env("DISPLAY")
+        .filter(|value| !value.is_empty())
+        .map(|display| format!("x-session={display}"))
+        .or_else(|| {
+            get_env("WAYLAND_DISPLAY")
+                .filter(|value| !value.is_empty())
+                .map(|display| format!("wayland-session={display}"))
+        })
 }
 
 pub fn prompt_master_password() -> io::Result<Zeroizing<String>> {
@@ -384,5 +511,368 @@ fn api_error(response: Response) -> ApiError {
         status: response.status,
         code,
         message,
+    }
+}
+
+fn unlock_method_api_path(url: &str) -> io::Result<String> {
+    if !url.starts_with("/api/v1/auth/") || url.contains('?') || url.contains('#') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid unlock method url",
+        ));
+    }
+
+    Ok(url.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::thread;
+
+    use base64::Engine;
+    use base64::engine::general_purpose;
+    use zeroize::Zeroizing;
+
+    use super::{AuthMode, AuthUnlockMethodsResponse, Client, Response, unlock_method_api_path};
+    use crate::config::Config;
+
+    #[test]
+    fn unlock_methods_response_uses_methods_array() {
+        let response: AuthUnlockMethodsResponse = serde_json::from_str(
+            r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+        )
+        .unwrap();
+
+        let method = response.methods.first().unwrap();
+        assert_eq!("/api/v1/auth/unlock/direct", method.url);
+        assert!(method.accepts_master_password);
+    }
+
+    #[test]
+    fn unlock_method_api_path_accepts_full_api_urls() {
+        assert_eq!(
+            "/api/v1/auth/unlock/direct",
+            unlock_method_api_path("/api/v1/auth/unlock/direct").unwrap()
+        );
+    }
+
+    #[test]
+    fn unlock_method_api_path_rejects_unexpected_urls() {
+        for url in [
+            "auth/unlock/direct",
+            "/auth/unlock/direct",
+            "/auth/unlock/direct?next=/x",
+            "/api/v1/auth/unlock/direct?next=/x",
+            "/api/v1/auth/unlock/direct#fragment",
+            "/settings",
+        ] {
+            assert!(unlock_method_api_path(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn client_capabilities_prefer_x_session_then_wayland() {
+        let x = super::client_capabilities_from_env(|name| match name {
+            "DISPLAY" => Some(":1".to_owned()),
+            "WAYLAND_DISPLAY" => Some("wayland-0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(Some("x-session=:1".to_owned()), x);
+
+        let wayland = super::client_capabilities_from_env(|name| match name {
+            "WAYLAND_DISPLAY" => Some("wayland-0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(Some("wayland-session=wayland-0".to_owned()), wayland);
+
+        let none = super::client_capabilities_from_env(|_| None);
+        assert_eq!(None, none);
+    }
+
+    #[test]
+    fn request_with_unlock_uses_discovered_method_without_original_bearer_for_process_auth() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer("correct")),
+                client_capabilities: None,
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("{}"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        let response = request_with_test_prompt(&config, AuthMode::ProcessOnly);
+
+        assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn request_with_unlock_retries_original_with_bearer_for_password_auth() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/ref/personal/github/password",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer("correct")),
+                client_capabilities: None,
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/ref/personal/github/password",
+                authorization: Some(bearer("correct")),
+                client_capabilities: None,
+                response: ok_json_response("{}"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        let response = Client::with_capabilities(&config, None)
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/ref/personal/github/password",
+                Zeroizing::new(Vec::new()),
+                None,
+                AuthMode::IncludePassword,
+                || Ok(Zeroizing::new("correct".to_owned())),
+            )
+            .unwrap();
+
+        assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn request_with_unlock_uses_method_without_master_password_when_advertised() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: Some("x-session=:1".to_owned()),
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/gui","accepts_master_password":false}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/gui",
+                authorization: None,
+                client_capabilities: Some("x-session=:1".to_owned()),
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("{}"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        let response = Client::with_capabilities(&config, Some("x-session=:1".to_owned()))
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/dirs",
+                Zeroizing::new(Vec::new()),
+                None,
+                AuthMode::ProcessOnly,
+                || panic!("GUI unlock must not prompt in the CLI"),
+            )
+            .unwrap();
+
+        assert_eq!(200, response.status);
+        server.join();
+    }
+
+    fn request_with_test_prompt(config: &Config, auth_mode: AuthMode) -> Response {
+        Client::with_capabilities(config, None)
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/dirs",
+                Zeroizing::new(Vec::new()),
+                None,
+                auth_mode,
+                || Ok(Zeroizing::new("correct".to_owned())),
+            )
+            .unwrap()
+    }
+
+    fn test_config(listen_path: &Path) -> Config {
+        Config::new(
+            "db".into(),
+            "files".into(),
+            "jobs".into(),
+            listen_path.to_owned(),
+            "lock".into(),
+        )
+    }
+
+    fn bearer(password: &str) -> String {
+        format!("Bearer {}", general_purpose::STANDARD.encode(password))
+    }
+
+    struct ExpectedRequest {
+        method: &'static str,
+        path: &'static str,
+        authorization: Option<String>,
+        client_capabilities: Option<String>,
+        response: String,
+    }
+
+    struct TestServer {
+        _tempdir: tempfile::TempDir,
+        listen_path: PathBuf,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl TestServer {
+        fn new(expected: Vec<ExpectedRequest>) -> Self {
+            let tempdir = tempfile::TempDir::new().unwrap();
+            let listen_path = tempdir.path().join("agent.sock");
+            let listener = UnixListener::bind(&listen_path).unwrap();
+            let handle = thread::spawn(move || {
+                for expected in expected {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_request(&mut stream);
+                    assert_eq!(expected.method, request.method);
+                    assert_eq!(expected.path, request.path);
+                    assert_eq!(expected.authorization, request.authorization);
+                    assert_eq!(expected.client_capabilities, request.client_capabilities);
+                    stream.write_all(expected.response.as_bytes()).unwrap();
+                }
+            });
+
+            Self {
+                _tempdir: tempdir,
+                listen_path,
+                handle,
+            }
+        }
+
+        fn listen_path(&self) -> &Path {
+            &self.listen_path
+        }
+
+        fn join(self) {
+            self.handle.join().unwrap();
+        }
+    }
+
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        client_capabilities: Option<String>,
+    }
+
+    fn read_request(stream: &mut std::os::unix::net::UnixStream) -> RecordedRequest {
+        let mut raw = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(0, read, "client closed before request headers");
+            raw.extend_from_slice(&buffer[..read]);
+            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let text = std::str::from_utf8(&raw).unwrap();
+        let mut lines = text.split("\r\n");
+        let mut request_line = lines.next().unwrap().split_whitespace();
+        let method = request_line.next().unwrap().to_owned();
+        let path = request_line.next().unwrap().to_owned();
+        let mut authorization = None;
+        let mut client_capabilities = None;
+        for line in lines {
+            if let Some(value) = line.strip_prefix("Authorization: ") {
+                authorization = Some(value.to_owned());
+            }
+            if let Some(value) = line.strip_prefix("X-Client-Capabilities: ") {
+                client_capabilities = Some(value.to_owned());
+            }
+        }
+
+        RecordedRequest {
+            method,
+            path,
+            authorization,
+            client_capabilities,
+        }
+    }
+
+    fn access_denied_response() -> String {
+        http_response(
+            403,
+            r#"{"error":{"code":"access_denied","message":"access denied"}}"#,
+        )
+    }
+
+    fn ok_json_response(body: &str) -> String {
+        http_response(200, body)
+    }
+
+    fn ok_empty_response() -> String {
+        http_response(200, "")
+    }
+
+    fn http_response(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+            body.len()
+        )
     }
 }

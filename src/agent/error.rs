@@ -22,6 +22,7 @@ pub enum ApiErrorCode {
     Conflict,
     InternalError,
     NotFound,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     UnlockFailed,
 }
 
@@ -44,6 +45,7 @@ impl ApiError {
         }
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn unlock_failed() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,

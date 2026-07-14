@@ -23,8 +23,68 @@ const LAUNCHD_SOCKET_NAME: &str = "monopass-agent";
 pub fn run(config: &Config) -> AppResult {
     harden_agent_process()?;
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(serve(config))
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    {
+        configure_prompt_backend_environment();
+        run_with_prompt_dispatcher(config)
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    )))]
+    {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(serve(config))
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "gtk"))]
+fn configure_prompt_backend_environment() {
+    // SAFETY: this runs before the agent server/runtime thread is spawned in this process.
+    unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+}
+
+#[cfg(all(target_os = "linux", not(feature = "gtk"), feature = "qt"))]
+fn configure_prompt_backend_environment() {
+    // SAFETY: this runs before the agent server/runtime thread is spawned in this process.
+    unsafe {
+        std::env::set_var("QT_QPA_PLATFORM", "xcb");
+        std::env::remove_var("XDG_CURRENT_DESKTOP");
+        std::env::remove_var("DESKTOP_SESSION");
+        std::env::remove_var("GNOME_DESKTOP_SESSION_ID");
+        std::env::remove_var("GTK_MODULES");
+        std::env::remove_var("GTK_IM_MODULE");
+    };
+}
+
+#[cfg(target_os = "macos")]
+fn configure_prompt_backend_environment() {}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
+fn run_with_prompt_dispatcher(config: &Config) -> AppResult {
+    let prompt_receiver = agent::install_prompt_dispatcher();
+    let config = config.clone();
+    let server = std::thread::spawn(move || -> Result<(), String> {
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+        runtime
+            .block_on(serve(&config))
+            .map_err(|error| error.to_string())
+    });
+
+    agent::run_prompt_dispatcher(prompt_receiver, &server);
+
+    match server.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err("agent server thread panicked".into()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -103,7 +163,7 @@ fn ensure_not_traced() -> io::Result<()> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(test, all(target_os = "linux", not(debug_assertions))))]
 fn parse_tracer_pid(status: &str) -> io::Result<u32> {
     let value = status
         .lines()

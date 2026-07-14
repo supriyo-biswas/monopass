@@ -12,12 +12,12 @@ use http_body::{Frame, SizeHint};
 use tokio::net::UnixListener;
 
 use super::error::ApiError;
-use super::process::{ScopeHash, resolve_authorization_scope_hash};
+use super::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash};
 use super::state::{ActiveDatabaseRequest, AgentState};
 
 #[derive(Debug, Clone)]
 pub struct PeerConnectInfo {
-    scope_hash: Option<ScopeHash>,
+    scope: Option<ResolvedAuthorizationScope>,
 }
 
 impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
@@ -29,12 +29,16 @@ impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
 impl PeerConnectInfo {
     fn from_peer_credentials(credentials: Option<PeerCredentials>) -> Self {
         Self {
-            scope_hash: authorized_peer_scope_hash(credentials.as_ref()),
+            scope: authorized_peer_scope(credentials.as_ref()),
         }
     }
 
     fn scope_hash(&self) -> Option<&ScopeHash> {
-        self.scope_hash.as_ref()
+        self.scope.as_ref().map(|scope| &scope.hash)
+    }
+
+    fn display(&self) -> Option<&ProcessDisplay> {
+        self.scope.as_ref().and_then(|scope| scope.display.as_ref())
     }
 }
 
@@ -62,6 +66,9 @@ pub async fn require_same_uid_and_gid(
 ) -> Result<Response, ApiError> {
     if let Some(scope_hash) = connect_info.scope_hash() {
         request.extensions_mut().insert(scope_hash.clone());
+        if let Some(display) = connect_info.display() {
+            request.extensions_mut().insert(display.clone());
+        }
         Ok(next.run(request).await)
     } else {
         Err(ApiError::access_denied())
@@ -117,13 +124,15 @@ impl HttpBody for GuardedBody {
     }
 }
 
-fn authorized_peer_scope_hash(credentials: Option<&PeerCredentials>) -> Option<ScopeHash> {
+fn authorized_peer_scope(
+    credentials: Option<&PeerCredentials>,
+) -> Option<ResolvedAuthorizationScope> {
     let credentials = credentials?;
     if !peer_credentials_are_authorized(Some(credentials)) {
         return None;
     }
 
-    resolve_authorization_scope_hash(credentials.pid?, credentials.uid)
+    super::process::resolve_authorization_scope(credentials.pid?, credentials.uid)
 }
 
 fn peer_credentials_are_authorized(credentials: Option<&PeerCredentials>) -> bool {
@@ -154,7 +163,7 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
-    use crate::agent::process::ScopeHash;
+    use crate::agent::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash};
 
     use super::{PeerConnectInfo, PeerCredentials, current_process_gid, current_process_uid};
 
@@ -261,9 +270,7 @@ mod tests {
     #[tokio::test]
     async fn middleware_with_no_precomputed_hash_returns_access_denied() {
         let response = router()
-            .oneshot(request_with_connect_info(PeerConnectInfo {
-                scope_hash: None,
-            }))
+            .oneshot(request_with_connect_info(PeerConnectInfo { scope: None }))
             .await
             .unwrap();
 
@@ -274,7 +281,31 @@ mod tests {
     async fn middleware_inserts_precomputed_hash_into_request_extensions() {
         let response = router()
             .oneshot(request_with_connect_info(PeerConnectInfo {
-                scope_hash: Some(ScopeHash::test(1)),
+                scope: Some(ResolvedAuthorizationScope {
+                    hash: ScopeHash::test(1),
+                    display: None,
+                }),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::OK, response.status());
+    }
+
+    #[tokio::test]
+    async fn middleware_inserts_precomputed_display_into_request_extensions() {
+        let display = ProcessDisplay {
+            name: "Example".to_owned(),
+            path: "example".into(),
+            icon_path: None,
+            modified: None,
+        };
+        let response = display_router()
+            .oneshot(request_with_connect_info(PeerConnectInfo {
+                scope: Some(ResolvedAuthorizationScope {
+                    hash: ScopeHash::test(1),
+                    display: Some(display),
+                }),
             }))
             .await
             .unwrap();
@@ -288,9 +319,24 @@ mod tests {
             .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
     }
 
+    fn display_router() -> Router {
+        Router::new()
+            .route("/", get(display_required_handler))
+            .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
+    }
+
     async fn hash_required_handler(scope_hash: Option<axum::Extension<ScopeHash>>) -> StatusCode {
         match scope_hash {
             Some(axum::Extension(scope_hash)) if scope_hash == ScopeHash::test(1) => StatusCode::OK,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    async fn display_required_handler(
+        display: Option<axum::Extension<ProcessDisplay>>,
+    ) -> StatusCode {
+        match display {
+            Some(axum::Extension(display)) if display.name == "Example" => StatusCode::OK,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::AppResult;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     database_path: PathBuf,
     file_store_path: PathBuf,
