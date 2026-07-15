@@ -65,7 +65,7 @@ Linux direct response:
 }
 ```
 
-Linux GUI-capable response with `x-session` capability:
+Linux GUI-capable response with `x-session` or `wayland-session` capability:
 
 ```json
 {
@@ -90,10 +90,10 @@ HTTP/1.1 200 OK
 The agent displays a password dialog for the requesting application and accepts
 one submitted password for the request. The dialog shows the application name,
 executable path, and an icon when available. Linux GUI unlock requires an
-`x-session` capability and uses in-process GTK4 or Qt Quick/QML SDK dialogs with
-forced X11 backend usage; Wayland-only clients fall back to direct unlock. A wrong password, cancelled dialog, or closed dialog
-denies the request. Concurrent GUI unlock requests are displayed as separate
-dialogs.
+accepted GUI session capability (`x-session` or `wayland-session`) and uses
+in-process GTK4 or Qt Quick/QML SDK dialogs with forced X11 backend usage. A
+wrong password, cancelled dialog, or closed dialog denies the request.
+Concurrent GUI unlock requests are displayed as separate dialogs.
 
 Failure:
 - `403 access_denied`

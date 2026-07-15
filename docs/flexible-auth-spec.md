@@ -16,9 +16,8 @@ Content-Type: application/json
 
 `X-Client-Capabilities` is optional. CLI clients running with `DISPLAY` set send
 `x-session=<DISPLAY>`. If `DISPLAY` is unset and `WAYLAND_DISPLAY` is set, they
-send `wayland-session=<WAYLAND_DISPLAY>`. Linux GUI-capable agents currently
-advertise GUI unlock only for `x-session`; Wayland-only clients fall back to
-direct unlock.
+send `wayland-session=<WAYLAND_DISPLAY>`. Linux GUI-capable agents advertise
+GUI unlock for either accepted GUI session capability.
 
 macOS response:
 
@@ -46,7 +45,7 @@ Linux direct response:
 }
 ```
 
-Linux GUI-capable response with `x-session` capability:
+Linux GUI-capable response with `x-session` or `wayland-session` capability:
 
 ```json
 {
@@ -83,9 +82,9 @@ nearest caller after filtering out processes whose executable identity matches
 the running agent binary. The dialog shows the application name, executable path,
 and an icon when the platform backend can resolve one.
 
-Linux GUI unlock requires the same `x-session` capability on the GUI unlock
-request that was used for method discovery. Linux GTK and Qt variants force X11
-backend usage; Wayland-only clients use direct unlock.
+Linux GUI unlock requires the same accepted GUI session capability on the GUI
+unlock request that was used for method discovery. Linux GTK and Qt variants
+force X11 backend usage.
 
 The agent clears native password fields when supported by the backend and keeps
 Rust-owned password material in zeroizing buffers. Native UI toolkit internals

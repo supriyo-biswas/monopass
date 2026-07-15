@@ -29,9 +29,8 @@ method through the discovery flow in
 [`flexible-auth-spec.md`](flexible-auth-spec.md). When `DISPLAY` is set, send
 `X-Client-Capabilities: x-session=<DISPLAY>` on method discovery and GUI unlock
 requests. When `DISPLAY` is unset and `WAYLAND_DISPLAY` is set, send
-`X-Client-Capabilities: wayland-session=<WAYLAND_DISPLAY>`; Linux GUI-capable
-agents currently fall back to direct unlock for Wayland-only clients. Prompt for
-the master password
+`X-Client-Capabilities: wayland-session=<WAYLAND_DISPLAY>` on method discovery
+and GUI unlock requests. Prompt for the master password
 with hidden terminal input only when the selected method has
 `accepts_master_password: true`; standard-base64 encode the UTF-8 password
 bytes, call the selected unlock method with that bearer value, then zeroize the
