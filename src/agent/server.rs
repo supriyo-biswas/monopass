@@ -40,7 +40,10 @@ fn auth_routes() -> Router<AgentState> {
         .route("/api/v1/auth/lock", post(controller::lock))
         .route("/api/v1/auth/status", get(controller::status));
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     let routes = routes.route("/api/v1/auth/unlock/gui", post(controller::unlock_gui));
 
     #[cfg(not(target_os = "macos"))]

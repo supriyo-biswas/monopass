@@ -27,11 +27,13 @@ fails closed when required process identity cannot be resolved.
 ### Unlock
 
 Unlock uses the method discovery flow described in
-[`flexible-auth-spec.md`](flexible-auth-spec.md). The agent advertises one
-unlock method for the current platform.
+[`flexible-auth-spec.md`](flexible-auth-spec.md). The agent advertises the
+preferred unlock method for the current platform, build variant, and client
+capabilities.
 
 ```http
 GET /api/v1/auth/unlock/methods
+X-Client-Capabilities: x-session=<display>
 
 HTTP/1.1 200 OK
 Content-Type: application/json
@@ -50,7 +52,7 @@ macOS response:
 }
 ```
 
-Linux response:
+Linux direct response:
 
 ```json
 {
@@ -63,23 +65,40 @@ Linux response:
 }
 ```
 
-On macOS, the advertised method is:
+Linux GUI-capable response with `x-session` capability:
+
+```json
+{
+  "methods": [
+    {
+      "url": "/api/v1/auth/unlock/gui",
+      "accepts_master_password": false
+    }
+  ]
+}
+```
+
+On macOS and Linux GUI-capable builds, the GUI method is:
 
 ```http
 POST /api/v1/auth/unlock/gui
+X-Client-Capabilities: x-session=<display>
 
 HTTP/1.1 200 OK
 ```
 
 The agent displays a password dialog for the requesting application and accepts
-one submitted password for the request. A wrong password, cancelled dialog, or
-closed dialog denies the request. Concurrent GUI unlock requests are displayed
-as separate dialogs.
+one submitted password for the request. The dialog shows the application name,
+executable path, and an icon when available. Linux GUI unlock requires an
+`x-session` capability and uses in-process GTK4 or Qt Quick/QML SDK dialogs with
+forced X11 backend usage; Wayland-only clients fall back to direct unlock. A wrong password, cancelled dialog, or closed dialog
+denies the request. Concurrent GUI unlock requests are displayed as separate
+dialogs.
 
 Failure:
 - `403 access_denied`
 
-On Linux, the advertised method is:
+On Linux direct-only builds or clients without an accepted GUI capability, the advertised method is:
 
 ```http
 POST /api/v1/auth/unlock/direct

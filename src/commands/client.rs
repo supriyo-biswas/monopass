@@ -69,11 +69,23 @@ struct AuthUnlockMethod {
 #[derive(Debug, Clone)]
 pub struct Client<'a> {
     config: &'a Config,
+    capabilities: Option<String>,
 }
 
 impl<'a> Client<'a> {
     pub fn new(config: &'a Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            capabilities: detect_client_capabilities(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_capabilities(config: &'a Config, capabilities: Option<String>) -> Self {
+        Self {
+            config,
+            capabilities,
+        }
     }
 
     pub fn get_json<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
@@ -252,7 +264,14 @@ impl<'a> Client<'a> {
     }
 
     fn first_unlock_method(&self) -> AppResult<AuthUnlockMethod> {
-        let response = self.request("GET", "/api/v1/auth/unlock/methods", &[], None, None)?;
+        let response = self.request_with_client_capabilities(
+            "GET",
+            "/api/v1/auth/unlock/methods",
+            &[],
+            None,
+            None,
+            true,
+        )?;
         if !(200..300).contains(&response.status) {
             return Err(api_error(response).into());
         }
@@ -269,7 +288,15 @@ impl<'a> Client<'a> {
 
     fn unlock(&self, method: &AuthUnlockMethod, password: Option<&str>) -> AppResult<()> {
         let path = unlock_method_api_path(&method.url)?;
-        let response = self.request("POST", &path, &[], None, password)?;
+        let include_capabilities = path == "/api/v1/auth/unlock/gui";
+        let response = self.request_with_client_capabilities(
+            "POST",
+            &path,
+            &[],
+            None,
+            password,
+            include_capabilities,
+        )?;
         if response.status == 200 {
             return Ok(());
         }
@@ -284,6 +311,25 @@ impl<'a> Client<'a> {
         content_type: Option<&str>,
         bearer_password: Option<&str>,
     ) -> AppResult<Response> {
+        self.request_with_client_capabilities(
+            method,
+            path,
+            body,
+            content_type,
+            bearer_password,
+            false,
+        )
+    }
+
+    fn request_with_client_capabilities(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        bearer_password: Option<&str>,
+        include_client_capabilities: bool,
+    ) -> AppResult<Response> {
         let mut stream = UnixStream::connect(self.config.listen_path())?;
         let mut request = Zeroizing::new(format!(
             "{method} {path} HTTP/1.1\r\nHost: monopass\r\nConnection: close\r\nContent-Length: {}\r\n",
@@ -293,6 +339,13 @@ impl<'a> Client<'a> {
             request.push_str("Content-Type: ");
             request.push_str(content_type);
             request.push_str("\r\n");
+        }
+        if include_client_capabilities {
+            if let Some(capabilities) = self.capabilities.as_deref() {
+                request.push_str("X-Client-Capabilities: ");
+                request.push_str(capabilities);
+                request.push_str("\r\n");
+            }
         }
         if let Some(password) = bearer_password {
             let token = Zeroizing::new(general_purpose::STANDARD.encode(password.as_bytes()));
@@ -309,6 +362,24 @@ impl<'a> Client<'a> {
         stream.read_to_end(&mut raw)?;
         parse_response(raw)
     }
+}
+
+fn detect_client_capabilities() -> Option<String> {
+    client_capabilities_from_env(|name| std::env::var(name).ok())
+}
+
+fn client_capabilities_from_env<F>(mut get_env: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    get_env("DISPLAY")
+        .filter(|value| !value.is_empty())
+        .map(|display| format!("x-session={display}"))
+        .or_else(|| {
+            get_env("WAYLAND_DISPLAY")
+                .filter(|value| !value.is_empty())
+                .map(|display| format!("wayland-session={display}"))
+        })
 }
 
 pub fn prompt_master_password() -> io::Result<Zeroizing<String>> {
@@ -504,18 +575,39 @@ mod tests {
     }
 
     #[test]
+    fn client_capabilities_prefer_x_session_then_wayland() {
+        let x = super::client_capabilities_from_env(|name| match name {
+            "DISPLAY" => Some(":1".to_owned()),
+            "WAYLAND_DISPLAY" => Some("wayland-0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(Some("x-session=:1".to_owned()), x);
+
+        let wayland = super::client_capabilities_from_env(|name| match name {
+            "WAYLAND_DISPLAY" => Some("wayland-0".to_owned()),
+            _ => None,
+        });
+        assert_eq!(Some("wayland-session=wayland-0".to_owned()), wayland);
+
+        let none = super::client_capabilities_from_env(|_| None);
+        assert_eq!(None, none);
+    }
+
+    #[test]
     fn request_with_unlock_uses_discovered_method_without_original_bearer_for_process_auth() {
         let server = TestServer::new(vec![
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/dirs",
                 authorization: None,
+                client_capabilities: None,
                 response: access_denied_response(),
             },
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/auth/unlock/methods",
                 authorization: None,
+                client_capabilities: None,
                 response: ok_json_response(
                     r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
                 ),
@@ -524,12 +616,14 @@ mod tests {
                 method: "POST",
                 path: "/api/v1/auth/unlock/direct",
                 authorization: Some(bearer("correct")),
+                client_capabilities: None,
                 response: ok_empty_response(),
             },
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/dirs",
                 authorization: None,
+                client_capabilities: None,
                 response: ok_json_response("{}"),
             },
         ]);
@@ -548,12 +642,14 @@ mod tests {
                 method: "GET",
                 path: "/api/v1/ref/personal/github/password",
                 authorization: None,
+                client_capabilities: None,
                 response: access_denied_response(),
             },
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/auth/unlock/methods",
                 authorization: None,
+                client_capabilities: None,
                 response: ok_json_response(
                     r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
                 ),
@@ -562,18 +658,20 @@ mod tests {
                 method: "POST",
                 path: "/api/v1/auth/unlock/direct",
                 authorization: Some(bearer("correct")),
+                client_capabilities: None,
                 response: ok_empty_response(),
             },
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/ref/personal/github/password",
                 authorization: Some(bearer("correct")),
+                client_capabilities: None,
                 response: ok_json_response("{}"),
             },
         ]);
         let config = test_config(server.listen_path());
 
-        let response = Client::new(&config)
+        let response = Client::with_capabilities(&config, None)
             .request_with_unlock_prompt(
                 "GET",
                 "/api/v1/ref/personal/github/password",
@@ -595,12 +693,14 @@ mod tests {
                 method: "GET",
                 path: "/api/v1/dirs",
                 authorization: None,
+                client_capabilities: None,
                 response: access_denied_response(),
             },
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/auth/unlock/methods",
                 authorization: None,
+                client_capabilities: Some("x-session=:1".to_owned()),
                 response: ok_json_response(
                     r#"{"methods":[{"url":"/api/v1/auth/unlock/gui","accepts_master_password":false}]}"#,
                 ),
@@ -609,18 +709,20 @@ mod tests {
                 method: "POST",
                 path: "/api/v1/auth/unlock/gui",
                 authorization: None,
+                client_capabilities: Some("x-session=:1".to_owned()),
                 response: ok_empty_response(),
             },
             ExpectedRequest {
                 method: "GET",
                 path: "/api/v1/dirs",
                 authorization: None,
+                client_capabilities: None,
                 response: ok_json_response("{}"),
             },
         ]);
         let config = test_config(server.listen_path());
 
-        let response = Client::new(&config)
+        let response = Client::with_capabilities(&config, Some("x-session=:1".to_owned()))
             .request_with_unlock_prompt(
                 "GET",
                 "/api/v1/dirs",
@@ -636,7 +738,7 @@ mod tests {
     }
 
     fn request_with_test_prompt(config: &Config, auth_mode: AuthMode) -> Response {
-        Client::new(config)
+        Client::with_capabilities(config, None)
             .request_with_unlock_prompt(
                 "GET",
                 "/api/v1/dirs",
@@ -666,6 +768,7 @@ mod tests {
         method: &'static str,
         path: &'static str,
         authorization: Option<String>,
+        client_capabilities: Option<String>,
         response: String,
     }
 
@@ -687,6 +790,7 @@ mod tests {
                     assert_eq!(expected.method, request.method);
                     assert_eq!(expected.path, request.path);
                     assert_eq!(expected.authorization, request.authorization);
+                    assert_eq!(expected.client_capabilities, request.client_capabilities);
                     stream.write_all(expected.response.as_bytes()).unwrap();
                 }
             });
@@ -711,6 +815,7 @@ mod tests {
         method: String,
         path: String,
         authorization: Option<String>,
+        client_capabilities: Option<String>,
     }
 
     fn read_request(stream: &mut std::os::unix::net::UnixStream) -> RecordedRequest {
@@ -730,15 +835,22 @@ mod tests {
         let mut request_line = lines.next().unwrap().split_whitespace();
         let method = request_line.next().unwrap().to_owned();
         let path = request_line.next().unwrap().to_owned();
-        let authorization = lines.find_map(|line| {
-            line.strip_prefix("Authorization: ")
-                .map(|value| value.to_owned())
-        });
+        let mut authorization = None;
+        let mut client_capabilities = None;
+        for line in lines {
+            if let Some(value) = line.strip_prefix("Authorization: ") {
+                authorization = Some(value.to_owned());
+            }
+            if let Some(value) = line.strip_prefix("X-Client-Capabilities: ") {
+                client_capabilities = Some(value.to_owned());
+            }
+        }
 
         RecordedRequest {
             method,
             path,
             authorization,
+            client_capabilities,
         }
     }
 

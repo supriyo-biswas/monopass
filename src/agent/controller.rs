@@ -27,7 +27,12 @@ use super::models::{
     JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse, UpdateContactRequest,
     UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
-use super::process::{ProcessDisplay, ScopeHash};
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
+use super::process::ProcessDisplay;
+use super::process::ScopeHash;
 use super::state::{
     AgentState, CopySource, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
     ItemSource, PageRequest, ReferenceBody, validate_file_upload_size,
@@ -37,18 +42,61 @@ const DEFAULT_PAGE_COUNT: u64 = 50;
 const MAX_PAGE_COUNT: u64 = 200;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
-pub async fn unlock_methods() -> Json<AuthUnlockMethodsResponse> {
+#[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+const CLIENT_CAPABILITIES_HEADER: &str = "x-client-capabilities";
+
+pub async fn unlock_methods(headers: HeaderMap) -> Json<AuthUnlockMethodsResponse> {
     Json(AuthUnlockMethodsResponse {
-        methods: vec![AuthUnlockMethod {
-            #[cfg(target_os = "macos")]
+        methods: unlock_methods_for_headers(&headers),
+    })
+}
+
+fn unlock_methods_for_headers(headers: &HeaderMap) -> Vec<AuthUnlockMethod> {
+    if should_advertise_gui_unlock(headers) {
+        return vec![AuthUnlockMethod {
             url: "/api/v1/auth/unlock/gui".to_owned(),
-            #[cfg(not(target_os = "macos"))]
-            url: "/api/v1/auth/unlock/direct".to_owned(),
-            #[cfg(target_os = "macos")]
             accepts_master_password: false,
-            #[cfg(not(target_os = "macos"))]
-            accepts_master_password: true,
-        }],
+        }];
+    }
+
+    vec![AuthUnlockMethod {
+        url: "/api/v1/auth/unlock/direct".to_owned(),
+        accepts_master_password: true,
+    }]
+}
+
+#[cfg(target_os = "macos")]
+fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
+    true
+}
+
+#[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+fn should_advertise_gui_unlock(headers: &HeaderMap) -> bool {
+    headers
+        .get(CLIENT_CAPABILITIES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(client_capabilities_include_gui_session)
+}
+
+#[cfg(all(target_os = "linux", not(any(feature = "gtk", feature = "qt"))))]
+fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+fn client_capabilities_include_gui_session(value: &str) -> bool {
+    value.split(',').any(|capability| {
+        let capability = capability.trim();
+        ["x-session=", "wayland-session="].iter().any(|prefix| {
+            capability
+                .strip_prefix(prefix)
+                .is_some_and(|session| !session.trim().is_empty())
+        })
     })
 }
 
@@ -71,26 +119,35 @@ pub async fn unlock_direct(
         })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
 pub async fn unlock_gui(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
     display: Option<Extension<ProcessDisplay>>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     unlock_gui_with_prompt(
         State(state),
         scope_hash,
         display,
+        headers,
         super::gui_auth::prompt_password,
     )
     .await
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
 async fn unlock_gui_with_prompt<F, Fut>(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
     display: Option<Extension<ProcessDisplay>>,
+    headers: HeaderMap,
     prompt: F,
 ) -> Result<StatusCode, ApiError>
 where
@@ -98,6 +155,9 @@ where
     Fut: std::future::Future<Output = Option<Zeroizing<String>>>,
 {
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
+    if !gui_unlock_request_allowed(&headers) {
+        return Err(ApiError::access_denied());
+    }
     let display = display.map(|Extension(display)| display);
 
     let Some(password) = prompt(display).await else {
@@ -111,6 +171,15 @@ where
         .map_err(|_| ApiError::access_denied())
 }
 
+#[cfg(target_os = "macos")]
+fn gui_unlock_request_allowed(_headers: &HeaderMap) -> bool {
+    true
+}
+
+#[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+fn gui_unlock_request_allowed(headers: &HeaderMap) -> bool {
+    should_advertise_gui_unlock(headers)
+}
 pub async fn lock(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
@@ -898,7 +967,10 @@ impl From<DbError> for ApiError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -915,13 +987,18 @@ mod tests {
         unlock_methods,
     };
     use crate::agent::models::{CreateContactRequest, CreateItemRequest};
-    use crate::agent::process::{ProcessDisplay, ScopeHash};
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    use crate::agent::process::ProcessDisplay;
+    use crate::agent::process::ScopeHash;
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
 
     #[tokio::test]
     #[cfg(not(target_os = "macos"))]
     async fn unlock_methods_returns_direct_method() {
-        let response = unlock_methods().await;
+        let response = unlock_methods(HeaderMap::new()).await;
 
         assert_eq!(
             serde_json::json!({
@@ -937,9 +1014,65 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    async fn unlock_methods_returns_gui_method_for_x_session_capability() {
+        let response = unlock_methods(x_session_headers()).await;
+
+        assert_eq!(
+            serde_json::json!({
+                "methods": [
+                    {
+                        "url": "/api/v1/auth/unlock/gui",
+                        "accepts_master_password": false
+                    }
+                ]
+            }),
+            serde_json::to_value(response.0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    async fn unlock_methods_returns_gui_method_for_wayland_session_capability() {
+        let response = unlock_methods(wayland_session_headers()).await;
+
+        assert_eq!(
+            serde_json::json!({
+                "methods": [
+                    {
+                        "url": "/api/v1/auth/unlock/gui",
+                        "accepts_master_password": false
+                    }
+                ]
+            }),
+            serde_json::to_value(response.0).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    fn linux_gui_capabilities_accept_x_and_wayland_sessions() {
+        assert!(super::client_capabilities_include_gui_session(
+            "x-session=:1"
+        ));
+        assert!(super::client_capabilities_include_gui_session(
+            "wayland-session=wayland-0"
+        ));
+        assert!(super::client_capabilities_include_gui_session(
+            "unknown=value, wayland-session=wayland-0"
+        ));
+        assert!(!super::client_capabilities_include_gui_session(
+            "wayland-session="
+        ));
+        assert!(!super::client_capabilities_include_gui_session(
+            "unknown=value"
+        ));
+    }
+
+    #[tokio::test]
     #[cfg(target_os = "macos")]
     async fn unlock_methods_returns_gui_method() {
-        let response = unlock_methods().await;
+        let response = unlock_methods(HeaderMap::new()).await;
 
         assert_eq!(
             serde_json::json!({
@@ -1040,7 +1173,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     async fn unlock_gui_submits_prompt_password_once() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
@@ -1062,6 +1198,7 @@ mod tests {
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
             None,
+            gui_unlock_headers(),
             prompt,
         )
         .await
@@ -1073,7 +1210,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     async fn unlock_gui_wrong_password_returns_access_denied_without_retry() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
@@ -1095,6 +1235,7 @@ mod tests {
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             None,
+            gui_unlock_headers(),
             prompt,
         )
         .await
@@ -1105,19 +1246,53 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     async fn unlock_gui_cancel_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = super::unlock_gui_with_prompt(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             None,
+            gui_unlock_headers(),
             |_display| async { None },
         )
         .await
         .unwrap_err();
 
         assert_eq!(StatusCode::FORBIDDEN, error.status);
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    async fn unlock_gui_without_x_session_capability_returns_access_denied_without_prompting() {
+        let state = AgentState::from_database_path("missing.db");
+        let prompts = Arc::new(Mutex::new(0usize));
+        let prompt = {
+            let prompts = Arc::clone(&prompts);
+            move |_display: Option<ProcessDisplay>| {
+                let prompts = Arc::clone(&prompts);
+                async move {
+                    *prompts.lock().unwrap() += 1;
+                    Some(Zeroizing::new("correct".to_owned()))
+                }
+            }
+        };
+
+        let error = super::unlock_gui_with_prompt(
+            axum::extract::State(state),
+            Some(axum::Extension(ScopeHash::test(1))),
+            None,
+            HeaderMap::new(),
+            prompt,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(StatusCode::FORBIDDEN, error.status);
+        assert_eq!(0, *prompts.lock().unwrap());
     }
 
     #[tokio::test]
@@ -1455,7 +1630,36 @@ mod tests {
         assert_eq!(StatusCode::FORBIDDEN, error.status);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "macos")]
+    fn gui_unlock_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    fn gui_unlock_headers() -> HeaderMap {
+        x_session_headers()
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    fn x_session_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            super::CLIENT_CAPABILITIES_HEADER,
+            HeaderValue::from_static("x-session=:1"),
+        );
+        headers
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    fn wayland_session_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            super::CLIENT_CAPABILITIES_HEADER,
+            HeaderValue::from_static("wayland-session=wayland-0"),
+        );
+        headers
+    }
+
     fn authorization_headers(password: &str) -> HeaderMap {
         let token = general_purpose::STANDARD.encode(password);
         let mut headers = HeaderMap::new();
