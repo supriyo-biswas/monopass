@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "monopass"
-version = "0.0.1-alpha10"
+version = "0.0.1-alpha11"
 dependencies = [
  "age",
  "axum",
