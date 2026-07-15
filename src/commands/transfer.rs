@@ -26,11 +26,16 @@ pub struct Args {
     globoff: bool,
     #[arg(
         required = true,
-        num_args = 2..,
-        value_name = "PATHS",
-        help = "One or more source paths followed by the destination path"
+        num_args = 1..,
+        value_name = "SOURCE",
+        help = "Source item, glob, or directory path"
     )]
-    paths: Vec<String>,
+    sources: Vec<String>,
+    #[arg(
+        value_name = "DESTINATION",
+        help = "Destination item or directory path"
+    )]
+    destination: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +60,18 @@ pub fn move_(config: &Config, args: Args) -> AppResult {
 
 fn run(config: &Config, args: Args, operation: Operation) -> AppResult {
     let client = Client::new(config);
-    let transfers = plan_transfers(args.paths, args.recursive, args.globoff, |dir, glob| {
-        Ok(super::dir::list_all_matching_items(&client, dir, glob)?
-            .into_iter()
-            .map(|item| item.name)
-            .collect())
-    })?;
+    let transfers = plan_transfers(
+        args.sources,
+        args.destination,
+        args.recursive,
+        args.globoff,
+        |dir, glob| {
+            Ok(super::dir::list_all_matching_items(&client, dir, glob)?
+                .into_iter()
+                .map(|item| item.name)
+                .collect())
+        },
+    )?;
 
     for transfer in transfers {
         execute_transfer(&client, operation, &transfer)?;
@@ -93,7 +104,8 @@ fn execute_transfer(client: &Client<'_>, operation: Operation, transfer: &Transf
 }
 
 fn plan_transfers<F>(
-    paths: Vec<String>,
+    sources: Vec<String>,
+    destination: String,
     recursive: bool,
     globoff: bool,
     mut list_items: F,
@@ -101,22 +113,11 @@ fn plan_transfers<F>(
 where
     F: FnMut(&str, Option<&str>) -> AppResult<Vec<String>>,
 {
-    if paths.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected at least one source and one destination",
-        )
-        .into());
-    }
-
-    let (dest, sources) = paths
-        .split_last()
-        .expect("paths length checked before splitting");
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
     let mut expanded_directory = false;
 
-    for source in sources {
+    for source in &sources {
         match parse_dir_or_item_path(source)? {
             Ok(dir) => {
                 if !recursive {
@@ -152,7 +153,7 @@ where
 
     let dest_is_dir = expanded.len() > 1 || expanded_directory;
     if dest_is_dir {
-        let dest_dir = parse_dir_path(dest)?;
+        let dest_dir = parse_dir_path(&destination)?;
         return Ok(expanded
             .into_iter()
             .map(|source| Transfer {
@@ -169,7 +170,7 @@ where
         .into_iter()
         .next()
         .expect("at least one source exists after path validation");
-    let dest = match parse_dir_or_item_path(dest)? {
+    let dest = match parse_dir_or_item_path(&destination)? {
         Ok(dir) => ItemPath {
             dir,
             item: source.item.clone(),
@@ -221,17 +222,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fewer_than_two_paths() {
-        let error = plan_transfers(vec!["Personal/github".to_owned()], false, true, no_lists)
-            .expect_err("single path should fail");
-
-        assert!(error.to_string().contains("at least one source"));
-    }
-
-    #[test]
     fn single_source_to_item_destination_renames() {
         let plan = plan_transfers(
-            vec!["Work/Github".to_owned(), "Personal/GitHub".to_owned()],
+            vec!["Work/Github".to_owned()],
+            "Personal/GitHub".to_owned(),
             false,
             true,
             no_lists,
@@ -256,7 +250,8 @@ mod tests {
     #[test]
     fn single_source_to_directory_destination_preserves_name() {
         let plan = plan_transfers(
-            vec!["Work/Github".to_owned(), "Personal".to_owned()],
+            vec!["Work/Github".to_owned()],
+            "Personal".to_owned(),
             false,
             true,
             no_lists,
@@ -275,11 +270,8 @@ mod tests {
     #[test]
     fn multiple_sources_require_directory_destination() {
         let error = plan_transfers(
-            vec![
-                "Work/Github".to_owned(),
-                "Fun/Steam".to_owned(),
-                "Personal/Github".to_owned(),
-            ],
+            vec!["Work/Github".to_owned(), "Fun/Steam".to_owned()],
+            "Personal/Github".to_owned(),
             false,
             true,
             no_lists,
@@ -296,11 +288,8 @@ mod tests {
     #[test]
     fn multiple_sources_preserve_names_in_destination_directory() {
         let plan = plan_transfers(
-            vec![
-                "Work/Github".to_owned(),
-                "Fun/Steam".to_owned(),
-                "Personal".to_owned(),
-            ],
+            vec!["Work/Github".to_owned(), "Fun/Steam".to_owned()],
+            "Personal".to_owned(),
             false,
             true,
             no_lists,
@@ -337,7 +326,8 @@ mod tests {
     #[test]
     fn directory_source_without_recursive_fails() {
         let error = plan_transfers(
-            vec!["Work".to_owned(), "Personal".to_owned()],
+            vec!["Work".to_owned()],
+            "Personal".to_owned(),
             false,
             true,
             no_lists,
@@ -350,7 +340,8 @@ mod tests {
     #[test]
     fn recursive_directory_source_expands_listed_items_and_preserves_names() {
         let plan = plan_transfers(
-            vec!["Work".to_owned(), "Personal".to_owned()],
+            vec!["Work".to_owned()],
+            "Personal".to_owned(),
             true,
             false,
             |dir, glob| {
@@ -391,7 +382,8 @@ mod tests {
     #[test]
     fn single_glob_match_can_use_item_destination() {
         let plan = plan_transfers(
-            vec!["Work/Git*".to_owned(), "Personal/Renamed".to_owned()],
+            vec!["Work/Git*".to_owned()],
+            "Personal/Renamed".to_owned(),
             false,
             false,
             |dir, glob| {
@@ -408,7 +400,8 @@ mod tests {
     #[test]
     fn multiple_glob_matches_require_directory_destination() {
         let error = plan_transfers(
-            vec!["Work/Git*".to_owned(), "Personal/Renamed".to_owned()],
+            vec!["Work/Git*".to_owned()],
+            "Personal/Renamed".to_owned(),
             false,
             false,
             |_, _| Ok(vec!["Github".to_owned(), "Gitlab".to_owned()]),
@@ -424,15 +417,14 @@ mod tests {
 
     #[test]
     fn glob_and_recursive_sources_must_match_before_planning() {
-        for (paths, recursive) in [
-            (
-                vec!["Work/Missing*".to_owned(), "Personal".to_owned()],
-                false,
-            ),
-            (vec!["Work".to_owned(), "Personal".to_owned()], true),
+        for (sources, recursive) in [
+            (vec!["Work/Missing*".to_owned()], false),
+            (vec!["Work".to_owned()], true),
         ] {
-            let error = plan_transfers(paths, recursive, false, |_, _| Ok(Vec::new()))
-                .expect_err("empty source should fail");
+            let error = plan_transfers(sources, "Personal".to_owned(), recursive, false, |_, _| {
+                Ok(Vec::new())
+            })
+            .expect_err("empty source should fail");
             assert!(error.to_string().contains("matched no items"));
         }
     }
@@ -440,11 +432,8 @@ mod tests {
     #[test]
     fn overlapping_patterns_are_deduplicated_in_first_match_order() {
         let plan = plan_transfers(
-            vec![
-                "Work/Git*".to_owned(),
-                "Work/*hub".to_owned(),
-                "Personal".to_owned(),
-            ],
+            vec!["Work/Git*".to_owned(), "Work/*hub".to_owned()],
+            "Personal".to_owned(),
             false,
             false,
             |_, glob| match glob {
@@ -466,7 +455,8 @@ mod tests {
     #[test]
     fn globoff_keeps_metacharacters_literal_and_destination_is_never_listed() {
         let plan = plan_transfers(
-            vec!["Work/literal*[x]".to_owned(), "Personal/dest*".to_owned()],
+            vec!["Work/literal*[x]".to_owned()],
+            "Personal/dest*".to_owned(),
             false,
             true,
             no_lists,
@@ -481,7 +471,8 @@ mod tests {
     fn destination_is_literal_when_source_globbing_is_enabled() {
         let mut calls = Vec::new();
         let plan = plan_transfers(
-            vec!["Work/Git*".to_owned(), "Personal/dest*".to_owned()],
+            vec!["Work/Git*".to_owned()],
+            "Personal/dest*".to_owned(),
             false,
             false,
             |dir, glob| {

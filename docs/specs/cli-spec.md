@@ -497,12 +497,12 @@ and system-locked for writes.
 ## share command
 
 ```
-monopass share <dir>/<item> <email>
-    --out-file
+monopass share [-g|--globoff] [-r|--recursive] <item>... <contact>
+    [--out-file <file> | --out-dir <dir>]
 ```
 
-Export an item as an age-encrypted ZIP for the contact by fetching the
-contact, item, and file contents:
+Export each item as an age-encrypted ZIP for the contact by fetching the
+contact, item, and file contents. For each item:
 
 1. Request an agent export job for the requested contact email.
 2. Fetch raw item metadata with
@@ -516,17 +516,39 @@ contact, item, and file contents:
    SHA-256 from the `ETag`.
 5. Encrypt the ZIP to the contact's age public key.
 
+Every item source component is a case-sensitive glob pattern by default and is
+expanded through ListItems before any export job starts. `-g`/`--globoff`
+treats item source components as exact names, including literal `*`, `?`, and
+bracket expressions. With `--recursive`, a source may also be a directory path;
+directory sources expand to their non-hidden items. Directory sources without
+`--recursive` are rejected. Any glob or recursive directory source matching no
+items fails before export work starts. Overlapping sources are deduplicated
+while preserving first-match order.
+
 Options:
 
-- `-o/--out-file`: Write the encrypted export to the given file, or `-` for
-  stdout.
+- `-r/--recursive`: Expand directory sources and share their items.
+- `-g/--globoff`: Treat item source names literally instead of as glob
+  patterns.
+- `-o/--out-file`: Write a single encrypted export to the given file, or `-`
+  for stdout. This option requires the fully expanded, deduplicated sources to
+  contain exactly one item.
+- `--out-dir`: Write exports into the given directory.
 
-When `--out-file` is omitted, write to
+When `--out-file` is omitted, write each export to
 `<contact>_<item>_<date-hms>.export`, where `<contact>` is the contact email,
 `<item>` is the item name from `<dir>/<item>`, and `<date-hms>` is the local
 timestamp used by the CLI at export time. For example, exporting
 `Personal/github` to contact `alice@example.com` writes a file like
 `alice@example.com_github_20260612-142533.export`.
+
+Quote patterns to prevent shell expansion:
+
+```sh
+monopass share 'Work/Git*' alice@example.com
+monopass share --globoff 'Work/literal*[name]' alice@example.com
+monopass share --recursive Work alice@example.com --out-dir ./exports
+```
 
 ## import command
 
