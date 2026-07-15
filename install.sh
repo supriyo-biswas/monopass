@@ -6,6 +6,7 @@ REPO="supriyo-biswas/monopass"
 DEFAULT_RELEASE_BASE_URL="https://github.com/${REPO}/releases/latest/download"
 RELEASE_BASE_URL="${RELEASE_BASE_URL:-$DEFAULT_RELEASE_BASE_URL}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+MONOPASS_VARIANT="${MONOPASS_VARIANT:-auto}"
 BINARY_NAME="monopass"
 PROFILE_LINE='export PATH="$HOME/.local/bin:$PATH"'
 
@@ -15,9 +16,34 @@ die() {
 }
 
 need_cmd() {
-  for cmd in "$@"; do
-    command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
+  for requirement in "$@"; do
+    found=0
+    old_ifs=$IFS
+    IFS=/
+
+    for cmd in $requirement; do
+      if command -v "$cmd" >/dev/null 2>&1; then
+        found=1
+        break
+      fi
+    done
+
+    IFS=$old_ifs
+    [ "$found" -eq 1 ] || die "required command not found: $requirement"
   done
+}
+
+download() {
+  url=$1
+  output=$2
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --progress-bar "$url" -o "$output"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$output" "$url"
+  else
+    die "required command not found: curl or wget"
+  fi
 }
 
 append_path_line() {
@@ -36,27 +62,61 @@ append_path_line() {
   fi
 }
 
-need_cmd uname
+need_cmd curl/wget uname tar mktemp chmod mv mkdir grep dirname rm id
 
 platform="$(uname -sm | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+selected_variant=cli
 
 case "$platform" in
   linux-x86_64|linux-amd64)
-    artifact_name="monopass-linux-x86_64.tar.gz"
+    platform=linux-x86_64
     ;;
   linux-aarch64|linux-arm64)
-    artifact_name="monopass-linux-aarch64.tar.gz"
+    platform=linux-aarch64
     ;;
   darwin-arm64)
-    artifact_name="monopass-darwin-arm64.tar.gz"
     ;;
   *)
     die "unsupported platform: $platform"
     ;;
 esac
 
-need_cmd curl tar mktemp chmod mv mkdir grep dirname
-need_cmd id
+case "$platform" in
+  linux-*)
+    case "$MONOPASS_VARIANT" in
+      auto|gtk|qt|cli)
+        selected_variant=$MONOPASS_VARIANT
+        ;;
+      *)
+        die "invalid MONOPASS_VARIANT: $MONOPASS_VARIANT (expected auto, gtk, qt, or cli)"
+        ;;
+    esac
+
+    if [ "$selected_variant" = auto ]; then
+      desktop="$(printf '%s' "${XDG_CURRENT_DESKTOP:-}" | tr '[:upper:]' '[:lower:]')"
+      case "$desktop" in
+        *kde*|*plasma*|*lxqt*)
+          selected_variant=qt
+          ;;
+        ?*)
+          selected_variant=gtk
+          ;;
+        *)
+          selected_variant=cli
+          ;;
+      esac
+    fi
+    ;;
+esac
+
+case "$selected_variant" in
+  cli)
+    artifact_name="monopass-$platform.tar.gz"
+    ;;
+  *)
+    artifact_name="monopass-$platform-$selected_variant.tar.gz"
+    ;;
+esac
 
 path_was_missing=0
 case ":${PATH:-}:" in
@@ -76,8 +136,9 @@ trap cleanup EXIT HUP INT TERM
 archive_path="$tmp_dir/$artifact_name"
 download_url="$RELEASE_BASE_URL/$artifact_name"
 
+printf 'Selected %s variant for %s.\n' "$selected_variant" "$platform" >&2
 printf 'Downloading %s\n' "$download_url" >&2
-curl -fsSL "$download_url" -o "$archive_path" || die "failed to download $artifact_name"
+download "$download_url" "$archive_path" || die "failed to download $artifact_name"
 
 tar -xzf "$archive_path" -C "$tmp_dir" || die "failed to unpack $artifact_name"
 
@@ -90,31 +151,20 @@ mkdir -p "$INSTALL_DIR"
 chmod 755 "$tmp_dir/$BINARY_NAME"
 mv -f "$tmp_dir/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
-case ":${PATH:-}:" in
-  *:"$HOME/.local/bin":*)
-    ;;
-  *)
-    if [ -n "${PATH:-}" ]; then
-      PATH="$HOME/.local/bin:$PATH"
-    else
-      PATH="$HOME/.local/bin"
-    fi
-    export PATH
-    ;;
-esac
-
-append_path_line "$HOME/.profile"
+profiles=.profile
 
 case "${SHELL:-}" in
   */bash)
-    append_path_line "$HOME/.bashrc"
-    append_path_line "$HOME/.bash_profile"
+    profiles="$profiles .bashrc .bash_profile"
     ;;
   */zsh)
-    append_path_line "$HOME/.zshrc"
-    append_path_line "$HOME/.zprofile"
+    profiles="$profiles .zshrc .zprofile"
     ;;
 esac
+
+for profile in $profiles; do
+  append_path_line "$HOME/$profile"
+done
 
 restart_existing_agent() {
   case "$platform" in
