@@ -1053,6 +1053,7 @@ mod appkit_prompt {
         MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
         NSString, ns_string,
     };
+    use objc2_uniform_type_identifiers::UTTypeUnixExecutable;
     use tokio::sync::oneshot;
     use zeroize::Zeroizing;
 
@@ -1342,10 +1343,21 @@ mod appkit_prompt {
     }
 
     fn load_icon(metadata: &PromptMetadata) -> Option<Retained<NSImage>> {
-        let path = metadata.preferred_icon_path.as_deref()?;
-        let icon_path = path_to_string(path)?;
-        let icon_path = NSString::from_str(&icon_path);
-        Some(NSWorkspace::sharedWorkspace().iconForFile(&icon_path))
+        let workspace = NSWorkspace::sharedWorkspace();
+
+        if let Some(icon_path) = metadata
+            .preferred_icon_path
+            .as_deref()
+            .and_then(path_to_string)
+        {
+            return Some(workspace.iconForFile(&NSString::from_str(&icon_path)));
+        }
+
+        metadata.executable_path.as_ref()?;
+
+        // SAFETY: UTTypeUnixExecutable is a system-provided, immutable UTI constant.
+        let executable_type = unsafe { UTTypeUnixExecutable };
+        Some(workspace.iconForContentType(executable_type))
     }
 }
 
