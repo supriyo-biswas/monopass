@@ -1562,7 +1562,7 @@ fn modified_text(modified: Option<std::time::SystemTime>) -> Option<String> {
 
 fn prompt_text(access_scope: AccessScope) -> String {
     format!(
-        "Enter your password to allow Monopass {} access to this app:",
+        "Enter your password to allow {} access to this app:",
         access_scope.as_str()
     )
 }
@@ -1594,7 +1594,7 @@ mod tests {
         );
 
         assert_eq!(
-            "Enter your password to allow Monopass items access to this app:",
+            "Enter your password to allow item access to this app:",
             metadata.intro
         );
         assert_eq!("Google Chrome", metadata.app_name);
@@ -1658,7 +1658,7 @@ mod tests {
     #[test]
     fn prompt_text_without_process_display_is_generic() {
         assert_eq!(
-            "Enter your password to allow Monopass items access to this app:",
+            "Enter your password to allow item access to this app:",
             super::prompt_text(AccessScope::Items)
         );
     }

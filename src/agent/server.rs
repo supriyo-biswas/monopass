@@ -47,9 +47,13 @@ fn auth_routes() -> Router<AgentState> {
     let routes = routes.route("/api/v1/auth/unlock/gui", post(controller::unlock_gui));
 
     #[cfg(not(target_os = "macos"))]
-    let routes = routes.route(
-        "/api/v1/auth/unlock/direct",
-        post(controller::unlock_direct),
+    let routes = routes.merge(
+        Router::new()
+            .route(
+                "/api/v1/auth/unlock/direct",
+                post(controller::unlock_direct),
+            )
+            .route_layer(middleware::from_fn(auth::require_direct_unlock_caller)),
     );
 
     routes
@@ -136,7 +140,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::agent::models::AccessScope;
-    use crate::agent::process::ScopeHash;
+    use crate::agent::process::{ScopeHash, UltimateProcess};
     use crate::agent::state::{AgentState, DbHandle, ITEM_READ_MUSTAUTH, MAX_FILE_UPLOAD_BYTES};
 
     #[tokio::test]
@@ -2570,6 +2574,7 @@ mod tests {
             json!(r#"{"path":"program"}"#),
             json!("\"program\""),
             json!(r#"["program",1]"#),
+            json!(r#"["[unterminated"]"#),
             json!([]),
         ] {
             let response = router
@@ -2767,6 +2772,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(scope_hash);
+        request
+            .extensions_mut()
+            .insert(UltimateProcess::test_agent());
         request
     }
 

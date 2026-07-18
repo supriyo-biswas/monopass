@@ -13,7 +13,7 @@ use tokio::net::UnixListener;
 
 use super::error::ApiError;
 use super::models::AccessScope;
-use super::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash};
+use super::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash, UltimateProcess};
 use super::state::{ActiveDatabaseRequest, AgentState};
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,10 @@ impl PeerConnectInfo {
 
     fn display(&self) -> Option<&ProcessDisplay> {
         self.scope.as_ref().and_then(|scope| scope.display.as_ref())
+    }
+
+    fn ultimate(&self) -> Option<&UltimateProcess> {
+        self.scope.as_ref().map(|scope| &scope.ultimate)
     }
 }
 
@@ -70,10 +74,27 @@ pub async fn require_same_uid_and_gid(
         if let Some(display) = connect_info.display() {
             request.extensions_mut().insert(display.clone());
         }
+        if let Some(ultimate) = connect_info.ultimate() {
+            request.extensions_mut().insert(ultimate.clone());
+        }
         Ok(next.run(request).await)
     } else {
         Err(ApiError::access_denied())
     }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+pub async fn require_direct_unlock_caller(
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let caller = request
+        .extensions()
+        .get::<UltimateProcess>()
+        .and_then(super::process::direct_unlock_caller)
+        .ok_or_else(ApiError::access_denied)?;
+    request.extensions_mut().insert(caller);
+    Ok(next.run(request).await)
 }
 
 pub async fn require_unlocked_database(
@@ -184,7 +205,9 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
-    use crate::agent::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash};
+    use crate::agent::process::{
+        DirectUnlockCaller, ProcessDisplay, ResolvedAuthorizationScope, ScopeHash, UltimateProcess,
+    };
 
     use super::{PeerConnectInfo, PeerCredentials, current_process_gid, current_process_uid};
 
@@ -305,6 +328,7 @@ mod tests {
                 scope: Some(ResolvedAuthorizationScope {
                     hash: ScopeHash::test(1),
                     display: None,
+                    ultimate: UltimateProcess::test("example"),
                 }),
             }))
             .await
@@ -326,12 +350,42 @@ mod tests {
                 scope: Some(ResolvedAuthorizationScope {
                     hash: ScopeHash::test(1),
                     display: Some(display),
+                    ultimate: UltimateProcess::test("example"),
                 }),
             }))
             .await
             .unwrap();
 
         assert_eq!(StatusCode::OK, response.status());
+    }
+
+    #[tokio::test]
+    async fn direct_unlock_middleware_derives_agent_policy_from_verified_ultimate_process() {
+        let response = direct_router()
+            .oneshot(request_with_connect_info(PeerConnectInfo {
+                scope: Some(ResolvedAuthorizationScope {
+                    hash: ScopeHash::test(1),
+                    display: None,
+                    ultimate: UltimateProcess::test_agent(),
+                }),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::OK, response.status());
+    }
+
+    #[tokio::test]
+    async fn direct_unlock_middleware_rejects_missing_ultimate_process() {
+        let request = Request::get("/").body(Body::empty()).unwrap();
+        let response = Router::new()
+            .route("/", get(direct_caller_required_handler))
+            .route_layer(middleware::from_fn(super::require_direct_unlock_caller))
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
     }
 
     fn router() -> Router {
@@ -343,6 +397,13 @@ mod tests {
     fn display_router() -> Router {
         Router::new()
             .route("/", get(display_required_handler))
+            .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
+    }
+
+    fn direct_router() -> Router {
+        Router::new()
+            .route("/", get(direct_caller_required_handler))
+            .route_layer(middleware::from_fn(super::require_direct_unlock_caller))
             .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
     }
 
@@ -358,6 +419,15 @@ mod tests {
     ) -> StatusCode {
         match display {
             Some(axum::Extension(display)) if display.name == "Example" => StatusCode::OK,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    async fn direct_caller_required_handler(
+        caller: Option<axum::Extension<DirectUnlockCaller>>,
+    ) -> StatusCode {
+        match caller {
+            Some(axum::Extension(DirectUnlockCaller::Agent)) => StatusCode::OK,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

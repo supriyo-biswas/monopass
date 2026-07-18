@@ -74,17 +74,26 @@ pub fn list(config: &Config, args: ListArgs) -> AppResult {
 fn parse_list_target(path: Option<&str>, globoff: bool) -> std::io::Result<ListTarget> {
     match path {
         None => Ok(ListTarget::Dirs),
-        Some(path) => match parse_dir_or_item_path(path)? {
-            Ok(dir) => Ok(ListTarget::Items { dir, glob: None }),
-            Err(path) => Ok(ListTarget::Items {
-                dir: path.dir,
-                glob: Some(if globoff {
-                    escape_sqlite_glob(&path.item)
-                } else {
-                    path.item
+        Some(path) => {
+            let (path, has_trailing_slash) = path
+                .strip_suffix('/')
+                .map_or((path, false), |path| (path, true));
+            match parse_dir_or_item_path(path)? {
+                Ok(dir) => Ok(ListTarget::Items { dir, glob: None }),
+                Err(_) if has_trailing_slash => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a trailing slash is only valid after a directory name",
+                )),
+                Err(path) => Ok(ListTarget::Items {
+                    dir: path.dir,
+                    glob: Some(if globoff {
+                        escape_sqlite_glob(&path.item)
+                    } else {
+                        path.item
+                    }),
                 }),
-            }),
-        },
+            }
+        }
     }
 }
 
@@ -184,10 +193,26 @@ mod tests {
         assert_eq!(
             ListTarget::Items {
                 dir: "Personal".to_owned(),
+                glob: None,
+            },
+            parse_list_target(Some("Personal/"), false).unwrap()
+        );
+        assert_eq!(
+            ListTarget::Items {
+                dir: "Personal".to_owned(),
+                glob: None,
+            },
+            parse_list_target(Some("pass://Personal/"), false).unwrap()
+        );
+        assert_eq!(
+            ListTarget::Items {
+                dir: "Personal".to_owned(),
                 glob: Some("*Github*".to_owned()),
             },
             parse_list_target(Some("Personal/*Github*"), false).unwrap()
         );
+        assert!(parse_list_target(Some("Personal/Github/"), false).is_err());
+        assert!(parse_list_target(Some("Personal//"), false).is_err());
     }
 
     #[test]

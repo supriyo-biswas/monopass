@@ -87,6 +87,48 @@ struct AuthorizationScope {
 pub(crate) struct ResolvedAuthorizationScope {
     pub(crate) hash: ScopeHash,
     pub(crate) display: Option<ProcessDisplay>,
+    pub(crate) ultimate: UltimateProcess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UltimateProcess {
+    executable: Option<ExecutableIdentity>,
+    executable_path: Option<PathBuf>,
+}
+
+impl UltimateProcess {
+    #[cfg(test)]
+    pub(crate) fn test(path: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: Some(ExecutableIdentity {
+                device: 1,
+                inode: 1,
+                generation: Some(1),
+                size: 1,
+                modified_seconds: 1,
+                modified_nanoseconds: 1,
+                changed_seconds: 1,
+                changed_nanoseconds: 1,
+            }),
+            executable_path: Some(path.into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_agent() -> Self {
+        let path = std::env::current_exe().expect("test executable path must resolve");
+        Self {
+            executable: ExecutableIdentity::from_path(&path),
+            executable_path: Some(path),
+        }
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirectUnlockCaller {
+    Agent,
+    Program(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,10 +226,43 @@ fn resolve_authorization_scope_with_resolver(
         chain: chain.iter().map(ProcessInfo::stable_identity).collect(),
     };
 
+    let ultimate = ultimate_process_from_chain(&chain)?;
     Some(ResolvedAuthorizationScope {
         hash: hash_authorization_scope(&scope),
         display: process_display_from_chain(&chain),
+        ultimate,
     })
+}
+
+fn ultimate_process_from_chain(chain: &[ProcessInfo]) -> Option<UltimateProcess> {
+    let process = chain.last()?;
+    Some(UltimateProcess {
+        executable: process.executable,
+        executable_path: process.executable_path.clone(),
+    })
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+pub(crate) fn direct_unlock_caller(ultimate: &UltimateProcess) -> Option<DirectUnlockCaller> {
+    let agent_executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| ExecutableIdentity::from_path(&path));
+    direct_unlock_caller_with_agent(ultimate, agent_executable)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn direct_unlock_caller_with_agent(
+    ultimate: &UltimateProcess,
+    agent_executable: Option<ExecutableIdentity>,
+) -> Option<DirectUnlockCaller> {
+    let executable = ultimate.executable?;
+    if agent_executable.is_some_and(|agent| agent == executable) {
+        return Some(DirectUnlockCaller::Agent);
+    }
+    ultimate
+        .executable_path
+        .clone()
+        .map(DirectUnlockCaller::Program)
 }
 
 fn process_display_from_chain(chain: &[ProcessInfo]) -> Option<ProcessDisplay> {
@@ -817,6 +892,56 @@ mod tests {
 
         assert!(scope.display.is_some());
         assert_eq!("Google Chrome", display.name);
+        assert_eq!(
+            Some(PathBuf::from("/usr/local/bin/monopass")),
+            scope.ultimate.executable_path
+        );
+        assert_eq!(Some(test_executable(3)), scope.ultimate.executable);
+    }
+
+    #[test]
+    fn direct_unlock_caller_uses_ultimate_executable_identity() {
+        let agent = test_executable(3);
+        let agent_ultimate = super::UltimateProcess {
+            executable: Some(agent),
+            executable_path: Some(PathBuf::from("/usr/local/bin/monopass")),
+        };
+        assert_eq!(
+            Some(super::DirectUnlockCaller::Agent),
+            super::direct_unlock_caller_with_agent(&agent_ultimate, Some(agent))
+        );
+
+        let external = super::UltimateProcess {
+            executable: Some(test_executable(4)),
+            executable_path: Some(PathBuf::from("/usr/local/bin/external")),
+        };
+        assert_eq!(
+            Some(super::DirectUnlockCaller::Program(PathBuf::from(
+                "/usr/local/bin/external"
+            ))),
+            super::direct_unlock_caller_with_agent(&external, Some(agent))
+        );
+    }
+
+    #[test]
+    fn direct_unlock_caller_requires_ultimate_identity_and_non_agent_path() {
+        let missing_identity = super::UltimateProcess {
+            executable: None,
+            executable_path: Some(PathBuf::from("/usr/local/bin/external")),
+        };
+        assert_eq!(
+            None,
+            super::direct_unlock_caller_with_agent(&missing_identity, Some(test_executable(3)))
+        );
+
+        let missing_path = super::UltimateProcess {
+            executable: Some(test_executable(4)),
+            executable_path: None,
+        };
+        assert_eq!(
+            None,
+            super::direct_unlock_caller_with_agent(&missing_path, Some(test_executable(3)))
+        );
     }
 
     #[test]

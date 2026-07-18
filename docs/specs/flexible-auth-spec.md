@@ -126,6 +126,25 @@ It is the migrated form of the older `/auth/unlock` behavior. It validates the
 bearer master password, opens or verifies the unlocked database, and authorizes
 the caller's process lineage for only the requested access scope.
 
+Direct unlock is restricted by `user.trustedProgramPaths`. Policy uses the
+ultimate executable in the verified process lineage—the process connected
+directly to the Unix socket—not the process selected for GUI display. An
+ultimate executable with the same file identity as the running agent is always
+allowed. Other callers are allowed only when their canonical executable path
+matches at least one configured glob. Matching is case-sensitive, `*` does not
+cross path separators, and `**` matches recursive path components. Empty,
+relative, and duplicate patterns are valid; malformed patterns are rejected on
+setting writes. The default `[]` therefore permits direct unlock only for the
+agent executable.
+
+Missing ultimate-process identity or path metadata, path canonicalization
+failures, invalid persisted patterns, and unmatched callers return the normal
+`403 access_denied` response. Password verification, database opening, trust
+evaluation, and authorization commitment remain atomic, so a failed trust check
+does not transiently store or authorize first-unlock state. Removing a trusted
+path affects future direct unlocks but does not revoke an authorization already
+issued to a process lineage.
+
 Failures:
 - `403 access_denied`
 - `403 unlock_failed`

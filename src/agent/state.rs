@@ -30,13 +30,15 @@ use super::models::{
     JobStatus, JobTarget, JobType, ListDirection, PaginatedResponse, UpdateContactRequest,
     UpdateDirRequest, UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
 };
+#[cfg(any(not(target_os = "macos"), test))]
+use super::process::DirectUnlockCaller;
 use super::process::ScopeHash;
 use crate::conceal::inferred_concealed;
 use crate::config::Config;
 use crate::db;
 use crate::settings::{
     AUTH_TTL_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING, SETTINGS_AUTH_TTL_SETTING,
-    SettingsError, user_setting,
+    SettingsError, TRUSTED_PROGRAM_PATHS_SETTING, trusted_program_path_matcher, user_setting,
 };
 
 const SCOPE_CACHE_CAPACITY: usize = 32;
@@ -139,6 +141,46 @@ impl AgentState {
         scope_hash: ScopeHash,
         access_scope: AccessScope,
     ) -> Result<(), UnlockError> {
+        self.unlock_for_scope_with_policy(password, scope_hash, access_scope, false, None)
+            .await
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    pub async fn unlock_direct_for_scope(
+        &self,
+        password: Zeroizing<String>,
+        scope_hash: ScopeHash,
+        access_scope: AccessScope,
+        caller: DirectUnlockCaller,
+    ) -> Result<(), UnlockError> {
+        let canonical_program = match caller {
+            DirectUnlockCaller::Agent => None,
+            DirectUnlockCaller::Program(path) => {
+                let canonical_path = tokio::task::spawn_blocking(move || fs::canonicalize(path))
+                    .await
+                    .map_err(|_| UnlockError::AccessDenied)?
+                    .map_err(|_| UnlockError::AccessDenied)?;
+                Some(canonical_path)
+            }
+        };
+        self.unlock_for_scope_with_policy(
+            password,
+            scope_hash,
+            access_scope,
+            true,
+            canonical_program.as_deref(),
+        )
+        .await
+    }
+
+    async fn unlock_for_scope_with_policy(
+        &self,
+        password: Zeroizing<String>,
+        scope_hash: ScopeHash,
+        access_scope: AccessScope,
+        enforce_direct_trust: bool,
+        direct_program: Option<&Path>,
+    ) -> Result<(), UnlockError> {
         let mut inner = self.inner.lock().await;
 
         if let Some(verifier) = &inner.password_verifier {
@@ -148,6 +190,11 @@ impl AgentState {
             let database = inner.database.clone().ok_or(UnlockError::AccessDenied)?;
             let auth_epoch = inner.auth_epoch;
             drop(inner);
+            if !direct_unlock_caller_is_trusted(&database, enforce_direct_trust, direct_program)
+                .await
+            {
+                return Err(UnlockError::AccessDenied);
+            }
             let auth_ttl = database
                 .user_setting_duration(auth_ttl_setting(access_scope))
                 .await
@@ -188,6 +235,9 @@ impl AgentState {
         .await
         .map_err(|_| UnlockError::UnlockFailed)?
         .map_err(|_| UnlockError::UnlockFailed)?;
+        if !direct_unlock_caller_is_trusted(&handle, enforce_direct_trust, direct_program).await {
+            return Err(UnlockError::AccessDenied);
+        }
         let auth_ttl = handle
             .user_setting_duration(auth_ttl_setting(access_scope))
             .await
@@ -690,6 +740,26 @@ fn auth_ttl_setting(access_scope: AccessScope) -> &'static str {
         AccessScope::Items => AUTH_TTL_SETTING,
         AccessScope::Settings => SETTINGS_AUTH_TTL_SETTING,
     }
+}
+
+async fn direct_unlock_caller_is_trusted(
+    database: &DbHandle,
+    enforce_direct_trust: bool,
+    program: Option<&Path>,
+) -> bool {
+    if !enforce_direct_trust {
+        return true;
+    }
+    let Some(path) = program else {
+        return true;
+    };
+    let Ok(settings) = database.list_settings().await else {
+        return false;
+    };
+    let Some(value) = settings.get(TRUSTED_PROGRAM_PATHS_SETTING) else {
+        return false;
+    };
+    trusted_program_path_matcher(value).is_ok_and(|matcher| matcher.is_match(path))
 }
 
 #[derive(Debug)]
@@ -5175,7 +5245,7 @@ mod tests {
         ListDirection, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
         PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest,
     };
-    use crate::agent::process::ScopeHash;
+    use crate::agent::process::{DirectUnlockCaller, ScopeHash};
 
     const AUTH_TTL: Duration = Duration::from_secs(900);
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -5565,6 +5635,144 @@ mod tests {
         let expires_at = state.max_authorization_expires_at().await.unwrap();
         assert!(expires_at >= before + AUTH_TTL);
         assert!(expires_at <= Instant::now() + AUTH_TTL);
+    }
+
+    #[tokio::test]
+    async fn direct_unlock_allows_agent_with_empty_or_invalid_trust_configuration() {
+        for value in ["[]", r#"["[unterminated"]"#] {
+            let file = NamedTempFile::new().unwrap();
+            create_encrypted_database(file.path(), "correct");
+            set_raw_trusted_program_paths(file.path(), "correct", value);
+            let state = AgentState::from_database_path(file.path());
+
+            state
+                .unlock_direct_for_scope(
+                    password("correct"),
+                    ScopeHash::test(1),
+                    AccessScope::Items,
+                    DirectUnlockCaller::Agent,
+                )
+                .await
+                .unwrap();
+
+            assert!(state.is_unlocked().await);
+            assert!(state.is_authorized(&ScopeHash::test(1)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_unlock_allows_matching_external_program_for_both_scopes() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let program = NamedTempFile::new().unwrap();
+        let canonical_program = std::fs::canonicalize(program.path()).unwrap();
+        let configured = serde_json::to_string(&[canonical_program.to_string_lossy()]).unwrap();
+        set_raw_trusted_program_paths(file.path(), "correct", &configured);
+        let state = AgentState::from_database_path(file.path());
+
+        state
+            .unlock_direct_for_scope(
+                password("correct"),
+                ScopeHash::test(1),
+                AccessScope::Items,
+                DirectUnlockCaller::Program(program.path().to_owned()),
+            )
+            .await
+            .unwrap();
+        state
+            .unlock_direct_for_scope(
+                password("correct"),
+                ScopeHash::test(2),
+                AccessScope::Settings,
+                DirectUnlockCaller::Program(program.path().to_owned()),
+            )
+            .await
+            .unwrap();
+
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(
+            state
+                .is_authorized_for_scope(&ScopeHash::test(2), AccessScope::Settings)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_external_direct_unlock_does_not_commit_first_unlock_state() {
+        for configured in [r#"["/definitely/not/the/caller"]"#, r#"["[unterminated"]"#] {
+            let file = NamedTempFile::new().unwrap();
+            create_encrypted_database(file.path(), "correct");
+            set_raw_trusted_program_paths(file.path(), "correct", configured);
+            let program = NamedTempFile::new().unwrap();
+            let state = AgentState::from_database_path(file.path());
+
+            assert_eq!(
+                Err(UnlockError::AccessDenied),
+                state
+                    .unlock_direct_for_scope(
+                        password("correct"),
+                        ScopeHash::test(1),
+                        AccessScope::Items,
+                        DirectUnlockCaller::Program(program.path().to_owned()),
+                    )
+                    .await
+            );
+            assert!(!state.is_unlocked().await);
+            assert!(!state.has_password_verifier().await);
+            assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_external_direct_unlock_does_not_add_authorization_when_unlocked() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let state = AgentState::from_database_path(file.path());
+        state
+            .unlock_direct_for_scope(
+                password("correct"),
+                ScopeHash::test(1),
+                AccessScope::Items,
+                DirectUnlockCaller::Agent,
+            )
+            .await
+            .unwrap();
+        let program = NamedTempFile::new().unwrap();
+
+        assert_eq!(
+            Err(UnlockError::AccessDenied),
+            state
+                .unlock_direct_for_scope(
+                    password("correct"),
+                    ScopeHash::test(2),
+                    AccessScope::Items,
+                    DirectUnlockCaller::Program(program.path().to_owned()),
+                )
+                .await
+        );
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(!state.is_authorized(&ScopeHash::test(2)).await);
+        assert!(state.is_unlocked().await);
+        assert!(state.has_password_verifier().await);
+    }
+
+    #[tokio::test]
+    async fn unresolvable_external_direct_unlock_fails_closed() {
+        let state = AgentState::from_database_path("missing.db");
+
+        assert_eq!(
+            Err(UnlockError::AccessDenied),
+            state
+                .unlock_direct_for_scope(
+                    password("correct"),
+                    ScopeHash::test(1),
+                    AccessScope::Items,
+                    DirectUnlockCaller::Program(PathBuf::from("/definitely/missing/program")),
+                )
+                .await
+        );
+        assert!(!state.is_unlocked().await);
+        assert!(!state.has_password_verifier().await);
     }
 
     #[tokio::test]
@@ -6320,6 +6528,7 @@ mod tests {
             r#"{"path":"program"}"#,
             r#""program""#,
             r#"["program",1]"#,
+            r#"["[unterminated"]"#,
             "[",
         ] {
             assert!(trusted_program_paths.validate(value).is_err());
@@ -6537,6 +6746,7 @@ mod tests {
             r#"{"path":"program"}"#,
             r#""program""#,
             r#"["program",1]"#,
+            r#"["[unterminated"]"#,
             "[",
         ] {
             assert_eq!(
@@ -9564,6 +9774,16 @@ mod tests {
 
     fn create_encrypted_database(path: &std::path::Path, password: &str) {
         crate::db::create_encrypted_database_with_password(path, password).unwrap();
+    }
+
+    fn set_raw_trusted_program_paths(path: &std::path::Path, password: &str, value: &str) {
+        let connection = crate::db::open_encrypted_database_with_password(path, password).unwrap();
+        connection
+            .execute(
+                "UPDATE system_settings SET value = ?1 WHERE name = 'user.trustedProgramPaths'",
+                [value],
+            )
+            .unwrap();
     }
 
     fn password(value: &str) -> Zeroizing<String> {

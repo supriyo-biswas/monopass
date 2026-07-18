@@ -416,11 +416,13 @@ monopass ls [-g|--globoff] [<dir>[/<item-glob>]]
 ```
 
 Without an argument, list directories with `GET /api/v1/dirs`. With `<dir>`,
-list all item names with `GET /api/v1/dir/{dirName}/items`. With `<dir>/<glob>`,
-pass the case-sensitive glob pattern to ListItems and print only matching names.
-Output is one name per line. Quote patterns to prevent shell expansion, for
-example `monopass ls 'Personal/*Github*'`. With `-g`/`--globoff`, treat the item
-component as a literal name, including literal `*`, `?`, and bracket expressions.
+list all item names with `GET /api/v1/dir/{dirName}/items`; a single trailing
+slash is accepted with the same meaning, for example `monopass ls Personal/`.
+With `<dir>/<glob>`, pass the case-sensitive glob pattern to ListItems and print
+only matching names. Output is one name per line. Quote patterns to prevent shell
+expansion, for example `monopass ls 'Personal/*Github*'`. With `-g`/`--globoff`,
+treat the item component as a literal name, including literal `*`, `?`, and
+bracket expressions.
 
 ## list versions command
 

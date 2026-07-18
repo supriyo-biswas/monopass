@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+
 pub(crate) const AUTH_TTL_SETTING: &str = "user.authTtlSeconds";
 pub(crate) const SETTINGS_AUTH_TTL_SETTING: &str = "user.settingsAuthTtlSeconds";
 pub(crate) const DENIAL_TTL_SETTING: &str = "user.denialTtlSeconds";
@@ -9,7 +11,7 @@ pub(crate) const TRUSTED_PROGRAM_PATHS_SETTING: &str = "user.trustedProgramPaths
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UserSettingKind {
     Seconds { min: u64, max: u64 },
-    StringArray,
+    TrustedProgramPaths,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +50,10 @@ impl UserSetting {
                 self.parse_seconds(value)?;
                 Ok(value.to_owned())
             }
-            UserSettingKind::StringArray => {
+            UserSettingKind::TrustedProgramPaths => {
                 let values = serde_json::from_str::<Vec<String>>(value)
                     .map_err(|_| SettingsError::InvalidValue)?;
+                compile_trusted_program_paths(&values)?;
                 serde_json::to_string(&values).map_err(|_| SettingsError::InvalidValue)
             }
         }
@@ -99,7 +102,7 @@ pub(crate) const USER_SETTINGS: &[UserSetting] = &[
     UserSetting {
         name: TRUSTED_PROGRAM_PATHS_SETTING,
         default: "[]",
-        kind: UserSettingKind::StringArray,
+        kind: UserSettingKind::TrustedProgramPaths,
     },
 ];
 
@@ -108,6 +111,25 @@ pub(crate) fn user_setting(name: &str) -> Result<&'static UserSetting, SettingsE
         .iter()
         .find(|setting| setting.name == name)
         .ok_or(SettingsError::UnknownSetting)
+}
+
+pub(crate) fn trusted_program_path_matcher(value: &str) -> Result<GlobSet, SettingsError> {
+    let patterns =
+        serde_json::from_str::<Vec<String>>(value).map_err(|_| SettingsError::InvalidValue)?;
+    compile_trusted_program_paths(&patterns)
+}
+
+fn compile_trusted_program_paths(patterns: &[String]) -> Result<GlobSet, SettingsError> {
+    let mut set = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .case_insensitive(false)
+            .build()
+            .map_err(|_| SettingsError::InvalidValue)?;
+        set.add(glob);
+    }
+    set.build().map_err(|_| SettingsError::InvalidValue)
 }
 
 #[cfg(test)]
@@ -134,4 +156,28 @@ pub(crate) fn gc_seconds_setting() -> &'static UserSetting {
 pub(crate) fn trusted_program_paths_setting() -> &'static UserSetting {
     user_setting(TRUSTED_PROGRAM_PATHS_SETTING)
         .expect("trusted program paths setting must be registered")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn trusted_program_globs_use_case_sensitive_path_separator_semantics() {
+        let exact = super::trusted_program_path_matcher(r#"["/opt/tools/bin/example"]"#).unwrap();
+        assert!(exact.is_match("/opt/tools/bin/example"));
+        assert!(!exact.is_match("/opt/tools/bin/Example"));
+
+        let single = super::trusted_program_path_matcher(r#"["/opt/tools/*/example"]"#).unwrap();
+        assert!(single.is_match("/opt/tools/bin/example"));
+        assert!(!single.is_match("/opt/tools/team/bin/example"));
+
+        let recursive =
+            super::trusted_program_path_matcher(r#"["/opt/tools/**/example"]"#).unwrap();
+        assert!(recursive.is_match("/opt/tools/bin/example"));
+        assert!(recursive.is_match("/opt/tools/team/bin/example"));
+    }
+
+    #[test]
+    fn trusted_program_globs_reject_malformed_syntax() {
+        assert!(super::trusted_program_path_matcher(r#"["[unterminated"]"#).is_err());
+    }
 }

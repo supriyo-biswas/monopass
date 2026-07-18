@@ -32,6 +32,8 @@ use super::models::{
     JobAcceptedResponse, JobResponse, JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse,
     UpdateContactRequest, UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
+#[cfg(any(not(target_os = "macos"), test))]
+use super::process::DirectUnlockCaller;
 #[cfg(any(
     target_os = "macos",
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
@@ -123,19 +125,21 @@ fn client_capabilities_include_gui_session(value: &str) -> bool {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), test))]
 pub async fn unlock_direct(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
+    caller: Option<Extension<DirectUnlockCaller>>,
     headers: HeaderMap,
     query: Result<Query<AuthScopeQuery>, QueryRejection>,
 ) -> Result<StatusCode, ApiError> {
     let access_scope = auth_scope_query(query)?.access_scope();
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
+    let Extension(caller) = caller.ok_or_else(ApiError::access_denied)?;
     let password = bearer_password(&headers)?;
 
     state
-        .unlock_for_scope(password, scope_hash, access_scope)
+        .unlock_direct_for_scope(password, scope_hash, access_scope, caller)
         .await
         .map(|()| StatusCode::OK)
         .map_err(|error| match error {
@@ -1031,7 +1035,7 @@ mod tests {
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     use crate::agent::process::ProcessDisplay;
-    use crate::agent::process::ScopeHash;
+    use crate::agent::process::{DirectUnlockCaller, ScopeHash};
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
 
     fn default_scope_query() -> Result<axum::extract::Query<AuthScopeQuery>, QueryRejection> {
@@ -1154,12 +1158,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn unlock_missing_bearer_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
             HeaderMap::new(),
             default_scope_query(),
         )
@@ -1170,7 +1174,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn unlock_malformed_bearer_returns_access_denied() {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
@@ -1179,6 +1182,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
             headers,
             default_scope_query(),
         )
@@ -1189,11 +1193,27 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn unlock_missing_scope_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = super::unlock_direct(
             axum::extract::State(state),
+            None,
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
+            authorization_headers("correct"),
+            default_scope_query(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(StatusCode::FORBIDDEN, error.status);
+    }
+
+    #[tokio::test]
+    async fn unlock_missing_direct_caller_policy_returns_access_denied() {
+        let state = AgentState::from_database_path("missing.db");
+        let error = super::unlock_direct(
+            axum::extract::State(state),
+            Some(axum::Extension(ScopeHash::test(1))),
             None,
             authorization_headers("correct"),
             default_scope_query(),
@@ -1205,7 +1225,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn unlock_failed_sqlcipher_unlock_returns_unlock_failed() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
@@ -1214,6 +1233,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("wrong"),
             default_scope_query(),
         )
@@ -1224,7 +1244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn unlock_success_returns_ok_and_stores_handle() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
@@ -1233,6 +1252,7 @@ mod tests {
         let status = super::unlock_direct(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("correct"),
             default_scope_query(),
         )
@@ -1603,7 +1623,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn already_unlocked_wrong_password_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
@@ -1612,6 +1631,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(2))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("wrong"),
             default_scope_query(),
         )
@@ -1622,7 +1642,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
     async fn already_unlocked_correct_password_caches_new_hash() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
@@ -1631,6 +1650,7 @@ mod tests {
         let response = super::unlock_direct(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(2))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("correct"),
             default_scope_query(),
         )
@@ -1928,7 +1948,6 @@ mod tests {
         headers
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn authorization_headers(password: &str) -> HeaderMap {
         let token = general_purpose::STANDARD.encode(password);
         let mut headers = HeaderMap::new();

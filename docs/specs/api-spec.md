@@ -129,7 +129,17 @@ HTTP/1.1 200 OK
 ```
 
 Both GUI and direct unlock open or reuse the encrypted database and authorize
-only the requested access scope for the caller's process lineage.
+only the requested access scope for the caller's process lineage. Direct unlock
+uses the ultimate executable in the verified process lineage: the process
+connected directly to the Unix socket, independently of the process selected
+for GUI display. An executable with the same file identity as the running agent
+is always allowed. Every other caller's executable path is canonicalized and
+must match at least one glob in `user.trustedProgramPaths`.
+
+Missing ultimate-process identity or path metadata, canonicalization failures,
+malformed persisted patterns, and unmatched paths fail closed with
+`403 access_denied`. Password verification, database opening, trust evaluation,
+and authorization commitment do not expose an intermediate authorized state.
 
 Failures:
 - `403 access_denied`
@@ -197,7 +207,7 @@ under `user.*` names:
 | `user.settingsAuthTtlSeconds` | `300` | integer seconds, `1..=604800` |
 | `user.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
 | `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
-| `user.trustedProgramPaths` | `[]` | JSON-serialized array of strings |
+| `user.trustedProgramPaths` | `[]` | JSON-serialized array of valid path globs |
 
 `user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
 effect immediately for new and existing cached item authorizations.
@@ -207,11 +217,16 @@ and likewise applies immediately to new and existing entries.
 seconds until the encrypted setting is first loaded by a successful unlock,
 then keeps the loaded value in memory through later database unloads. Changes
 take effect immediately for new and existing cached denials. `user.gcSeconds`
-controls the best-effort idle cleanup cadence. `user.trustedProgramPaths` is
-reserved for trusted-program authorization behavior. This setting only stores
-validated configuration; it does not currently change authorization behavior.
-Its value must be a JSON-serialized array containing only strings. Paths are not
-required to be absolute, unique, non-empty, present, or executable.
+controls the best-effort idle cleanup cadence. `user.trustedProgramPaths`
+controls which non-agent ultimate executables may use direct unlock. Patterns
+are matched case-sensitively against canonical executable paths. `*` does not
+cross path separators; `**` may match recursive path components. Empty,
+relative, and duplicate patterns are allowed, while malformed glob syntax is
+rejected. Paths are not required to be absolute, unique, non-empty, present, or
+executable when the setting is written. The default `[]` allows only callers
+whose executable file identity matches the running agent. Removing a pattern
+affects future direct unlocks and does not revoke an authorization already
+issued to a process lineage.
 
 ### List Settings
 
@@ -246,12 +261,13 @@ HTTP/1.1 200 OK
 ```
 
 Known duration settings are upserted when `value` is an in-range integer string.
-`user.trustedProgramPaths` accepts a JSON-serialized string array and stores it
-in canonical compact form. For example, its request body is
+`user.trustedProgramPaths` accepts a JSON-serialized string array of valid globs
+and stores it in canonical compact form. For example, its request body is
 `{ "value": "[\"/usr/bin/example\",\"relative-program\"]" }`. Unknown
 settings, including `sys.*`, return `404 not_found`. Malformed request JSON,
-missing `value`, invalid setting JSON, non-string array elements, non-integer
-duration values, and out-of-range duration values return `400 bad_request`.
+missing `value`, invalid setting JSON, non-string array elements, malformed glob
+syntax, non-integer duration values, and out-of-range duration values return
+`400 bad_request`.
 
 ## Dirs
 
