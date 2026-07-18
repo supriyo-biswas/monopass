@@ -2417,7 +2417,8 @@ mod tests {
                 "user.authTtlSeconds":"900",
                 "user.denialTtlSeconds":"60",
                 "user.gcSeconds":"3600",
-                "user.settingsAuthTtlSeconds":"300"
+                "user.settingsAuthTtlSeconds":"300",
+                "user.trustedProgramPaths":"[]"
             }),
             json_body(response).await
         );
@@ -2463,6 +2464,18 @@ mod tests {
         assert_eq!(StatusCode::OK, response.status());
 
         let response = router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/settings/user.trustedProgramPaths",
+                json!({"value":r#"["", "relative", "relative"]"#}),
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+
+        let response = router
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
                 ScopeHash::test(1),
@@ -2474,6 +2487,10 @@ mod tests {
         assert_eq!("1200", body["user.authTtlSeconds"]);
         assert_eq!("120", body["user.denialTtlSeconds"]);
         assert_eq!("600", body["user.settingsAuthTtlSeconds"]);
+        assert_eq!(
+            r#"["","relative","relative"]"#,
+            body["user.trustedProgramPaths"]
+        );
     }
 
     #[tokio::test]
@@ -2546,6 +2563,27 @@ mod tests {
                 .unwrap();
             assert_eq!(StatusCode::NOT_FOUND, response.status());
             assert_eq!("not_found", json_body(response).await["error"]["code"]);
+        }
+
+        for value in [
+            json!("{"),
+            json!(r#"{"path":"program"}"#),
+            json!("\"program\""),
+            json!(r#"["program",1]"#),
+            json!([]),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(json_request_with_hash(
+                    "PUT",
+                    "/api/v1/settings/user.trustedProgramPaths",
+                    json!({"value":value}),
+                    ScopeHash::test(1),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(StatusCode::BAD_REQUEST, response.status());
+            assert_eq!("bad_request", json_body(response).await["error"]["code"]);
         }
     }
 

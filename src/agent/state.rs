@@ -2473,7 +2473,7 @@ impl DatabaseWorker {
 
     fn upsert_setting(&self, name: &str, value: &str) -> Result<(), DbError> {
         let setting = user_setting(name).map_err(|error| map_named_settings_error(error, name))?;
-        setting.validate(value).map_err(map_settings_error)?;
+        let value = setting.normalize(value).map_err(map_settings_error)?;
         self.connection
             .execute(
                 r#"
@@ -6304,6 +6304,26 @@ mod tests {
                 .validate("604801")
                 .is_err()
         );
+        let trusted_program_paths = crate::settings::trusted_program_paths_setting();
+        assert!(
+            trusted_program_paths
+                .validate(trusted_program_paths.default)
+                .is_ok()
+        );
+        assert_eq!(
+            r#"["","relative","relative"]"#,
+            trusted_program_paths
+                .normalize(r#"["", "relative", "relative"]"#)
+                .unwrap()
+        );
+        for value in [
+            r#"{"path":"program"}"#,
+            r#""program""#,
+            r#"["program",1]"#,
+            "[",
+        ] {
+            assert!(trusted_program_paths.validate(value).is_err());
+        }
     }
 
     #[tokio::test]
@@ -6329,7 +6349,24 @@ mod tests {
             settings.get("user.denialTtlSeconds")
         );
         assert_eq!(Some(&"3600".to_owned()), settings.get("user.gcSeconds"));
+        assert_eq!(
+            Some(&"[]".to_owned()),
+            settings.get("user.trustedProgramPaths")
+        );
         assert!(!settings.contains_key("sys.fileEncryptionKey"));
+
+        database
+            .upsert_setting(
+                "user.trustedProgramPaths".to_owned(),
+                r#"["", "relative", "relative"]"#.to_owned(),
+            )
+            .await
+            .unwrap();
+        let settings = database.list_settings().await.unwrap();
+        assert_eq!(
+            Some(&r#"["","relative","relative"]"#.to_owned()),
+            settings.get("user.trustedProgramPaths")
+        );
     }
 
     #[tokio::test]
@@ -6496,6 +6533,19 @@ mod tests {
                 .upsert_setting("sys.fileEncryptionKey".to_owned(), "900".to_owned())
                 .await
         );
+        for value in [
+            r#"{"path":"program"}"#,
+            r#""program""#,
+            r#"["program",1]"#,
+            "[",
+        ] {
+            assert_eq!(
+                Err(DbError::BadRequest("invalid setting value".to_owned())),
+                database
+                    .upsert_setting("user.trustedProgramPaths".to_owned(), value.to_owned())
+                    .await
+            );
+        }
     }
 
     #[tokio::test]

@@ -395,6 +395,7 @@ mod tests {
         assert_setting_value(&conn, "user.settingsAuthTtlSeconds", "300");
         assert_setting_value(&conn, "user.denialTtlSeconds", "60");
         assert_setting_value(&conn, "user.gcSeconds", "3600");
+        assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
     }
 
     #[test]
@@ -452,6 +453,7 @@ mod tests {
         assert_setting_value(&conn, "user.settingsAuthTtlSeconds", "300");
         assert_setting_value(&conn, "user.denialTtlSeconds", "60");
         assert_setting_value(&conn, "user.gcSeconds", "3600");
+        assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
     }
 
     #[test]

@@ -197,6 +197,7 @@ under `user.*` names:
 | `user.settingsAuthTtlSeconds` | `300` | integer seconds, `1..=604800` |
 | `user.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
 | `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
+| `user.trustedProgramPaths` | `[]` | JSON-serialized array of strings |
 
 `user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
 effect immediately for new and existing cached item authorizations.
@@ -206,7 +207,11 @@ and likewise applies immediately to new and existing entries.
 seconds until the encrypted setting is first loaded by a successful unlock,
 then keeps the loaded value in memory through later database unloads. Changes
 take effect immediately for new and existing cached denials. `user.gcSeconds`
-controls the best-effort idle cleanup cadence.
+controls the best-effort idle cleanup cadence. `user.trustedProgramPaths` is
+reserved for trusted-program authorization behavior. This setting only stores
+validated configuration; it does not currently change authorization behavior.
+Its value must be a JSON-serialized array containing only strings. Paths are not
+required to be absolute, unique, non-empty, present, or executable.
 
 ### List Settings
 
@@ -220,7 +225,8 @@ Content-Type: application/json
   "user.authTtlSeconds": "900",
   "user.settingsAuthTtlSeconds": "300",
   "user.denialTtlSeconds": "60",
-  "user.gcSeconds": "3600"
+  "user.gcSeconds": "3600",
+  "user.trustedProgramPaths": "[]"
 }
 ```
 
@@ -239,10 +245,13 @@ HTTP/1.1 200 OK
 {}
 ```
 
-Known `user.*` settings are upserted when `value` is an in-range integer string.
-Unknown settings, including `sys.*`, return `404 not_found`. Malformed JSON,
-missing `value`, non-integer values, and out-of-range values return
-`400 bad_request`.
+Known duration settings are upserted when `value` is an in-range integer string.
+`user.trustedProgramPaths` accepts a JSON-serialized string array and stores it
+in canonical compact form. For example, its request body is
+`{ "value": "[\"/usr/bin/example\",\"relative-program\"]" }`. Unknown
+settings, including `sys.*`, return `404 not_found`. Malformed request JSON,
+missing `value`, invalid setting JSON, non-string array elements, non-integer
+duration values, and out-of-range duration values return `400 bad_request`.
 
 ## Dirs
 
@@ -882,7 +891,8 @@ VALUES
   ('user.authTtlSeconds', '900'),
   ('user.settingsAuthTtlSeconds', '300'),
   ('user.denialTtlSeconds', '60'),
-  ('user.gcSeconds', '3600');
+  ('user.gcSeconds', '3600'),
+  ('user.trustedProgramPaths', '[]');
 
 -- Init also creates:
 -- - hidden dir `Trash`
