@@ -3,8 +3,9 @@
 Base path: `/api/v1`
 
 All database-backed routes require the agent database to be unlocked and the
-caller process to be authorized. Unauthorized or locked access returns
-`403 access_denied`.
+caller process lineage to be authorized for the route's access scope. Settings
+routes require `settings`; all other database routes require `items`.
+Unauthorized or locked access returns `403 access_denied`.
 
 Timestamps are stored as Unix seconds and returned as RFC3339 UTC strings.
 
@@ -24,6 +25,10 @@ PID/start-time fallback from a new process requires reauthorization. Traversal
 stops before a different-user or different-session ancestor and otherwise
 fails closed when required process identity cannot be resolved.
 
+Authorization is recorded independently for the `items` and `settings` access
+scopes. Auth endpoints that accept `scope` default to `items` when it is omitted.
+Unknown scope values return `400 bad_request`.
+
 ### Unlock
 
 Unlock uses the method discovery flow described in
@@ -32,12 +37,16 @@ preferred unlock method for the current platform, build variant, and client
 capabilities.
 
 ```http
-GET /api/v1/auth/unlock/methods
+GET /api/v1/auth/unlock/methods?scope={items|settings}
 X-Client-Capabilities: x-session=<display>
 
 HTTP/1.1 200 OK
 Content-Type: application/json
 ```
+
+When `scope` was explicit, each advertised method URL carries the same query,
+for example `/api/v1/auth/unlock/gui?scope=settings`. An omitted scope preserves
+the existing unqualified method URLs.
 
 macOS response:
 
@@ -81,24 +90,26 @@ Linux GUI-capable response with `x-session` or `wayland-session` capability:
 On macOS and Linux GUI-capable builds, the GUI method is:
 
 ```http
-POST /api/v1/auth/unlock/gui
+POST /api/v1/auth/unlock/gui?scope={items|settings}
 X-Client-Capabilities: x-session=<display>
 
 HTTP/1.1 200 OK
 ```
 
-The agent displays a password dialog for the requesting application and accepts
-one submitted password for the request. The dialog shows the application name,
-executable path, and an icon when available. Linux GUI unlock requires an
-accepted GUI session capability (`x-session` or `wayland-session`) and uses
+The agent displays a scope-specific password dialog for the requesting
+application and accepts one submitted password for the request. Item prompts
+retain the requesting application's icon. Settings prompts use a platform
+settings icon. Both show the application name and executable path. Linux GUI
+unlock requires an accepted GUI session capability (`x-session` or
+`wayland-session`) and uses
 in-process GTK4 or Qt Quick/QML SDK dialogs with forced X11 backend usage. A
 wrong password, cancelled dialog, or closed dialog denies the request.
 Concurrent GUI unlock requests are displayed as separate dialogs.
 
 Clicking the explicit **Deny** button records a denial for the requesting
-process-lineage scope. Until `user.denialTtlSeconds` expires, later GUI unlock
-requests for that scope return `403 temporary_lockout` without displaying
-another dialog. The Deny-button response itself uses the same error. Other
+process-lineage and access-scope pair. Until `user.denialTtlSeconds` expires,
+later GUI unlock requests for that pair return `403 temporary_lockout` without
+displaying another dialog. The Deny-button response itself uses the same error. Other
 scopes remain unaffected. Escape, window close, prompt backend
 failure, and wrong-password submission do not create a cached denial. A
 successful unlock clears any denial for that scope. Denials are memory-only,
@@ -111,11 +122,14 @@ Failure:
 On Linux direct-only builds or clients without an accepted GUI capability, the advertised method is:
 
 ```http
-POST /api/v1/auth/unlock/direct
+POST /api/v1/auth/unlock/direct?scope={items|settings}
 Authorization: Bearer <standard-base64 UTF-8 password>
 
 HTTP/1.1 200 OK
 ```
+
+Both GUI and direct unlock open or reuse the encrypted database and authorize
+only the requested access scope for the caller's process lineage.
 
 Failures:
 - `403 access_denied`
@@ -129,8 +143,8 @@ POST /api/v1/auth/lock
 HTTP/1.1 200 OK
 ```
 
-Clears cached process-lineage authorizations immediately and schedules the
-unlocked database for unload on the agent's next authorization-expiry sweep.
+Clears cached item and settings process-lineage authorizations immediately and
+schedules the unlocked database for unload on the agent's next authorization-expiry sweep.
 The request does not close the database synchronously; active database requests
 and active jobs continue to delay unload as normal.
 
@@ -140,7 +154,7 @@ Failure:
 ### Status
 
 ```http
-GET /api/v1/auth/status
+GET /api/v1/auth/status?scope={items|settings}
 
 HTTP/1.1 200 OK
 Content-Type: application/json
@@ -151,8 +165,8 @@ Content-Type: application/json
 ```
 
 Returns `200 OK` only when the database is unlocked and the current process
-lineage is authorized. `reauth_timestamp` is an RFC3339 UTC timestamp for when
-the current process-lineage authorization expires. Does not refresh the
+lineage is authorized for the requested access scope. `reauth_timestamp` is an
+RFC3339 UTC timestamp for when that authorization expires. Does not refresh the
 process-lineage authorization expiry or database idle timer.
 
 Failure:
@@ -160,18 +174,17 @@ Failure:
 
 ## Settings
 
-Settings routes are database-backed and require the same unlocked database and
-authorized process lineage as item, dir, and file routes. Every settings request
-also requires `Authorization: Bearer <standard-base64 UTF-8 password>` with the
-master password. Missing, malformed, invalid, or wrong settings passwords return
-`403 access_denied`.
+Settings routes are database-backed and require a cached `settings`
+authorization for the caller's process lineage. An `items` authorization does
+not grant settings access, even if the request includes a valid master-password
+bearer. Settings requests do not consume bearer passwords.
 
 Items may also carry internal bitmask flags. `ITEM_HIDDEN = 1 << 0` hides an
 item from public item reads and lists. `ITEM_READ_MUSTAUTH = 1 << 1` adds a
 per-request master-password check for secret-bearing reads: `GET Item` with
 `reveal=true` or `raw=true`, and `GET Reference`. The password is supplied with
-the same `Authorization: Bearer <standard-base64 UTF-8 password>` header used
-by settings. Missing, malformed, or wrong bearer passwords return
+`Authorization: Bearer <standard-base64 UTF-8 password>`. Missing, malformed,
+or wrong bearer passwords return
 `403 access_denied` only when the target public item has `ITEM_READ_MUSTAUTH`;
 masked `GET Item`, `List Items`, and `List Item Versions` do not enforce it.
 
@@ -181,11 +194,14 @@ under `user.*` names:
 | Name | Default | Allowed values |
 | --- | --- | --- |
 | `user.authTtlSeconds` | `900` | integer seconds, `1..=604800` |
+| `user.settingsAuthTtlSeconds` | `300` | integer seconds, `1..=604800` |
 | `user.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
 | `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
 
 `user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
-effect immediately for new and existing cached authorizations.
+effect immediately for new and existing cached item authorizations.
+`user.settingsAuthTtlSeconds` independently controls settings authorization TTL
+and likewise applies immediately to new and existing entries.
 `user.denialTtlSeconds` controls explicit GUI denial TTL. The agent uses 60
 seconds until the encrypted setting is first loaded by a successful unlock,
 then keeps the loaded value in memory through later database unloads. Changes
@@ -196,13 +212,13 @@ controls the best-effort idle cleanup cadence.
 
 ```http
 GET /api/v1/settings
-Authorization: Bearer <standard-base64 UTF-8 password>
 
 HTTP/1.1 200 OK
 Content-Type: application/json
 
 {
   "user.authTtlSeconds": "900",
+  "user.settingsAuthTtlSeconds": "300",
   "user.denialTtlSeconds": "60",
   "user.gcSeconds": "3600"
 }
@@ -215,7 +231,6 @@ Returns all `user.*` settings currently stored in `system_settings`. Internal
 
 ```http
 PUT /api/v1/settings/{name}
-Authorization: Bearer <standard-base64 UTF-8 password>
 Content-Type: application/json
 
 { "value": "900" }
@@ -865,6 +880,7 @@ CREATE TABLE system_settings (
 INSERT INTO system_settings (name, value)
 VALUES
   ('user.authTtlSeconds', '900'),
+  ('user.settingsAuthTtlSeconds', '300'),
   ('user.denialTtlSeconds', '60'),
   ('user.gcSeconds', '3600');
 

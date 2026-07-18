@@ -11,6 +11,7 @@ use chrono::{DateTime, Local};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
+use super::models::AccessScope;
 use super::process::ProcessDisplay;
 
 pub(crate) type PromptRequestReceiver = mpsc::Receiver<PromptRequest>;
@@ -28,6 +29,7 @@ struct PromptRequestSender(mpsc::Sender<PromptRequest>);
 
 pub(crate) struct PromptRequest {
     display: Option<ProcessDisplay>,
+    access_scope: AccessScope,
     response: oneshot::Sender<PromptOutcome>,
 }
 
@@ -37,27 +39,42 @@ pub(crate) fn install_prompt_dispatcher() -> PromptRequestReceiver {
     receiver
 }
 
-pub(crate) async fn prompt_password(display: Option<ProcessDisplay>) -> PromptOutcome {
-    prompt_password_with(display, dispatch_prompt).await
+pub(crate) async fn prompt_password(
+    display: Option<ProcessDisplay>,
+    access_scope: AccessScope,
+) -> PromptOutcome {
+    prompt_password_with(display, access_scope, dispatch_prompt).await
 }
 
 pub(crate) async fn prompt_password_with<F, Fut>(
     display: Option<ProcessDisplay>,
+    access_scope: AccessScope,
     prompt: F,
 ) -> PromptOutcome
 where
-    F: FnOnce(Option<ProcessDisplay>) -> Fut,
+    F: FnOnce(Option<ProcessDisplay>, AccessScope) -> Fut,
     Fut: std::future::Future<Output = PromptOutcome>,
 {
-    prompt(display).await
+    prompt(display, access_scope).await
 }
 
-async fn dispatch_prompt(display: Option<ProcessDisplay>) -> PromptOutcome {
+async fn dispatch_prompt(
+    display: Option<ProcessDisplay>,
+    access_scope: AccessScope,
+) -> PromptOutcome {
     let Some(sender) = PROMPT_DISPATCHER.get().cloned() else {
         return PromptOutcome::Dismissed;
     };
     let (response, receiver) = oneshot::channel();
-    if sender.0.send(PromptRequest { display, response }).is_err() {
+    if sender
+        .0
+        .send(PromptRequest {
+            display,
+            access_scope,
+            response,
+        })
+        .is_err()
+    {
         return PromptOutcome::Dismissed;
     }
     receiver.await.unwrap_or(PromptOutcome::Dismissed)
@@ -174,7 +191,7 @@ mod linux_prompt {
     use gtk4 as gtk;
     use zeroize::Zeroizing;
 
-    use super::{PromptMetadata, PromptOutcome, PromptRequest, PromptRequestReceiver};
+    use super::{AccessScope, PromptMetadata, PromptOutcome, PromptRequest, PromptRequestReceiver};
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -262,7 +279,8 @@ mod linux_prompt {
 
     impl GtkPrompt {
         fn present(request: PromptRequest, app: &gtk::Application) -> Self {
-            let metadata = PromptMetadata::from_display(request.display.as_ref());
+            let metadata =
+                PromptMetadata::from_display(request.display.as_ref(), request.access_scope);
             let finished = Rc::new(Cell::new(false));
             let response = Rc::new(RefCell::new(Some(request.response)));
             let window = build_window(&metadata, app);
@@ -300,7 +318,7 @@ mod linux_prompt {
     fn build_window(metadata: &PromptMetadata, app: &gtk::Application) -> gtk::Window {
         let window: gtk::Window = gtk::ApplicationWindow::builder()
             .application(app)
-            .title("monopass access requested")
+            .title(&metadata.title)
             .default_width(460)
             .resizable(false)
             .build()
@@ -365,6 +383,12 @@ mod linux_prompt {
     }
 
     fn icon_for_metadata(metadata: &PromptMetadata) -> Option<gtk::Image> {
+        if metadata.access_scope == AccessScope::Settings {
+            let image = gtk::Image::from_icon_name("preferences-system");
+            image.set_pixel_size(40);
+            return Some(image);
+        }
+
         if let Some(path) = metadata.preferred_icon_path.as_deref()
             && path.exists()
         {
@@ -498,7 +522,7 @@ mod linux_prompt {
     use qmetaobject::{QObjectPinned, prelude::*};
     use zeroize::Zeroizing;
 
-    use super::{PromptMetadata, PromptOutcome, PromptRequestReceiver};
+    use super::{AccessScope, PromptMetadata, PromptOutcome, PromptRequestReceiver};
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -573,7 +597,10 @@ mod linux_prompt {
                 Ok(request) => {
                     let id = self.next_id;
                     self.next_id = self.next_id.wrapping_add(1).max(1);
-                    let metadata = PromptMetadata::from_display(request.display.as_ref());
+                    let metadata = PromptMetadata::from_display(
+                        request.display.as_ref(),
+                        request.access_scope,
+                    );
                     self.pending.insert(id, request.response);
                     CURRENT.with(|current| {
                         *current.borrow_mut() = CurrentPrompt::from_metadata(id, metadata);
@@ -630,6 +657,8 @@ mod linux_prompt {
     #[derive(Default)]
     struct CurrentPrompt {
         id: u32,
+        settings_scope: bool,
+        title: String,
         intro: String,
         app_name: String,
         modified_text: String,
@@ -642,6 +671,8 @@ mod linux_prompt {
             let icon_sources = icon_sources(&metadata);
             Self {
                 id,
+                settings_scope: metadata.access_scope == AccessScope::Settings,
+                title: metadata.title,
                 intro: metadata.intro,
                 app_name: metadata.app_name,
                 modified_text: metadata.modified_text.unwrap_or_default(),
@@ -652,6 +683,16 @@ mod linux_prompt {
     }
 
     fn icon_sources(metadata: &PromptMetadata) -> String {
+        if metadata.access_scope == AccessScope::Settings {
+            return ["preferences-system", "settings", "preferences-other"]
+                .iter()
+                .filter_map(|name| find_xdg_icon(name))
+                .filter_map(|path| url::Url::from_file_path(path).ok())
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+
         let mut sources = Vec::new();
         if let Some(path) = metadata.preferred_icon_path.as_deref()
             && path.exists()
@@ -746,6 +787,8 @@ mod linux_prompt {
         deny: qt_method!(fn(&self, id: u32)),
         dismiss: qt_method!(fn(&self, id: u32)),
         prompt_id: qt_method!(fn(&self) -> u32),
+        settings_scope: qt_method!(fn(&self) -> bool),
+        title: qt_method!(fn(&self) -> QString),
         intro: qt_method!(fn(&self) -> QString),
         app_name: qt_method!(fn(&self) -> QString),
         modified_text: qt_method!(fn(&self) -> QString),
@@ -798,6 +841,14 @@ mod linux_prompt {
 
         fn prompt_id(&self) -> u32 {
             CURRENT.with(|current| current.borrow().id)
+        }
+
+        fn settings_scope(&self) -> bool {
+            CURRENT.with(|current| current.borrow().settings_scope)
+        }
+
+        fn title(&self) -> QString {
+            CURRENT.with(|current| current.borrow().title.as_str().into())
         }
 
         fn intro(&self) -> QString {
@@ -862,6 +913,8 @@ Window {
             while (_promptBridge.poll()) {
                 var prompt = promptComponent.createObject(null, {
                     "promptId": _promptBridge.prompt_id(),
+                    "settingsScope": _promptBridge.settings_scope(),
+                    "titleText": _promptBridge.title(),
                     "introText": _promptBridge.intro(),
                     "appName": _promptBridge.app_name(),
                     "modifiedText": _promptBridge.modified_text(),
@@ -883,6 +936,8 @@ Window {
         Window {
             id: prompt
             property int promptId: 0
+            property bool settingsScope: false
+            property string titleText: ""
             property string introText: ""
             property string appName: ""
             property string modifiedText: ""
@@ -936,7 +991,7 @@ Window {
                 password.forceActiveFocus()
             }
 
-            title: "monopass access requested"
+            title: titleText
             width: 460
             minimumWidth: 460
             maximumWidth: 460
@@ -1022,6 +1077,16 @@ Window {
                         }
                     }
 
+                    Label {
+                        text: "⚙"
+                        visible: prompt.settingsScope && !icon.visible
+                        font.pixelSize: 34
+                        Layout.preferredWidth: visible ? 40 : 0
+                        Layout.preferredHeight: visible ? 40 : 0
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
                     ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 4
@@ -1095,8 +1160,8 @@ mod appkit_prompt {
     use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
         NSApplication, NSBackingStoreType, NSButton, NSFloatingWindowLevel, NSFont, NSImage,
-        NSImageView, NSLineBreakMode, NSSecureTextField, NSTextField, NSView, NSWindow,
-        NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+        NSImageNamePreferencesGeneral, NSImageView, NSLineBreakMode, NSSecureTextField,
+        NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
     };
     use objc2_foundation::{
         MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -1106,7 +1171,7 @@ mod appkit_prompt {
     use tokio::sync::oneshot;
     use zeroize::Zeroizing;
 
-    use super::{PromptMetadata, PromptOutcome, PromptRequest, path_to_string};
+    use super::{AccessScope, PromptMetadata, PromptOutcome, PromptRequest, path_to_string};
 
     const WINDOW_WIDTH: f64 = 460.0;
     const WINDOW_HEIGHT: f64 = 196.0;
@@ -1182,7 +1247,8 @@ mod appkit_prompt {
             mtm: MainThreadMarker,
         ) -> Retained<PromptController> {
             let controller = Self::new(request.response, mtm);
-            let metadata = PromptMetadata::from_display(request.display.as_ref());
+            let metadata =
+                PromptMetadata::from_display(request.display.as_ref(), request.access_scope);
             let window = build_window(&controller, metadata, mtm);
 
             {
@@ -1264,7 +1330,7 @@ mod appkit_prompt {
         };
 
         unsafe { window.setReleasedWhenClosed(false) };
-        window.setTitle(ns_string!("monopass access requested"));
+        window.setTitle(&NSString::from_str(&metadata.title));
         window.setLevel(NSFloatingWindowLevel);
         window.center();
         window.setDelegate(Some(ProtocolObject::from_ref(&**controller)));
@@ -1408,6 +1474,11 @@ mod appkit_prompt {
     }
 
     fn load_icon(metadata: &PromptMetadata) -> Option<Retained<NSImage>> {
+        if metadata.access_scope == AccessScope::Settings {
+            // SAFETY: NSImageNamePreferencesGeneral is a system-provided, immutable name.
+            return NSImage::imageNamed(unsafe { NSImageNamePreferencesGeneral });
+        }
+
         let workspace = NSWorkspace::sharedWorkspace();
 
         if let Some(icon_path) = metadata
@@ -1435,6 +1506,8 @@ use appkit_prompt::PromptController;
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PromptMetadata {
+    access_scope: AccessScope,
+    title: String,
     intro: String,
     app_name: String,
     modified_text: Option<String>,
@@ -1448,10 +1521,13 @@ struct PromptMetadata {
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 impl PromptMetadata {
-    fn from_display(display: Option<&ProcessDisplay>) -> Self {
-        let intro = prompt_text(None);
+    fn from_display(display: Option<&ProcessDisplay>, access_scope: AccessScope) -> Self {
+        let intro = prompt_text(access_scope);
+        let title = format!("monopass {} access requested", access_scope.as_str());
         let Some(display) = display else {
             return Self {
+                access_scope,
+                title,
                 intro,
                 app_name: "this app".to_owned(),
                 modified_text: None,
@@ -1462,6 +1538,8 @@ impl PromptMetadata {
         };
 
         Self {
+            access_scope,
+            title,
             intro,
             app_name: display.name.clone(),
             modified_text: modified_text(display.modified),
@@ -1482,20 +1560,10 @@ fn modified_text(modified: Option<std::time::SystemTime>) -> Option<String> {
     })
 }
 
-fn prompt_text(display: Option<&ProcessDisplay>) -> String {
-    let Some(display) = display else {
-        return "Enter your password to allow password access to this app:".to_owned();
-    };
-
-    let modified = modified_text(display.modified)
-        .map(|modified| format!(" {modified}"))
-        .unwrap_or_default();
-
+fn prompt_text(access_scope: AccessScope) -> String {
     format!(
-        "Enter your password to allow password access to this app:\n\n{}{}\n{}",
-        display.name,
-        modified,
-        display.path.display()
+        "Enter your password to allow Monopass {} access to this app:",
+        access_scope.as_str()
     )
 }
 
@@ -1508,21 +1576,25 @@ mod tests {
 
     use zeroize::{Zeroize, Zeroizing};
 
+    use super::AccessScope;
     #[cfg(target_os = "macos")]
     use super::ProcessDisplay;
 
     #[test]
     #[cfg(target_os = "macos")]
     fn metadata_for_app_caller_uses_bundle_name_and_icon_path() {
-        let metadata = super::PromptMetadata::from_display(Some(&ProcessDisplay {
-            name: "Google Chrome".to_owned(),
-            path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
-            icon_path: Some("/Applications/Google Chrome.app".into()),
-            modified: Some(UNIX_EPOCH + Duration::from_secs(1_781_225_600)),
-        }));
+        let metadata = super::PromptMetadata::from_display(
+            Some(&ProcessDisplay {
+                name: "Google Chrome".to_owned(),
+                path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
+                icon_path: Some("/Applications/Google Chrome.app".into()),
+                modified: Some(UNIX_EPOCH + Duration::from_secs(1_781_225_600)),
+            }),
+            AccessScope::Items,
+        );
 
         assert_eq!(
-            "Enter your password to allow password access to this app:",
+            "Enter your password to allow Monopass items access to this app:",
             metadata.intro
         );
         assert_eq!("Google Chrome", metadata.app_name);
@@ -1550,12 +1622,15 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn metadata_for_plain_executable_uses_default_icon() {
-        let metadata = super::PromptMetadata::from_display(Some(&ProcessDisplay {
-            name: "example-tool".to_owned(),
-            path: "/usr/local/bin/example-tool".into(),
-            icon_path: None,
-            modified: None,
-        }));
+        let metadata = super::PromptMetadata::from_display(
+            Some(&ProcessDisplay {
+                name: "example-tool".to_owned(),
+                path: "/usr/local/bin/example-tool".into(),
+                icon_path: None,
+                modified: None,
+            }),
+            AccessScope::Items,
+        );
 
         assert_eq!("example-tool", metadata.app_name);
         assert_eq!(None, metadata.modified_text);
@@ -1569,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_password_with_allows_fake_prompt_injection() {
-        let outcome = super::prompt_password_with(None, |_| async {
+        let outcome = super::prompt_password_with(None, AccessScope::Items, |_, _| async {
             super::PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
         })
         .await;
@@ -1583,8 +1658,20 @@ mod tests {
     #[test]
     fn prompt_text_without_process_display_is_generic() {
         assert_eq!(
-            "Enter your password to allow password access to this app:",
-            super::prompt_text(None)
+            "Enter your password to allow Monopass items access to this app:",
+            super::prompt_text(AccessScope::Items)
+        );
+    }
+
+    #[test]
+    fn settings_prompt_uses_scope_specific_title_and_copy() {
+        let metadata = super::PromptMetadata::from_display(None, AccessScope::Settings);
+
+        assert_eq!("monopass settings access requested", metadata.title);
+        assert_eq!(AccessScope::Settings, metadata.access_scope);
+        assert_eq!(
+            "Enter your password to allow Monopass settings access to this app:",
+            metadata.intro
         );
     }
 

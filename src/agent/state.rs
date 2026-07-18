@@ -24,18 +24,19 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::models::{
-    ContactResponse, CreateContactRequest, CreateField, CreateItemRequest, DirResponse, Field,
-    FieldEntry, FieldType, FileInput, FileMetadata, FileMetadataEntry, ItemResponse,
-    ItemSummaryResponse, ItemVersionSummaryResponse, JobErrorResponse, JobResponse, JobStatus,
-    JobTarget, JobType, ListDirection, PaginatedResponse, UpdateContactRequest, UpdateDirRequest,
-    UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
+    AccessScope, ContactResponse, CreateContactRequest, CreateField, CreateItemRequest,
+    DirResponse, Field, FieldEntry, FieldType, FileInput, FileMetadata, FileMetadataEntry,
+    ItemResponse, ItemSummaryResponse, ItemVersionSummaryResponse, JobErrorResponse, JobResponse,
+    JobStatus, JobTarget, JobType, ListDirection, PaginatedResponse, UpdateContactRequest,
+    UpdateDirRequest, UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
 };
 use super::process::ScopeHash;
 use crate::conceal::inferred_concealed;
 use crate::config::Config;
 use crate::db;
 use crate::settings::{
-    AUTH_TTL_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING, SettingsError, user_setting,
+    AUTH_TTL_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING, SETTINGS_AUTH_TTL_SETTING,
+    SettingsError, user_setting,
 };
 
 const SCOPE_CACHE_CAPACITY: usize = 32;
@@ -122,10 +123,21 @@ impl AgentState {
         });
     }
 
+    #[cfg(test)]
     pub async fn unlock(
         &self,
         password: Zeroizing<String>,
         scope_hash: ScopeHash,
+    ) -> Result<(), UnlockError> {
+        self.unlock_for_scope(password, scope_hash, AccessScope::Items)
+            .await
+    }
+
+    pub async fn unlock_for_scope(
+        &self,
+        password: Zeroizing<String>,
+        scope_hash: ScopeHash,
+        access_scope: AccessScope,
     ) -> Result<(), UnlockError> {
         let mut inner = self.inner.lock().await;
 
@@ -137,7 +149,7 @@ impl AgentState {
             let auth_epoch = inner.auth_epoch;
             drop(inner);
             let auth_ttl = database
-                .user_setting_duration(AUTH_TTL_SETTING)
+                .user_setting_duration(auth_ttl_setting(access_scope))
                 .await
                 .map_err(|_| UnlockError::AccessDenied)?;
             let denial_ttl = database
@@ -154,8 +166,10 @@ impl AgentState {
             }
             let now = Instant::now();
             inner.denial_ttl = denial_ttl;
-            inner.denied_scopes.remove(&scope_hash);
-            inner.authorized_scopes.insert(scope_hash, now);
+            inner.denied_scopes_mut(access_scope).remove(&scope_hash);
+            inner
+                .authorized_scopes_mut(access_scope)
+                .insert(scope_hash, now);
             inner.record_authorization_expiry(now + auth_ttl);
             return Ok(());
         }
@@ -175,7 +189,7 @@ impl AgentState {
         .map_err(|_| UnlockError::UnlockFailed)?
         .map_err(|_| UnlockError::UnlockFailed)?;
         let auth_ttl = handle
-            .user_setting_duration(AUTH_TTL_SETTING)
+            .user_setting_duration(auth_ttl_setting(access_scope))
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
         let denial_ttl = handle
@@ -188,9 +202,11 @@ impl AgentState {
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
         let now = Instant::now();
         inner.denial_ttl = denial_ttl;
-        inner.denied_scopes.remove(&scope_hash);
+        inner.denied_scopes_mut(access_scope).remove(&scope_hash);
         inner.last_authorized_database_access = Some(now);
-        inner.authorized_scopes.insert(scope_hash, now);
+        inner
+            .authorized_scopes_mut(access_scope)
+            .insert(scope_hash, now);
         inner.record_authorization_expiry(now + auth_ttl);
         Ok(())
     }
@@ -199,6 +215,7 @@ impl AgentState {
         let mut inner = self.inner.lock().await;
         inner.invalidate_auth_epoch();
         inner.authorized_scopes.clear();
+        inner.settings_authorized_scopes.clear();
         inner.max_authorization_expires_at = Some(now);
     }
 
@@ -209,21 +226,49 @@ impl AgentState {
 
     #[cfg(test)]
     pub async fn is_authorized(&self, scope_hash: &ScopeHash) -> bool {
-        self.authorization_expires_at(scope_hash).await.is_some()
+        self.is_authorized_for_scope(scope_hash, AccessScope::Items)
+            .await
     }
 
+    #[cfg(test)]
+    pub async fn is_authorized_for_scope(
+        &self,
+        scope_hash: &ScopeHash,
+        access_scope: AccessScope,
+    ) -> bool {
+        self.authorization_expires_at_for_scope(scope_hash, access_scope)
+            .await
+            .is_some()
+    }
+
+    #[cfg(test)]
     pub async fn authorization_expires_at(&self, scope_hash: &ScopeHash) -> Option<Instant> {
+        self.authorization_expires_at_for_scope(scope_hash, AccessScope::Items)
+            .await
+    }
+
+    pub async fn authorization_expires_at_for_scope(
+        &self,
+        scope_hash: &ScopeHash,
+        access_scope: AccessScope,
+    ) -> Option<Instant> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
-            .user_setting_duration(AUTH_TTL_SETTING)
+            .user_setting_duration(auth_ttl_setting(access_scope))
             .await
             .ok()?;
 
         self.inner
             .lock()
             .await
-            .authorized_scopes
+            .authorized_scopes(access_scope)
             .expires_at(scope_hash, Instant::now(), auth_ttl)
+    }
+
+    #[cfg(test)]
+    pub async fn deny_scope_hash(&self, scope_hash: ScopeHash) {
+        self.deny_scope_hash_for_scope(scope_hash, AccessScope::Items)
+            .await;
     }
 
     // Keep this condition in sync with the GUI unlock route.
@@ -232,12 +277,22 @@ impl AgentState {
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
-    pub async fn deny_scope_hash(&self, scope_hash: ScopeHash) {
+    pub async fn deny_scope_hash_for_scope(
+        &self,
+        scope_hash: ScopeHash,
+        access_scope: AccessScope,
+    ) {
         self.inner
             .lock()
             .await
-            .denied_scopes
+            .denied_scopes_mut(access_scope)
             .insert(scope_hash, Instant::now());
+    }
+
+    #[cfg(test)]
+    pub async fn is_scope_denied(&self, scope_hash: &ScopeHash) -> bool {
+        self.is_scope_denied_for_scope(scope_hash, AccessScope::Items)
+            .await
     }
 
     #[cfg(any(
@@ -245,11 +300,15 @@ impl AgentState {
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
-    pub async fn is_scope_denied(&self, scope_hash: &ScopeHash) -> bool {
+    pub async fn is_scope_denied_for_scope(
+        &self,
+        scope_hash: &ScopeHash,
+        access_scope: AccessScope,
+    ) -> bool {
         let mut inner = self.inner.lock().await;
         let denial_ttl = inner.denial_ttl;
         inner
-            .denied_scopes
+            .denied_scopes_mut(access_scope)
             .contains(scope_hash, Instant::now(), denial_ttl)
     }
 
@@ -276,7 +335,7 @@ impl AgentState {
         Ok(())
     }
 
-    pub async fn verify_settings_password(&self, password: &str) -> bool {
+    pub async fn verify_master_password(&self, password: &str) -> bool {
         let inner = self.inner.lock().await;
         inner.database.is_some()
             && inner
@@ -285,18 +344,30 @@ impl AgentState {
                 .is_some_and(|verifier| verifier.verify(password))
     }
 
+    #[cfg(test)]
     pub async fn authorize_database_access(&self, scope_hash: &ScopeHash) -> Option<DbHandle> {
+        self.authorize_database_access_for_scope(scope_hash, AccessScope::Items)
+            .await
+    }
+
+    pub async fn authorize_database_access_for_scope(
+        &self,
+        scope_hash: &ScopeHash,
+        access_scope: AccessScope,
+    ) -> Option<DbHandle> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
-            .user_setting_duration(AUTH_TTL_SETTING)
+            .user_setting_duration(auth_ttl_setting(access_scope))
             .await
             .ok()?;
 
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         let database = inner.database.clone();
-        let authorized =
-            database.is_some() && inner.authorized_scopes.contains(scope_hash, now, auth_ttl);
+        let authorized = database.is_some()
+            && inner
+                .authorized_scopes_mut(access_scope)
+                .contains(scope_hash, now, auth_ttl);
 
         if authorized {
             inner.last_authorized_database_access = Some(now);
@@ -315,6 +386,10 @@ impl AgentState {
             .user_setting_duration(AUTH_TTL_SETTING)
             .await
             .unwrap_or(Duration::ZERO);
+        let settings_auth_ttl = database
+            .user_setting_duration(SETTINGS_AUTH_TTL_SETTING)
+            .await
+            .unwrap_or(Duration::ZERO);
         let gc_interval = database
             .user_setting_duration(GC_SECONDS_SETTING)
             .await
@@ -326,7 +401,18 @@ impl AgentState {
                 return false;
             }
             inner.authorized_scopes.retain_unexpired(now, auth_ttl);
-            inner.max_authorization_expires_at = inner.authorized_scopes.max_expires_at(auth_ttl);
+            inner
+                .settings_authorized_scopes
+                .retain_unexpired(now, settings_auth_ttl);
+            inner.max_authorization_expires_at = [
+                inner.authorized_scopes.max_expires_at(auth_ttl),
+                inner
+                    .settings_authorized_scopes
+                    .max_expires_at(settings_auth_ttl),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
             let should_unload =
                 inner.database.is_some() && inner.max_authorization_expires_at.is_none();
 
@@ -372,6 +458,7 @@ impl AgentState {
         inner.database = None;
         inner.password_verifier = None;
         inner.authorized_scopes.clear();
+        inner.settings_authorized_scopes.clear();
         inner.last_authorized_database_access = None;
         inner.max_authorization_expires_at = None;
     }
@@ -396,19 +483,40 @@ impl AgentState {
 
     #[cfg(test)]
     pub async fn authorize_scope_hash(&self, scope_hash: ScopeHash) {
+        self.authorize_scope_hash_for_scope(scope_hash, AccessScope::Items)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub async fn authorize_scope_hash_for_scope(
+        &self,
+        scope_hash: ScopeHash,
+        access_scope: AccessScope,
+    ) {
         self.inner
             .lock()
             .await
-            .authorized_scopes
+            .authorized_scopes_mut(access_scope)
             .insert(scope_hash, Instant::now());
     }
 
     #[cfg(test)]
     pub async fn authorize_scope_hash_at(&self, scope_hash: ScopeHash, now: Instant) {
+        self.authorize_scope_hash_at_for_scope(scope_hash, AccessScope::Items, now)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub async fn authorize_scope_hash_at_for_scope(
+        &self,
+        scope_hash: ScopeHash,
+        access_scope: AccessScope,
+        now: Instant,
+    ) {
         self.inner
             .lock()
             .await
-            .authorized_scopes
+            .authorized_scopes_mut(access_scope)
             .insert(scope_hash, now);
     }
 
@@ -508,7 +616,9 @@ struct InnerState {
     database: Option<DbHandle>,
     password_verifier: Option<PasswordVerifier>,
     authorized_scopes: AuthCache,
+    settings_authorized_scopes: AuthCache,
     denied_scopes: AuthCache,
+    settings_denied_scopes: AuthCache,
     denial_ttl: Duration,
     last_authorized_database_access: Option<Instant>,
     max_authorization_expires_at: Option<Instant>,
@@ -528,7 +638,9 @@ impl Default for InnerState {
             database: None,
             password_verifier: None,
             authorized_scopes: AuthCache::default(),
+            settings_authorized_scopes: AuthCache::default(),
             denied_scopes: AuthCache::default(),
+            settings_denied_scopes: AuthCache::default(),
             denial_ttl,
             last_authorized_database_access: None,
             max_authorization_expires_at: None,
@@ -540,6 +652,27 @@ impl Default for InnerState {
 }
 
 impl InnerState {
+    fn authorized_scopes(&self, access_scope: AccessScope) -> &AuthCache {
+        match access_scope {
+            AccessScope::Items => &self.authorized_scopes,
+            AccessScope::Settings => &self.settings_authorized_scopes,
+        }
+    }
+
+    fn authorized_scopes_mut(&mut self, access_scope: AccessScope) -> &mut AuthCache {
+        match access_scope {
+            AccessScope::Items => &mut self.authorized_scopes,
+            AccessScope::Settings => &mut self.settings_authorized_scopes,
+        }
+    }
+
+    fn denied_scopes_mut(&mut self, access_scope: AccessScope) -> &mut AuthCache {
+        match access_scope {
+            AccessScope::Items => &mut self.denied_scopes,
+            AccessScope::Settings => &mut self.settings_denied_scopes,
+        }
+    }
+
     fn invalidate_auth_epoch(&mut self) {
         self.auth_epoch = self.auth_epoch.wrapping_add(1);
     }
@@ -549,6 +682,13 @@ impl InnerState {
             self.max_authorization_expires_at
                 .map_or(expires_at, |current| current.max(expires_at)),
         );
+    }
+}
+
+fn auth_ttl_setting(access_scope: AccessScope) -> &'static str {
+    match access_scope {
+        AccessScope::Items => AUTH_TTL_SETTING,
+        AccessScope::Settings => SETTINGS_AUTH_TTL_SETTING,
     }
 }
 
@@ -5030,10 +5170,10 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        AgentState, AuthCache, CreateContactRequest, CreateItemRequest, DATABASE_READER_WORKERS,
-        DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest, ListDirection,
-        MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, PageRequest,
-        UnlockError, UpdateContactRequest,
+        AccessScope, AgentState, AuthCache, CreateContactRequest, CreateItemRequest,
+        DATABASE_READER_WORKERS, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
+        ListDirection, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
+        PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest,
     };
     use crate::agent::process::ScopeHash;
 
@@ -5370,8 +5510,8 @@ mod tests {
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
 
-        assert!(state.verify_settings_password("correct").await);
-        assert!(!state.verify_settings_password("wrong").await);
+        assert!(state.verify_master_password("correct").await);
+        assert!(!state.verify_master_password("wrong").await);
     }
 
     #[tokio::test]
@@ -5379,7 +5519,7 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
 
-        assert!(!state.verify_settings_password("correct").await);
+        assert!(!state.verify_master_password("correct").await);
     }
 
     #[tokio::test]
@@ -5387,11 +5527,11 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         state.store_password_verifier("correct").await;
 
-        assert!(!state.verify_settings_password("correct").await);
+        assert!(!state.verify_master_password("correct").await);
     }
 
     #[tokio::test]
-    async fn settings_password_verification_does_not_authorize_or_extend_expiry() {
+    async fn master_password_verification_does_not_authorize_or_extend_expiry() {
         let state = AgentState::from_database_path("missing.db");
         let original_expiry = Instant::now() + Duration::from_secs(1);
         state.store_database_handle(DbHandle::test()).await;
@@ -5400,7 +5540,7 @@ mod tests {
             .set_max_authorization_expires_at(Some(original_expiry))
             .await;
 
-        assert!(state.verify_settings_password("correct").await);
+        assert!(state.verify_master_password("correct").await);
 
         assert!(!state.is_authorized(&ScopeHash::test(1)).await);
         assert_eq!(
@@ -5525,6 +5665,64 @@ mod tests {
                 .is_some_and(|handle| handle.ptr_eq(&database))
         );
         assert!(state.has_password_verifier().await);
+    }
+
+    #[tokio::test]
+    async fn settings_authorization_is_independent_and_uses_configured_ttl() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        state.store_database_handle(database.clone()).await;
+        state
+            .authorize_scope_hash_at_for_scope(
+                ScopeHash::test(1),
+                AccessScope::Settings,
+                Instant::now() - Duration::from_secs(2),
+            )
+            .await;
+
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(
+            state
+                .is_authorized_for_scope(&ScopeHash::test(1), AccessScope::Settings)
+                .await
+        );
+
+        database
+            .upsert_setting("user.settingsAuthTtlSeconds".to_owned(), "1".to_owned())
+            .await
+            .unwrap();
+        assert!(
+            !state
+                .is_authorized_for_scope(&ScopeHash::test(1), AccessScope::Settings)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_expiry_unload_waits_for_settings_scope() {
+        let state = AgentState::from_database_path("missing.db");
+        let now = Instant::now();
+        state.store_database_handle(DbHandle::test()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_scope_hash_at(ScopeHash::test(1), now - Duration::from_secs(900))
+            .await;
+        state
+            .authorize_scope_hash_at_for_scope(
+                ScopeHash::test(2),
+                AccessScope::Settings,
+                now - Duration::from_secs(299),
+            )
+            .await;
+
+        assert!(!state.unload_if_authorization_expired(now).await);
+        assert!(state.database_handle().await.is_some());
+        assert!(
+            state
+                .unload_if_authorization_expired(now + Duration::from_secs(1))
+                .await
+        );
+        assert!(state.database_handle().await.is_none());
     }
 
     #[tokio::test]
@@ -6074,6 +6272,11 @@ mod tests {
                 .is_ok()
         );
         assert!(
+            crate::settings::settings_auth_ttl_setting()
+                .validate(crate::settings::settings_auth_ttl_setting().default)
+                .is_ok()
+        );
+        assert!(
             crate::settings::denial_ttl_setting()
                 .validate(crate::settings::denial_ttl_setting().default)
                 .is_ok()
@@ -6091,6 +6294,16 @@ mod tests {
                 .is_err()
         );
         assert!(crate::settings::auth_ttl_setting().validate("abc").is_err());
+        assert!(
+            crate::settings::settings_auth_ttl_setting()
+                .validate("0")
+                .is_err()
+        );
+        assert!(
+            crate::settings::settings_auth_ttl_setting()
+                .validate("604801")
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -6106,6 +6319,10 @@ mod tests {
         assert_eq!(
             Some(&"1200".to_owned()),
             settings.get("user.authTtlSeconds")
+        );
+        assert_eq!(
+            Some(&"300".to_owned()),
+            settings.get("user.settingsAuthTtlSeconds")
         );
         assert_eq!(
             Some(&"60".to_owned()),

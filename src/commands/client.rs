@@ -55,6 +55,30 @@ pub enum AuthMode {
     IncludePassword,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessScope {
+    Items,
+    Settings,
+}
+
+impl AccessScope {
+    fn for_api_path(path: &str) -> Self {
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
+        if path == "/api/v1/settings" || path.starts_with("/api/v1/settings/") {
+            Self::Settings
+        } else {
+            Self::Items
+        }
+    }
+
+    fn discovery_path(self) -> &'static str {
+        match self {
+            Self::Items => "/api/v1/auth/unlock/methods",
+            Self::Settings => "/api/v1/auth/unlock/methods?scope=settings",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthUnlockMethodsResponse {
     methods: Vec<AuthUnlockMethod>,
@@ -227,7 +251,7 @@ impl<'a> Client<'a> {
         let mut password: Option<Zeroizing<String>> = None;
         let mut response = self.request(method, path, &body, content_type, None)?;
         if is_access_denied(&response) {
-            let unlock_method = self.first_unlock_method()?;
+            let unlock_method = self.first_unlock_method(AccessScope::for_api_path(path))?;
             if unlock_method.accepts_master_password {
                 let prompted = prompt()?;
                 self.unlock(&unlock_method, Some(&prompted))?;
@@ -263,10 +287,10 @@ impl<'a> Client<'a> {
         Ok(response)
     }
 
-    fn first_unlock_method(&self) -> AppResult<AuthUnlockMethod> {
+    fn first_unlock_method(&self, access_scope: AccessScope) -> AppResult<AuthUnlockMethod> {
         let response = self.request_with_client_capabilities(
             "GET",
-            "/api/v1/auth/unlock/methods",
+            access_scope.discovery_path(),
             &[],
             None,
             None,
@@ -288,7 +312,8 @@ impl<'a> Client<'a> {
 
     fn unlock(&self, method: &AuthUnlockMethod, password: Option<&str>) -> AppResult<()> {
         let path = unlock_method_api_path(&method.url)?;
-        let include_capabilities = path == "/api/v1/auth/unlock/gui";
+        let include_capabilities = path.split_once('?').map_or(path.as_str(), |(path, _)| path)
+            == "/api/v1/auth/unlock/gui";
         let response = self.request_with_client_capabilities(
             "POST",
             &path,
@@ -340,12 +365,10 @@ impl<'a> Client<'a> {
             request.push_str(content_type);
             request.push_str("\r\n");
         }
-        if include_client_capabilities {
-            if let Some(capabilities) = self.capabilities.as_deref() {
-                request.push_str("X-Client-Capabilities: ");
-                request.push_str(capabilities);
-                request.push_str("\r\n");
-            }
+        if include_client_capabilities && let Some(capabilities) = self.capabilities.as_deref() {
+            request.push_str("X-Client-Capabilities: ");
+            request.push_str(capabilities);
+            request.push_str("\r\n");
         }
         if let Some(password) = bearer_password {
             let token = Zeroizing::new(general_purpose::STANDARD.encode(password.as_bytes()));
@@ -515,7 +538,22 @@ fn api_error(response: Response) -> ApiError {
 }
 
 fn unlock_method_api_path(url: &str) -> io::Result<String> {
-    if !url.starts_with("/api/v1/auth/") || url.contains('?') || url.contains('#') {
+    if url.contains('#') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid unlock method url",
+        ));
+    }
+
+    let (path, query) = url
+        .split_once('?')
+        .map_or((url, None), |(path, query)| (path, Some(query)));
+    let valid_path = matches!(
+        path,
+        "/api/v1/auth/unlock/direct" | "/api/v1/auth/unlock/gui"
+    );
+    let valid_query = query.is_none_or(|query| matches!(query, "scope=items" | "scope=settings"));
+    if !valid_path || !valid_query {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid unlock method url",
@@ -558,6 +596,10 @@ mod tests {
             "/api/v1/auth/unlock/direct",
             unlock_method_api_path("/api/v1/auth/unlock/direct").unwrap()
         );
+        assert_eq!(
+            "/api/v1/auth/unlock/gui?scope=settings",
+            unlock_method_api_path("/api/v1/auth/unlock/gui?scope=settings").unwrap()
+        );
     }
 
     #[test]
@@ -567,6 +609,8 @@ mod tests {
             "/auth/unlock/direct",
             "/auth/unlock/direct?next=/x",
             "/api/v1/auth/unlock/direct?next=/x",
+            "/api/v1/auth/unlock/direct?scope=unknown",
+            "/api/v1/auth/unlock/direct?scope=settings&next=/x",
             "/api/v1/auth/unlock/direct#fragment",
             "/settings",
         ] {
@@ -630,6 +674,57 @@ mod tests {
         let config = test_config(server.listen_path());
 
         let response = request_with_test_prompt(&config, AuthMode::ProcessOnly);
+
+        assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn request_with_unlock_uses_settings_scope_for_settings_api() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/settings",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods?scope=settings",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct?scope=settings","accepts_master_password":true}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct?scope=settings",
+                authorization: Some(bearer("correct")),
+                client_capabilities: None,
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/settings",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("{}"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        let response = Client::with_capabilities(&config, None)
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/settings",
+                Zeroizing::new(Vec::new()),
+                None,
+                AuthMode::ProcessOnly,
+                || Ok(Zeroizing::new("correct".to_owned())),
+            )
+            .unwrap();
 
         assert_eq!(200, response.status);
         server.join();

@@ -1,13 +1,13 @@
 # Flexible Auth Spec
 
 Monopass clients discover unlock methods before attempting to authorize a
-process lineage. This lets the agent advertise multiple authentication methods
-without changing the shared client retry flow.
+process lineage for either `items` or `settings`. The scopes are independent;
+omitting `scope` defaults to `items` for backward compatibility.
 
 ## Unlock Method Discovery
 
 ```http
-GET /api/v1/auth/unlock/methods
+GET /api/v1/auth/unlock/methods?scope={items|settings}
 X-Client-Capabilities: x-session=<display>
 
 HTTP/1.1 200 OK
@@ -18,6 +18,11 @@ Content-Type: application/json
 `x-session=<DISPLAY>`. If `DISPLAY` is unset and `WAYLAND_DISPLAY` is set, they
 send `wayland-session=<WAYLAND_DISPLAY>`. Linux GUI-capable agents advertise
 GUI unlock for either accepted GUI session capability.
+
+When the discovery request explicitly includes `scope`, advertised method URLs
+carry the same query. For example, settings discovery returns
+`/api/v1/auth/unlock/gui?scope=settings`. Unqualified discovery preserves the
+existing unqualified method URLs. Unknown scopes return `400 bad_request`.
 
 macOS response:
 
@@ -69,7 +74,7 @@ must not prompt for or send the master password to a method that sets
 ## GUI Unlock
 
 ```http
-POST /api/v1/auth/unlock/gui
+POST /api/v1/auth/unlock/gui?scope={items|settings}
 X-Client-Capabilities: x-session=<display>
 
 HTTP/1.1 200 OK
@@ -80,7 +85,9 @@ for the master password in a dialog owned by the agent. The dialog identifies
 the requesting application from the authorized process chain, selecting the
 nearest caller after filtering out processes whose executable identity matches
 the running agent binary. The dialog shows the application name, executable path,
-and an icon when the platform backend can resolve one.
+and an icon when the platform backend can resolve one. Item prompts retain the
+requesting application icon. Settings prompts use a platform settings icon.
+Window titles and prompt copy identify the requested scope.
 
 Linux GUI unlock requires the same accepted GUI session capability on the GUI
 unlock request that was used for method discovery. Linux GTK and Qt variants
@@ -95,9 +102,10 @@ or closed dialog denies the unlock request without showing a retry prompt.
 Concurrent GUI unlock requests are shown as separate dialogs.
 
 Clicking the explicit **Deny** button returns `403 temporary_lockout` and caches
-that result for the process-lineage scope for `user.denialTtlSeconds`. Later GUI
-unlock requests for the scope fail with the same error without opening a dialog
-until the cache entry expires. Escape, window close, backend failure, and
+that result for the process-lineage and access-scope pair for
+`user.denialTtlSeconds`. Later GUI unlock requests for that pair fail with the
+same error without opening a dialog until the cache entry expires. Escape,
+window close, backend failure, and
 wrong-password submission do not populate the denial cache.
 
 Failures:
@@ -107,7 +115,7 @@ Failures:
 ## Direct Unlock
 
 ```http
-POST /api/v1/auth/unlock/direct
+POST /api/v1/auth/unlock/direct?scope={items|settings}
 Authorization: Bearer <standard-base64 UTF-8 password>
 
 HTTP/1.1 200 OK
@@ -116,7 +124,7 @@ HTTP/1.1 200 OK
 The direct method is the Linux fallback and the direct-only Linux agent behavior.
 It is the migrated form of the older `/auth/unlock` behavior. It validates the
 bearer master password, opens or verifies the unlocked database, and authorizes
-the caller's process-lineage scope.
+the caller's process lineage for only the requested access scope.
 
 Failures:
 - `403 access_denied`
@@ -137,3 +145,8 @@ When an auth-required request returns `403 access_denied`, the CLI:
 Secret-bearing item reads may still need the same bearer password on the retried
 original request. That behavior is controlled by the command's auth mode, not by
 method discovery.
+
+API clients accessing settings use the same retry sequence with
+`scope=settings`, then retry the settings request without a bearer password.
+The built-in CLI currently has no settings command and continues to omit scope,
+so all existing command flows remain item-scoped.

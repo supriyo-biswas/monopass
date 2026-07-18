@@ -27,10 +27,10 @@ use super::error::ApiError;
 ))]
 use super::gui_auth::PromptOutcome;
 use super::models::{
-    AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse, ContactResponse,
-    CreateContactRequest, CreateFileResponse, CreateItemRequest, JobAcceptedResponse, JobResponse,
-    JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse, UpdateContactRequest,
-    UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
+    AccessScope, AuthScopeQuery, AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse,
+    ContactResponse, CreateContactRequest, CreateFileResponse, CreateItemRequest,
+    JobAcceptedResponse, JobResponse, JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse,
+    UpdateContactRequest, UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
 #[cfg(any(
     target_os = "macos",
@@ -50,24 +50,42 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
 const CLIENT_CAPABILITIES_HEADER: &str = "x-client-capabilities";
 
-pub async fn unlock_methods(headers: HeaderMap) -> Json<AuthUnlockMethodsResponse> {
-    Json(AuthUnlockMethodsResponse {
-        methods: unlock_methods_for_headers(&headers),
-    })
+pub async fn unlock_methods(
+    headers: HeaderMap,
+    query: Result<Query<AuthScopeQuery>, QueryRejection>,
+) -> Result<Json<AuthUnlockMethodsResponse>, ApiError> {
+    let query = auth_scope_query(query)?;
+    Ok(Json(AuthUnlockMethodsResponse {
+        methods: unlock_methods_for_headers(&headers, query.scope),
+    }))
 }
 
-fn unlock_methods_for_headers(headers: &HeaderMap) -> Vec<AuthUnlockMethod> {
+fn unlock_methods_for_headers(
+    headers: &HeaderMap,
+    explicit_scope: Option<AccessScope>,
+) -> Vec<AuthUnlockMethod> {
+    let scope_query = explicit_scope
+        .map(|scope| format!("?scope={}", scope.as_str()))
+        .unwrap_or_default();
     if should_advertise_gui_unlock(headers) {
         return vec![AuthUnlockMethod {
-            url: "/api/v1/auth/unlock/gui".to_owned(),
+            url: format!("/api/v1/auth/unlock/gui{scope_query}"),
             accepts_master_password: false,
         }];
     }
 
     vec![AuthUnlockMethod {
-        url: "/api/v1/auth/unlock/direct".to_owned(),
+        url: format!("/api/v1/auth/unlock/direct{scope_query}"),
         accepts_master_password: true,
     }]
+}
+
+fn auth_scope_query(
+    query: Result<Query<AuthScopeQuery>, QueryRejection>,
+) -> Result<AuthScopeQuery, ApiError> {
+    query
+        .map(|Query(query)| query)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 #[cfg(target_os = "macos")]
@@ -110,12 +128,14 @@ pub async fn unlock_direct(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
     headers: HeaderMap,
+    query: Result<Query<AuthScopeQuery>, QueryRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let access_scope = auth_scope_query(query)?.access_scope();
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
     let password = bearer_password(&headers)?;
 
     state
-        .unlock(password, scope_hash)
+        .unlock_for_scope(password, scope_hash, access_scope)
         .await
         .map(|()| StatusCode::OK)
         .map_err(|error| match error {
@@ -133,12 +153,14 @@ pub async fn unlock_gui(
     scope_hash: Option<Extension<ScopeHash>>,
     display: Option<Extension<ProcessDisplay>>,
     headers: HeaderMap,
+    query: Result<Query<AuthScopeQuery>, QueryRejection>,
 ) -> Result<StatusCode, ApiError> {
     unlock_gui_with_prompt(
         State(state),
         scope_hash,
         display,
         headers,
+        query,
         super::gui_auth::prompt_password,
     )
     .await
@@ -153,32 +175,39 @@ async fn unlock_gui_with_prompt<F, Fut>(
     scope_hash: Option<Extension<ScopeHash>>,
     display: Option<Extension<ProcessDisplay>>,
     headers: HeaderMap,
+    query: Result<Query<AuthScopeQuery>, QueryRejection>,
     prompt: F,
 ) -> Result<StatusCode, ApiError>
 where
-    F: Fn(Option<ProcessDisplay>) -> Fut,
+    F: Fn(Option<ProcessDisplay>, AccessScope) -> Fut,
     Fut: std::future::Future<Output = PromptOutcome>,
 {
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
+    let access_scope = auth_scope_query(query)?.access_scope();
     if !gui_unlock_request_allowed(&headers) {
         return Err(ApiError::access_denied());
     }
-    if state.is_scope_denied(&scope_hash).await {
+    if state
+        .is_scope_denied_for_scope(&scope_hash, access_scope)
+        .await
+    {
         return Err(ApiError::temporary_lockout());
     }
     let display = display.map(|Extension(display)| display);
 
-    let password = match prompt(display).await {
+    let password = match prompt(display, access_scope).await {
         PromptOutcome::Allowed(password) => password,
         PromptOutcome::Denied => {
-            state.deny_scope_hash(scope_hash).await;
+            state
+                .deny_scope_hash_for_scope(scope_hash, access_scope)
+                .await;
             return Err(ApiError::temporary_lockout());
         }
         PromptOutcome::Dismissed => return Err(ApiError::access_denied()),
     };
 
     state
-        .unlock(password, scope_hash)
+        .unlock_for_scope(password, scope_hash, access_scope)
         .await
         .map(|()| StatusCode::OK)
         .map_err(|_| ApiError::access_denied())
@@ -205,10 +234,12 @@ pub async fn lock(
 pub async fn status(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
+    query: Result<Query<AuthScopeQuery>, QueryRejection>,
 ) -> Result<Json<AuthStatusResponse>, ApiError> {
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
+    let access_scope = auth_scope_query(query)?.access_scope();
     let expires_at = state
-        .authorization_expires_at(&scope_hash)
+        .authorization_expires_at_for_scope(&scope_hash, access_scope)
         .await
         .ok_or_else(ApiError::access_denied)?;
     let reauth_timestamp = reauth_timestamp(expires_at).ok_or_else(ApiError::access_denied)?;
@@ -251,7 +282,7 @@ fn bearer_password(headers: &HeaderMap) -> Result<Zeroizing<String>, ApiError> {
 
 async fn optional_bearer_password_is_valid(state: &AgentState, headers: &HeaderMap) -> bool {
     match bearer_password(headers) {
-        Ok(password) => state.verify_settings_password(&password).await,
+        Ok(password) => state.verify_master_password(&password).await,
         Err(_) => false,
     }
 }
@@ -340,15 +371,8 @@ pub async fn delete_contact(
 }
 
 pub async fn list_settings(
-    State(state): State<AgentState>,
     Extension(database): Extension<DbHandle>,
-    headers: HeaderMap,
 ) -> Result<Json<std::collections::HashMap<String, String>>, ApiError> {
-    let password = bearer_password(&headers)?;
-    if !state.verify_settings_password(&password).await {
-        return Err(ApiError::access_denied());
-    }
-
     database
         .list_settings()
         .await
@@ -360,14 +384,8 @@ pub async fn update_setting(
     State(state): State<AgentState>,
     Extension(database): Extension<DbHandle>,
     Path(name): Path<String>,
-    headers: HeaderMap,
     request: Result<Json<UpdateSettingRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let password = bearer_password(&headers)?;
-    if !state.verify_settings_password(&password).await {
-        return Err(ApiError::access_denied());
-    }
-
     let Json(request) = request.map_err(|error| ApiError::bad_request(error.to_string()))?;
     state
         .upsert_user_setting(&database, name, request.value)
@@ -988,6 +1006,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use axum::body::Body;
+    use axum::extract::rejection::QueryRejection;
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use base64::Engine;
     use base64::engine::general_purpose;
@@ -1004,7 +1023,9 @@ mod tests {
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     use crate::agent::gui_auth::PromptOutcome;
-    use crate::agent::models::{CreateContactRequest, CreateItemRequest};
+    use crate::agent::models::{
+        AccessScope, AuthScopeQuery, CreateContactRequest, CreateItemRequest,
+    };
     #[cfg(any(
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
@@ -1013,10 +1034,31 @@ mod tests {
     use crate::agent::process::ScopeHash;
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
 
+    fn default_scope_query() -> Result<axum::extract::Query<AuthScopeQuery>, QueryRejection> {
+        Ok(axum::extract::Query(AuthScopeQuery::default()))
+    }
+
+    fn scope_query(
+        scope: AccessScope,
+    ) -> Result<axum::extract::Query<AuthScopeQuery>, QueryRejection> {
+        Ok(axum::extract::Query(AuthScopeQuery { scope: Some(scope) }))
+    }
+
+    #[tokio::test]
+    async fn unlock_methods_propagates_explicit_settings_scope() {
+        let response = unlock_methods(HeaderMap::new(), scope_query(AccessScope::Settings))
+            .await
+            .unwrap();
+        let method = response.methods.first().unwrap();
+        assert!(method.url.ends_with("?scope=settings"));
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "macos"))]
     async fn unlock_methods_returns_direct_method() {
-        let response = unlock_methods(HeaderMap::new()).await;
+        let response = unlock_methods(HeaderMap::new(), default_scope_query())
+            .await
+            .unwrap();
 
         assert_eq!(
             serde_json::json!({
@@ -1034,7 +1076,9 @@ mod tests {
     #[tokio::test]
     #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
     async fn unlock_methods_returns_gui_method_for_x_session_capability() {
-        let response = unlock_methods(x_session_headers()).await;
+        let response = unlock_methods(x_session_headers(), default_scope_query())
+            .await
+            .unwrap();
 
         assert_eq!(
             serde_json::json!({
@@ -1052,7 +1096,9 @@ mod tests {
     #[tokio::test]
     #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
     async fn unlock_methods_returns_gui_method_for_wayland_session_capability() {
-        let response = unlock_methods(wayland_session_headers()).await;
+        let response = unlock_methods(wayland_session_headers(), default_scope_query())
+            .await
+            .unwrap();
 
         assert_eq!(
             serde_json::json!({
@@ -1090,7 +1136,9 @@ mod tests {
     #[tokio::test]
     #[cfg(target_os = "macos")]
     async fn unlock_methods_returns_gui_method() {
-        let response = unlock_methods(HeaderMap::new()).await;
+        let response = unlock_methods(HeaderMap::new(), default_scope_query())
+            .await
+            .unwrap();
 
         assert_eq!(
             serde_json::json!({
@@ -1113,6 +1161,7 @@ mod tests {
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             HeaderMap::new(),
+            default_scope_query(),
         )
         .await
         .unwrap_err();
@@ -1131,6 +1180,7 @@ mod tests {
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             headers,
+            default_scope_query(),
         )
         .await
         .unwrap_err();
@@ -1146,6 +1196,7 @@ mod tests {
             axum::extract::State(state),
             None,
             authorization_headers("correct"),
+            default_scope_query(),
         )
         .await
         .unwrap_err();
@@ -1164,6 +1215,7 @@ mod tests {
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             authorization_headers("wrong"),
+            default_scope_query(),
         )
         .await
         .unwrap_err();
@@ -1182,6 +1234,7 @@ mod tests {
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
             authorization_headers("correct"),
+            default_scope_query(),
         )
         .await
         .unwrap();
@@ -1203,7 +1256,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(0usize));
         let prompt = {
             let prompts = Arc::clone(&prompts);
-            move |_display: Option<ProcessDisplay>| {
+            move |_display: Option<ProcessDisplay>, _access_scope| {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
@@ -1217,6 +1270,7 @@ mod tests {
             Some(axum::Extension(ScopeHash::test(1))),
             None,
             gui_unlock_headers(),
+            default_scope_query(),
             prompt,
         )
         .await
@@ -1232,6 +1286,38 @@ mod tests {
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
+    async fn unlock_gui_settings_scope_authorizes_settings_only() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let state = AgentState::from_database_path(file.path());
+
+        super::unlock_gui_with_prompt(
+            axum::extract::State(state.clone()),
+            Some(axum::Extension(ScopeHash::test(1))),
+            None,
+            gui_unlock_headers(),
+            scope_query(AccessScope::Settings),
+            |_display, access_scope| async move {
+                assert_eq!(AccessScope::Settings, access_scope);
+                PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state
+                .is_authorized_for_scope(&ScopeHash::test(1), AccessScope::Settings)
+                .await
+        );
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+    }
+
+    #[tokio::test]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     async fn unlock_gui_wrong_password_returns_access_denied_without_retry() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
@@ -1240,7 +1326,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(0usize));
         let prompt = {
             let prompts = Arc::clone(&prompts);
-            move |_display: Option<ProcessDisplay>| {
+            move |_display: Option<ProcessDisplay>, _access_scope| {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
@@ -1255,6 +1341,7 @@ mod tests {
                 Some(axum::Extension(ScopeHash::test(1))),
                 None,
                 gui_unlock_headers(),
+                default_scope_query(),
                 &prompt,
             )
             .await
@@ -1277,7 +1364,8 @@ mod tests {
             Some(axum::Extension(ScopeHash::test(1))),
             None,
             gui_unlock_headers(),
-            |_display| async { PromptOutcome::Dismissed },
+            default_scope_query(),
+            |_display, _access_scope| async { PromptOutcome::Dismissed },
         )
         .await
         .unwrap_err();
@@ -1295,7 +1383,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(0usize));
         let prompt = {
             let prompts = Arc::clone(&prompts);
-            move |_display: Option<ProcessDisplay>| {
+            move |_display: Option<ProcessDisplay>, _access_scope| {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
@@ -1310,6 +1398,47 @@ mod tests {
                 Some(axum::Extension(scope_hash)),
                 None,
                 gui_unlock_headers(),
+                default_scope_query(),
+                &prompt,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(StatusCode::FORBIDDEN, error.status);
+        }
+
+        assert_eq!(2, *prompts.lock().unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    async fn unlock_gui_denials_are_separate_for_items_and_settings() {
+        let state = AgentState::from_database_path("missing.db");
+        let prompts = Arc::new(Mutex::new(0usize));
+        let prompt = {
+            let prompts = Arc::clone(&prompts);
+            move |_display: Option<ProcessDisplay>, _access_scope| {
+                let prompts = Arc::clone(&prompts);
+                async move {
+                    *prompts.lock().unwrap() += 1;
+                    PromptOutcome::Denied
+                }
+            }
+        };
+
+        for access_scope in [
+            AccessScope::Items,
+            AccessScope::Settings,
+            AccessScope::Items,
+        ] {
+            let error = super::unlock_gui_with_prompt(
+                axum::extract::State(state.clone()),
+                Some(axum::Extension(ScopeHash::test(1))),
+                None,
+                gui_unlock_headers(),
+                scope_query(access_scope),
                 &prompt,
             )
             .await
@@ -1330,7 +1459,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(0usize));
         let prompt = {
             let prompts = Arc::clone(&prompts);
-            move |_display: Option<ProcessDisplay>| {
+            move |_display: Option<ProcessDisplay>, _access_scope| {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
@@ -1345,6 +1474,7 @@ mod tests {
                 Some(axum::Extension(ScopeHash::test(1))),
                 None,
                 gui_unlock_headers(),
+                default_scope_query(),
                 &prompt,
             )
             .await
@@ -1362,7 +1492,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(0usize));
         let prompt = {
             let prompts = Arc::clone(&prompts);
-            move |_display: Option<ProcessDisplay>| {
+            move |_display: Option<ProcessDisplay>, _access_scope| {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
@@ -1376,6 +1506,7 @@ mod tests {
             Some(axum::Extension(ScopeHash::test(1))),
             None,
             HeaderMap::new(),
+            default_scope_query(),
             prompt,
         )
         .await
@@ -1398,6 +1529,9 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
         state.authorize_scope_hash(ScopeHash::test(1)).await;
+        state
+            .authorize_scope_hash_for_scope(ScopeHash::test(1), AccessScope::Settings)
+            .await;
 
         let response = lock(
             axum::extract::State(state.clone()),
@@ -1408,6 +1542,11 @@ mod tests {
 
         assert_eq!(StatusCode::OK, response);
         assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(
+            !state
+                .is_authorized_for_scope(&ScopeHash::test(1), AccessScope::Settings)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1474,6 +1613,7 @@ mod tests {
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(2))),
             authorization_headers("wrong"),
+            default_scope_query(),
         )
         .await
         .unwrap_err();
@@ -1492,6 +1632,7 @@ mod tests {
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(2))),
             authorization_headers("correct"),
+            default_scope_query(),
         )
         .await
         .unwrap();
@@ -1509,6 +1650,7 @@ mod tests {
         let response = status(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            default_scope_query(),
         )
         .await
         .unwrap();
@@ -1524,6 +1666,7 @@ mod tests {
             status(
                 axum::extract::State(state),
                 Some(axum::Extension(ScopeHash::test(2))),
+                default_scope_query(),
             )
             .await
             .unwrap_err()
@@ -1544,6 +1687,7 @@ mod tests {
         let response = status(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            default_scope_query(),
         )
         .await
         .unwrap();
@@ -1553,6 +1697,35 @@ mod tests {
             .with_timezone(&Utc);
         assert!(timestamp >= before + ChronoDuration::seconds(899));
         assert!(timestamp <= Utc::now() + ChronoDuration::seconds(900));
+    }
+
+    #[tokio::test]
+    async fn settings_status_uses_settings_authorization_ttl() {
+        let state = AgentState::from_database_path("missing.db");
+        let authorized_at = Instant::now();
+        let before = Utc::now();
+        state.store_database_handle(DbHandle::test()).await;
+        state
+            .authorize_scope_hash_at_for_scope(
+                ScopeHash::test(1),
+                AccessScope::Settings,
+                authorized_at,
+            )
+            .await;
+
+        let response = status(
+            axum::extract::State(state),
+            Some(axum::Extension(ScopeHash::test(1))),
+            scope_query(AccessScope::Settings),
+        )
+        .await
+        .unwrap();
+
+        let timestamp = DateTime::parse_from_rfc3339(&response.reauth_timestamp)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(timestamp >= before + ChronoDuration::seconds(299));
+        assert!(timestamp <= Utc::now() + ChronoDuration::seconds(300));
     }
 
     #[tokio::test]
@@ -1568,6 +1741,7 @@ mod tests {
         let _ = status(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            default_scope_query(),
         )
         .await
         .unwrap();
@@ -1598,6 +1772,7 @@ mod tests {
         let _ = status(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            default_scope_query(),
         )
         .await
         .unwrap();
@@ -1626,6 +1801,7 @@ mod tests {
         let error = status(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            default_scope_query(),
         )
         .await
         .unwrap_err();
@@ -1715,7 +1891,9 @@ mod tests {
     #[tokio::test]
     async fn status_missing_scope_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
-        let error = status(axum::extract::State(state), None).await.unwrap_err();
+        let error = status(axum::extract::State(state), None, default_scope_query())
+            .await
+            .unwrap_err();
 
         assert_eq!(StatusCode::FORBIDDEN, error.status);
     }

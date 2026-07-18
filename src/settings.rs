@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 pub(crate) const AUTH_TTL_SETTING: &str = "user.authTtlSeconds";
+pub(crate) const SETTINGS_AUTH_TTL_SETTING: &str = "user.settingsAuthTtlSeconds";
 pub(crate) const DENIAL_TTL_SETTING: &str = "user.denialTtlSeconds";
 pub(crate) const GC_SECONDS_SETTING: &str = "user.gcSeconds";
 
@@ -46,6 +47,12 @@ pub(crate) const USER_SETTINGS: &[UserSetting] = &[
         max_seconds: 604_800,
     },
     UserSetting {
+        name: SETTINGS_AUTH_TTL_SETTING,
+        default: "300",
+        min_seconds: 1,
+        max_seconds: 604_800,
+    },
+    UserSetting {
         name: DENIAL_TTL_SETTING,
         default: "60",
         min_seconds: 1,
@@ -69,6 +76,11 @@ pub(crate) fn user_setting(name: &str) -> Result<&'static UserSetting, SettingsE
 #[cfg(test)]
 pub(crate) fn auth_ttl_setting() -> &'static UserSetting {
     user_setting(AUTH_TTL_SETTING).expect("auth ttl setting must be registered")
+}
+
+#[cfg(test)]
+pub(crate) fn settings_auth_ttl_setting() -> &'static UserSetting {
+    user_setting(SETTINGS_AUTH_TTL_SETTING).expect("settings auth ttl setting must be registered")
 }
 
 #[cfg(test)]

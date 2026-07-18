@@ -45,6 +45,10 @@ Cached denials do not open another dialog, and the CLI does not retry the unlock
 method.
 `GET /api/v1/auth/status` may be used as a diagnostic, but never as a keepalive
 because it intentionally refreshes neither authorization nor idle state.
+The auth APIs also support `scope=settings` for settings API clients. Existing
+CLI commands omit the query and therefore retain the default `items` scope. A
+scoped discovery response may return a validated GUI or direct method URL with
+the same `scope=items|settings` query.
 
 Secret-bearing item reads can require the same bearer password on the original
 read request, even after process-lineage authorization succeeds. If `read`,

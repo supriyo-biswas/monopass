@@ -65,8 +65,6 @@ fn database_routes(state: AgentState) -> Router<AgentState> {
                 .patch(controller::update_contact)
                 .delete(controller::delete_contact),
         )
-        .route("/api/v1/settings", get(controller::list_settings))
-        .route("/api/v1/settings/{name}", put(controller::update_setting))
         .route("/api/v1/jobs/status/{job_id}", get(controller::get_job))
         .route(
             "/api/v1/jobs/import/{dir_name}/{item_name}",
@@ -109,9 +107,18 @@ fn database_routes(state: AgentState) -> Router<AgentState> {
             get(controller::get_reference),
         )
         .route_layer(middleware::from_fn_with_state(
-            state,
+            state.clone(),
             auth::require_unlocked_database,
         ))
+        .merge(
+            Router::new()
+                .route("/api/v1/settings", get(controller::list_settings))
+                .route("/api/v1/settings/{name}", put(controller::update_setting))
+                .route_layer(middleware::from_fn_with_state(
+                    state,
+                    auth::require_settings_authorization,
+                )),
+        )
 }
 
 #[cfg(test)]
@@ -128,6 +135,7 @@ mod tests {
     use tempfile::NamedTempFile;
     use tower::ServiceExt;
 
+    use crate::agent::models::AccessScope;
     use crate::agent::process::ScopeHash;
     use crate::agent::state::{AgentState, DbHandle, ITEM_READ_MUSTAUTH, MAX_FILE_UPLOAD_BYTES};
 
@@ -230,6 +238,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlock_methods_propagates_explicit_scope_and_rejects_invalid_scope() {
+        let state = AgentState::from_database_path("missing.db");
+        let router = super::auth_routes().with_state(state);
+
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
+                "/api/v1/auth/unlock/methods?scope=settings",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        let body = json_body(response).await;
+        assert!(
+            body["methods"][0]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("?scope=settings")
+        );
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/auth/unlock/methods?scope=unknown",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
+        assert_eq!("bad_request", json_body(response).await["error"]["code"]);
+    }
+
+    #[tokio::test]
     async fn old_unlock_route_is_not_available() {
         let state = AgentState::from_database_path("missing.db");
         let router = super::auth_routes().with_state(state);
@@ -291,6 +332,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn unlock_direct_settings_scope_authorizes_settings_only() {
+        let file = NamedTempFile::new().unwrap();
+        crate::db::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+        let state = AgentState::from_database_path(file.path());
+        let router = super::auth_routes()
+            .merge(super::database_routes(state.clone()))
+            .with_state(state);
+
+        let response = router
+            .clone()
+            .oneshot(post_request_with_hash_and_password(
+                "/api/v1/auth/unlock/direct?scope=settings",
+                ScopeHash::test(1),
+                "correct",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+
+        let response = router
+            .clone()
+            .oneshot(request_with_hash("/api/v1/settings", ScopeHash::test(1)))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        let response = router
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
     }
 
     #[tokio::test]
@@ -2324,7 +2399,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_api_lists_and_updates_user_settings() {
-        let state = authorized_state().await;
+        let state = settings_authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);
 
         let response = router
@@ -2341,7 +2416,8 @@ mod tests {
             json!({
                 "user.authTtlSeconds":"900",
                 "user.denialTtlSeconds":"60",
-                "user.gcSeconds":"3600"
+                "user.gcSeconds":"3600",
+                "user.settingsAuthTtlSeconds":"300"
             }),
             json_body(response).await
         );
@@ -2375,6 +2451,18 @@ mod tests {
         assert_eq!(json!({}), json_body(response).await);
 
         let response = router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/settings/user.settingsAuthTtlSeconds",
+                json!({"value":"600"}),
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+
+        let response = router
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
                 ScopeHash::test(1),
@@ -2385,45 +2473,44 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!("1200", body["user.authTtlSeconds"]);
         assert_eq!("120", body["user.denialTtlSeconds"]);
+        assert_eq!("600", body["user.settingsAuthTtlSeconds"]);
     }
 
     #[tokio::test]
-    async fn settings_api_requires_valid_bearer_password() {
+    async fn settings_api_requires_settings_authorization_instead_of_bearer_password() {
+        let state = settings_authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+        let response = router
+            .oneshot(request_with_hash("/api/v1/settings", ScopeHash::test(1)))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+
         let state = authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);
-
         let response = router
-            .clone()
-            .oneshot(request_with_hash("/api/v1/settings", ScopeHash::test(1)))
+            .oneshot(request_with_hash_and_password(
+                "/api/v1/settings",
+                ScopeHash::test(1),
+                "correct",
+            ))
             .await
             .unwrap();
         assert_eq!(StatusCode::FORBIDDEN, response.status());
         assert_eq!("access_denied", json_body(response).await["error"]["code"]);
 
-        for authorization in [
-            "Basic abc".to_owned(),
-            "Bearer !!!".to_owned(),
-            format!("Bearer {}", general_purpose::STANDARD.encode([0xff, 0xfe])),
-            format!("Bearer {}", general_purpose::STANDARD.encode("wrong")),
-            "Bearer ".to_owned(),
-        ] {
-            let response = router
-                .clone()
-                .oneshot(request_with_hash_and_authorization(
-                    "/api/v1/settings",
-                    ScopeHash::test(1),
-                    &authorization,
-                ))
-                .await
-                .unwrap();
-            assert_eq!(StatusCode::FORBIDDEN, response.status());
-            assert_eq!("access_denied", json_body(response).await["error"]["code"]);
-        }
+        let state = settings_authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+        let response = router
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
     }
 
     #[tokio::test]
     async fn settings_api_rejects_invalid_unknown_and_internal_settings() {
-        let state = authorized_state().await;
+        let state = settings_authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);
 
         for body in [json!({}), json!({"value":"abc"}), json!({"value":"0"})] {
@@ -2739,6 +2826,16 @@ mod tests {
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
         state.authorize_scope_hash(ScopeHash::test(1)).await;
+        state
+    }
+
+    async fn settings_authorized_state() -> AgentState {
+        let state = AgentState::from_database_path("missing.db");
+        state.store_database_handle(DbHandle::test()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .authorize_scope_hash_for_scope(ScopeHash::test(1), AccessScope::Settings)
+            .await;
         state
     }
 

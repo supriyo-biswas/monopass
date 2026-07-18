@@ -12,6 +12,7 @@ use http_body::{Frame, SizeHint};
 use tokio::net::UnixListener;
 
 use super::error::ApiError;
+use super::models::AccessScope;
 use super::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash};
 use super::state::{ActiveDatabaseRequest, AgentState};
 
@@ -77,14 +78,34 @@ pub async fn require_same_uid_and_gid(
 
 pub async fn require_unlocked_database(
     State(state): State<AgentState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    require_authorized_database(state, request, next, AccessScope::Items).await
+}
+
+pub async fn require_settings_authorization(
+    State(state): State<AgentState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    require_authorized_database(state, request, next, AccessScope::Settings).await
+}
+
+async fn require_authorized_database(
+    state: AgentState,
     mut request: Request,
     next: Next,
+    access_scope: AccessScope,
 ) -> Result<Response, ApiError> {
     let Some(scope_hash) = request.extensions().get::<ScopeHash>() else {
         return Err(ApiError::access_denied());
     };
 
-    if let Some(database) = state.authorize_database_access(scope_hash).await {
+    if let Some(database) = state
+        .authorize_database_access_for_scope(scope_hash, access_scope)
+        .await
+    {
         let active_request = state.begin_active_database_request();
         request.extensions_mut().insert(database);
         let response = next.run(request).await;

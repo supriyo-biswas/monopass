@@ -2,6 +2,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::secret::SecretString;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessScope {
+    #[default]
+    Items,
+    Settings,
+}
+
+impl AccessScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Items => "items",
+            Self::Settings => "settings",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct AuthScopeQuery {
+    pub scope: Option<AccessScope>,
+}
+
+impl AuthScopeQuery {
+    pub fn access_scope(self) -> AccessScope {
+        self.scope.unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthStatusResponse {
     #[serde(rename = "reauth_timestamp")]
