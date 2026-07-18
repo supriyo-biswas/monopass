@@ -21,6 +21,7 @@ mod pubkey;
 mod pwgen;
 mod read;
 mod run;
+mod settings;
 mod share;
 mod totp;
 mod transfer;
@@ -76,6 +77,12 @@ pub enum Command {
     Show(item::ShowArgs),
     #[command(name = "ls-contacts", about = "List contacts")]
     ListContacts,
+    #[command(name = "ls-settings", about = "List settings")]
+    ListSettings,
+    #[command(name = "read-setting", about = "Read a setting")]
+    ReadSetting(settings::ReadArgs),
+    #[command(name = "write-setting", about = "Write a setting")]
+    WriteSetting(settings::WriteArgs),
     #[command(name = "add-contact", about = "Add a contact")]
     AddContact(contact::AddArgs),
     #[command(name = "edit-contact", about = "Edit a contact")]
@@ -113,6 +120,9 @@ pub fn run(config: &Config, command: Command) -> AppResult {
         Command::Restore(args) => item::restore(config, args),
         Command::Show(args) => item::show(config, args),
         Command::ListContacts => contact::list(config),
+        Command::ListSettings => settings::list(config),
+        Command::ReadSetting(args) => settings::read(config, args),
+        Command::WriteSetting(args) => settings::write(config, args),
         Command::AddContact(args) => contact::add(config, args),
         Command::EditContact(args) => contact::edit(config, args),
         Command::RemoveContact(args) => contact::remove(config, args),

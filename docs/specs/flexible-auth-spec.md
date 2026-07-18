@@ -148,5 +148,6 @@ method discovery.
 
 API clients accessing settings use the same retry sequence with
 `scope=settings`, then retry the settings request without a bearer password.
-The built-in CLI currently has no settings command and continues to omit scope,
-so all existing command flows remain item-scoped.
+The built-in `ls-settings`, `read-setting`, and `write-setting` commands use
+settings API paths and therefore follow this settings-scoped flow. Other
+built-in command flows remain item-scoped.

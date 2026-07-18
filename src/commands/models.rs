@@ -84,6 +84,11 @@ pub struct UpdateContactRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSettingRequest {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemResponse {
     pub name: String,
     pub created_at: String,

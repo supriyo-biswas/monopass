@@ -100,6 +100,28 @@ schedule the unlocked database for unload on the agent's next authorization
 expiry sweep. The command does not prompt for the master password when the
 agent returns `403 access_denied`.
 
+## settings commands
+
+```text
+monopass ls-settings
+monopass read-setting <name>
+monopass write-setting <name> <value>
+```
+
+All settings commands require settings-scoped process-lineage authorization and
+use the settings unlock discovery flow. Names are exact full setting names such
+as `user.trustedProgramPaths`; the CLI does not add a `user.` prefix.
+
+`ls-settings` calls `GET /api/v1/settings`, sorts the response by name, and
+prints one tab-separated `<name>\t<value>` row per setting. `read-setting` calls
+the same endpoint, prints the selected raw string value, and fails locally when
+the name is absent. Both commands append a newline to each printed value.
+
+`write-setting` calls `PUT /api/v1/settings/{name}` with
+`{ "value": "<value>" }`, where the path component is percent-encoded and the
+argument is passed through unchanged. It produces no output on success. The
+agent remains responsible for rejecting unknown settings and invalid values.
+
 ## init command
 
 ```

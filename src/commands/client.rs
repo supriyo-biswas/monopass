@@ -575,7 +575,9 @@ mod tests {
     use base64::engine::general_purpose;
     use zeroize::Zeroizing;
 
-    use super::{AuthMode, AuthUnlockMethodsResponse, Client, Response, unlock_method_api_path};
+    use super::{
+        AccessScope, AuthMode, AuthUnlockMethodsResponse, Client, Response, unlock_method_api_path,
+    };
     use crate::config::Config;
 
     #[test]
@@ -588,6 +590,22 @@ mod tests {
         let method = response.methods.first().unwrap();
         assert_eq!("/api/v1/auth/unlock/direct", method.url);
         assert!(method.accepts_master_password);
+    }
+
+    #[test]
+    fn settings_collection_and_member_paths_use_settings_scope() {
+        assert_eq!(
+            AccessScope::Settings,
+            AccessScope::for_api_path("/api/v1/settings")
+        );
+        assert_eq!(
+            AccessScope::Settings,
+            AccessScope::for_api_path("/api/v1/settings/user.authTtlSeconds")
+        );
+        assert_eq!(
+            AccessScope::Items,
+            AccessScope::for_api_path("/api/v1/dirs")
+        );
     }
 
     #[test]
