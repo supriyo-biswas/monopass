@@ -392,6 +392,7 @@ mod tests {
         assert_internal_age_keypair_exists(&conn);
         assert_setting_missing(&conn, "sys.fileEncryptionKey");
         assert_setting_value(&conn, "user.authTtlSeconds", "900");
+        assert_setting_value(&conn, "user.denialTtlSeconds", "60");
         assert_setting_value(&conn, "user.gcSeconds", "3600");
     }
 
@@ -447,6 +448,7 @@ mod tests {
 
         assert_eq!(1, pragma_i64(&conn, "user_version"));
         assert_setting_value(&conn, "user.authTtlSeconds", "900");
+        assert_setting_value(&conn, "user.denialTtlSeconds", "60");
         assert_setting_value(&conn, "user.gcSeconds", "3600");
     }
 

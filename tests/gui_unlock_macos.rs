@@ -50,7 +50,7 @@ fn gui_unlock_concurrent_requests_use_independent_windows() {
 
 #[test]
 #[ignore = "requires a real macOS GUI session and Accessibility permission for System Events"]
-fn gui_unlock_deny_or_wrong_password_does_not_retry() {
+fn gui_unlock_deny_is_remembered_for_process_lineage() {
     let env = TestEnv::new();
     env.init_vault();
     let mut agent = env.start_agent();
@@ -58,13 +58,49 @@ fn gui_unlock_deny_or_wrong_password_does_not_retry() {
     let mut denied = env.client("ls");
     wait_for_prompt_count(1, &mut [&mut denied]);
     submit_prompt("", PromptAction::Deny);
-    assert_child_failure(&mut denied);
+    assert_child_failure_containing(&mut denied, "temporarily locked out after denial");
     assert_prompt_count(0);
+
+    let mut suppressed = env.client("ls");
+    assert_child_failure_containing(&mut suppressed, "temporarily locked out after denial");
+    assert_prompt_count(0);
+
+    agent.stop();
+}
+
+#[test]
+#[ignore = "requires a real macOS GUI session and Accessibility permission for System Events"]
+fn gui_unlock_wrong_password_does_not_retry() {
+    let env = TestEnv::new();
+    env.init_vault();
+    let mut agent = env.start_agent();
 
     let mut wrong = env.client("ls");
     wait_for_prompt_count(1, &mut [&mut wrong]);
     submit_prompt("wrong password", PromptAction::Allow);
     assert_child_failure(&mut wrong);
+    assert_prompt_count(0);
+
+    agent.stop();
+}
+
+#[test]
+#[ignore = "requires a real macOS GUI session and Accessibility permission for System Events"]
+fn gui_unlock_escape_dismissal_is_not_remembered() {
+    let env = TestEnv::new();
+    env.init_vault();
+    let mut agent = env.start_agent();
+
+    let mut dismissed = env.client("ls");
+    wait_for_prompt_count(1, &mut [&mut dismissed]);
+    dismiss_prompt_with_escape();
+    assert_child_failure(&mut dismissed);
+    assert_prompt_count(0);
+
+    let mut prompted_again = env.client("ls");
+    wait_for_prompt_count(1, &mut [&mut prompted_again]);
+    submit_prompt("", PromptAction::Deny);
+    assert_child_failure(&mut prompted_again);
     assert_prompt_count(0);
 
     agent.stop();
@@ -237,6 +273,19 @@ fn assert_child_failure(child: &mut Child) {
     );
 }
 
+fn assert_child_failure_containing(child: &mut Child, expected: &str) {
+    let status = wait_child(child, Duration::from_secs(10));
+    let output = child_output(child);
+    assert!(
+        !status.success(),
+        "expected failure, got {status}; output: {output}"
+    );
+    assert!(
+        output.contains(expected),
+        "expected output to contain {expected:?}; output: {output}"
+    );
+}
+
 fn child_output(child: &mut Child) -> String {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -343,6 +392,26 @@ tell application "System Events"
           end if
           click button "{button}"
         end tell
+        return
+      end if
+    end tell
+  end repeat
+  error "prompt window not found"
+end tell
+"#
+    );
+    osascript(&script);
+}
+
+fn dismiss_prompt_with_escape() {
+    let script = format!(
+        r#"
+tell application "System Events"
+  repeat with appProcess in (processes whose name is "monopass")
+    tell appProcess
+      if exists window "{WINDOW_TITLE}" then
+        set frontmost to true
+        key code 53
         return
       end if
     end tell

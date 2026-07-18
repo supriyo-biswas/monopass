@@ -95,8 +95,18 @@ in-process GTK4 or Qt Quick/QML SDK dialogs with forced X11 backend usage. A
 wrong password, cancelled dialog, or closed dialog denies the request.
 Concurrent GUI unlock requests are displayed as separate dialogs.
 
+Clicking the explicit **Deny** button records a denial for the requesting
+process-lineage scope. Until `user.denialTtlSeconds` expires, later GUI unlock
+requests for that scope return `403 temporary_lockout` without displaying
+another dialog. The Deny-button response itself uses the same error. Other
+scopes remain unaffected. Escape, window close, prompt backend
+failure, and wrong-password submission do not create a cached denial. A
+successful unlock clears any denial for that scope. Denials are memory-only,
+survive database lock and idle unload, and are cleared when the agent exits.
+
 Failure:
 - `403 access_denied`
+- `403 temporary_lockout`
 
 On Linux direct-only builds or clients without an accepted GUI capability, the advertised method is:
 
@@ -171,10 +181,15 @@ under `user.*` names:
 | Name | Default | Allowed values |
 | --- | --- | --- |
 | `user.authTtlSeconds` | `900` | integer seconds, `1..=604800` |
+| `user.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
 | `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
 
 `user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
-effect immediately for new and existing cached authorizations. `user.gcSeconds`
+effect immediately for new and existing cached authorizations.
+`user.denialTtlSeconds` controls explicit GUI denial TTL. The agent uses 60
+seconds until the encrypted setting is first loaded by a successful unlock,
+then keeps the loaded value in memory through later database unloads. Changes
+take effect immediately for new and existing cached denials. `user.gcSeconds`
 controls the best-effort idle cleanup cadence.
 
 ### List Settings
@@ -188,6 +203,7 @@ Content-Type: application/json
 
 {
   "user.authTtlSeconds": "900",
+  "user.denialTtlSeconds": "60",
   "user.gcSeconds": "3600"
 }
 ```
@@ -829,6 +845,7 @@ Structured errors:
 
 Codes:
 - `access_denied` -> 403
+- `temporary_lockout` -> 403
 - `unlock_failed` -> 403
 - `bad_request` -> 400
 - `not_found` -> 404
@@ -848,6 +865,7 @@ CREATE TABLE system_settings (
 INSERT INTO system_settings (name, value)
 VALUES
   ('user.authTtlSeconds', '900'),
+  ('user.denialTtlSeconds', '60'),
   ('user.gcSeconds', '3600');
 
 -- Init also creates:

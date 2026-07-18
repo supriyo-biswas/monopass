@@ -22,6 +22,13 @@ pub enum ApiErrorCode {
     Conflict,
     InternalError,
     NotFound,
+    // Keep this condition in sync with the GUI unlock route.
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    TemporaryLockout,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     UnlockFailed,
 }
@@ -43,6 +50,20 @@ impl ApiError {
                 },
             },
         }
+    }
+
+    // Keep this condition in sync with the GUI unlock route.
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    pub fn temporary_lockout() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            ApiErrorCode::TemporaryLockout,
+            "temporarily locked out after denial",
+        )
     }
 
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -112,6 +133,21 @@ mod tests {
             ApiError::access_denied(),
             StatusCode::FORBIDDEN,
             json!({"error":{"code":"access_denied","message":"access denied"}}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serializes_temporary_lockout() {
+        assert_error_response(
+            ApiError::temporary_lockout(),
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": {
+                    "code": "temporary_lockout",
+                    "message": "temporarily locked out after denial"
+                }
+            }),
         )
         .await;
     }

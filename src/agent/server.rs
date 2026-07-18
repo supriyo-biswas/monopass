@@ -2338,7 +2338,11 @@ mod tests {
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
         assert_eq!(
-            json!({"user.authTtlSeconds":"900","user.gcSeconds":"3600"}),
+            json!({
+                "user.authTtlSeconds":"900",
+                "user.denialTtlSeconds":"60",
+                "user.gcSeconds":"3600"
+            }),
             json_body(response).await
         );
 
@@ -2357,6 +2361,20 @@ mod tests {
         assert_eq!(json!({}), json_body(response).await);
 
         let response = router
+            .clone()
+            .oneshot(json_request_with_hash_and_password(
+                "PUT",
+                "/api/v1/settings/user.denialTtlSeconds",
+                json!({"value":"120"}),
+                ScopeHash::test(1),
+                "correct",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(json!({}), json_body(response).await);
+
+        let response = router
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
                 ScopeHash::test(1),
@@ -2364,7 +2382,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!("1200", json_body(response).await["user.authTtlSeconds"]);
+        let body = json_body(response).await;
+        assert_eq!("1200", body["user.authTtlSeconds"]);
+        assert_eq!("120", body["user.denialTtlSeconds"]);
     }
 
     #[tokio::test]

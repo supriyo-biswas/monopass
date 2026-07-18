@@ -85,6 +85,31 @@ fn gui_unlock_cancel_or_wrong_password_does_not_retry() {
     agent.stop();
 }
 
+#[test]
+#[ignore = "requires an X11 DISPLAY and xdotool"]
+fn gui_unlock_deny_is_remembered_for_process_lineage() {
+    let _guard = gui_test_lock();
+    if !linux_gui_available() {
+        return;
+    }
+
+    let env = TestEnv::new();
+    env.init_vault();
+    let mut agent = env.start_agent();
+
+    let mut denied = env.client("ls");
+    wait_for_prompt_count(1, &mut [&mut denied], &mut agent);
+    submit_prompt("", PromptAction::Deny);
+    assert_child_failure_containing(&mut denied, "temporarily locked out after denial");
+    assert_prompt_count(0);
+
+    let mut suppressed = env.client("ls");
+    assert_child_failure_containing(&mut suppressed, "temporarily locked out after denial");
+    assert_prompt_count(0);
+
+    agent.stop();
+}
+
 struct TestEnv {
     _root: tempfile::TempDir,
     runtime: tempfile::TempDir,
@@ -216,6 +241,7 @@ impl Drop for AgentGuard {
 enum PromptAction {
     Allow,
     Cancel,
+    Deny,
 }
 
 fn binary() -> &'static Path {
@@ -324,6 +350,19 @@ fn assert_child_failure(child: &mut Child) {
     assert!(
         !status.success(),
         "expected failure, got {status}; output: {output}"
+    );
+}
+
+fn assert_child_failure_containing(child: &mut Child, expected: &str) {
+    let status = wait_child(child, Duration::from_secs(10));
+    let output = child_output(child);
+    assert!(
+        !status.success(),
+        "expected failure, got {status}; output: {output}"
+    );
+    assert!(
+        output.contains(expected),
+        "expected output to contain {expected:?}; output: {output}"
     );
 }
 
@@ -478,6 +517,11 @@ fn submit_prompt(password: &str, action: PromptAction) {
                     );
                 }
             }
+        }
+        PromptAction::Deny => {
+            run_xdotool(&["windowfocus", "--sync", &window]);
+            run_xdotool(&["key", "Tab"]);
+            run_xdotool(&["key", "Return"]);
         }
     }
 }

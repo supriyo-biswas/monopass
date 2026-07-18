@@ -38,6 +38,11 @@ password buffer. When the selected method has `accepts_master_password: false`,
 call it without prompting locally or sending a bearer password. Retry the
 original request once after a successful unlock method call. Treat
 `403 unlock_failed` and a second `403 access_denied` as command failure.
+If the user explicitly denies GUI access, or that denial is already cached for
+the caller's process lineage, the GUI unlock method returns
+`403 temporary_lockout` with message `temporarily locked out after denial`.
+Cached denials do not open another dialog, and the CLI does not retry the unlock
+method.
 `GET /api/v1/auth/status` may be used as a diagnostic, but never as a keepalive
 because it intentionally refreshes neither authorization nor idle state.
 

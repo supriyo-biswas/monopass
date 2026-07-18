@@ -15,6 +15,12 @@ use super::process::ProcessDisplay;
 
 pub(crate) type PromptRequestReceiver = mpsc::Receiver<PromptRequest>;
 
+pub(crate) enum PromptOutcome {
+    Allowed(Zeroizing<String>),
+    Denied,
+    Dismissed,
+}
+
 static PROMPT_DISPATCHER: OnceLock<PromptRequestSender> = OnceLock::new();
 
 #[derive(Clone)]
@@ -22,7 +28,7 @@ struct PromptRequestSender(mpsc::Sender<PromptRequest>);
 
 pub(crate) struct PromptRequest {
     display: Option<ProcessDisplay>,
-    response: oneshot::Sender<Option<Zeroizing<String>>>,
+    response: oneshot::Sender<PromptOutcome>,
 }
 
 pub(crate) fn install_prompt_dispatcher() -> PromptRequestReceiver {
@@ -31,26 +37,30 @@ pub(crate) fn install_prompt_dispatcher() -> PromptRequestReceiver {
     receiver
 }
 
-pub(crate) async fn prompt_password(display: Option<ProcessDisplay>) -> Option<Zeroizing<String>> {
+pub(crate) async fn prompt_password(display: Option<ProcessDisplay>) -> PromptOutcome {
     prompt_password_with(display, dispatch_prompt).await
 }
 
 pub(crate) async fn prompt_password_with<F, Fut>(
     display: Option<ProcessDisplay>,
     prompt: F,
-) -> Option<Zeroizing<String>>
+) -> PromptOutcome
 where
     F: FnOnce(Option<ProcessDisplay>) -> Fut,
-    Fut: std::future::Future<Output = Option<Zeroizing<String>>>,
+    Fut: std::future::Future<Output = PromptOutcome>,
 {
     prompt(display).await
 }
 
-async fn dispatch_prompt(display: Option<ProcessDisplay>) -> Option<Zeroizing<String>> {
-    let sender = PROMPT_DISPATCHER.get()?.clone();
+async fn dispatch_prompt(display: Option<ProcessDisplay>) -> PromptOutcome {
+    let Some(sender) = PROMPT_DISPATCHER.get().cloned() else {
+        return PromptOutcome::Dismissed;
+    };
     let (response, receiver) = oneshot::channel();
-    sender.0.send(PromptRequest { display, response }).ok()?;
-    receiver.await.ok().flatten()
+    if sender.0.send(PromptRequest { display, response }).is_err() {
+        return PromptOutcome::Dismissed;
+    }
+    receiver.await.unwrap_or(PromptOutcome::Dismissed)
 }
 
 pub(crate) fn run_prompt_dispatcher<T>(receiver: PromptRequestReceiver, server: &JoinHandle<T>) {
@@ -101,7 +111,7 @@ fn run_prompt_dispatcher_inner<T>(receiver: PromptRequestReceiver, server: &Join
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(request) => {
-                let _ = request.response.send(None);
+                let _ = request.response.send(PromptOutcome::Dismissed);
             }
             Err(mpsc::RecvTimeoutError::Timeout) if server.is_finished() => break,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -147,7 +157,7 @@ fn pump_appkit_once(mtm: objc2_foundation::MainThreadMarker) {
 #[cfg(target_os = "macos")]
 fn close_prompts(prompts: &[objc2::rc::Retained<PromptController>]) {
     for prompt in prompts {
-        prompt.finish(None);
+        prompt.finish(PromptOutcome::Dismissed);
     }
 }
 
@@ -164,7 +174,7 @@ mod linux_prompt {
     use gtk4 as gtk;
     use zeroize::Zeroizing;
 
-    use super::{PromptMetadata, PromptRequest, PromptRequestReceiver};
+    use super::{PromptMetadata, PromptOutcome, PromptRequest, PromptRequestReceiver};
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -229,7 +239,7 @@ mod linux_prompt {
         loop {
             match receiver.recv_timeout(Duration::from_millis(250)) {
                 Ok(request) => {
-                    let _ = request.response.send(None);
+                    let _ = request.response.send(PromptOutcome::Dismissed);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if server.is_finished() => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -240,14 +250,14 @@ mod linux_prompt {
 
     fn close_prompts(prompts: &[GtkPrompt]) {
         for prompt in prompts {
-            prompt.finish(None);
+            prompt.finish(PromptOutcome::Dismissed);
         }
     }
 
     struct GtkPrompt {
         window: gtk::Window,
         finished: Rc<Cell<bool>>,
-        response: Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<Zeroizing<String>>>>>>,
+        response: Rc<RefCell<Option<tokio::sync::oneshot::Sender<PromptOutcome>>>>,
     }
 
     impl GtkPrompt {
@@ -278,8 +288,8 @@ mod linux_prompt {
             }
         }
 
-        fn finish(&self, password: Option<Zeroizing<String>>) {
-            finish_prompt(&self.window, &self.finished, &self.response, password);
+        fn finish(&self, outcome: PromptOutcome) {
+            finish_prompt(&self.window, &self.finished, &self.response, outcome);
         }
 
         fn is_finished(&self) -> bool {
@@ -384,7 +394,7 @@ mod linux_prompt {
         allow: &gtk::Button,
         deny: &gtk::Button,
         finished: Rc<Cell<bool>>,
-        response: Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<Zeroizing<String>>>>>>,
+        response: Rc<RefCell<Option<tokio::sync::oneshot::Sender<PromptOutcome>>>>,
     ) {
         let allow_window = window.clone();
         let allow_finished = Rc::clone(&finished);
@@ -397,7 +407,7 @@ mod linux_prompt {
                 &allow_window,
                 &allow_finished,
                 &allow_response,
-                Some(Zeroizing::new(password_text)),
+                PromptOutcome::Allowed(Zeroizing::new(password_text)),
             );
         });
 
@@ -411,7 +421,7 @@ mod linux_prompt {
                 &activate_window,
                 &activate_finished,
                 &activate_response,
-                Some(Zeroizing::new(password_text)),
+                PromptOutcome::Allowed(Zeroizing::new(password_text)),
             );
         });
 
@@ -419,13 +429,23 @@ mod linux_prompt {
         let deny_finished = Rc::clone(&finished);
         let deny_response = Rc::clone(&response);
         deny.connect_clicked(move |_| {
-            finish_prompt(&deny_window, &deny_finished, &deny_response, None);
+            finish_prompt(
+                &deny_window,
+                &deny_finished,
+                &deny_response,
+                PromptOutcome::Denied,
+            );
         });
 
         let close_finished = Rc::clone(&finished);
         let close_response = Rc::clone(&response);
         window.connect_close_request(move |window| {
-            finish_prompt(window, &close_finished, &close_response, None);
+            finish_prompt(
+                window,
+                &close_finished,
+                &close_response,
+                PromptOutcome::Dismissed,
+            );
             glib::Propagation::Proceed
         });
 
@@ -435,7 +455,12 @@ mod linux_prompt {
         let escape_response = Rc::clone(&response);
         escape.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
-                finish_prompt(&escape_window, &escape_finished, &escape_response, None);
+                finish_prompt(
+                    &escape_window,
+                    &escape_finished,
+                    &escape_response,
+                    PromptOutcome::Dismissed,
+                );
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -446,14 +471,14 @@ mod linux_prompt {
     fn finish_prompt(
         window: &gtk::Window,
         finished: &Rc<Cell<bool>>,
-        response: &Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<Zeroizing<String>>>>>>,
-        password: Option<Zeroizing<String>>,
+        response: &Rc<RefCell<Option<tokio::sync::oneshot::Sender<PromptOutcome>>>>,
+        outcome: PromptOutcome,
     ) {
         if finished.replace(true) {
             return;
         }
         if let Some(response) = response.borrow_mut().take() {
-            let _ = response.send(password);
+            let _ = response.send(outcome);
         }
         window.close();
     }
@@ -473,7 +498,7 @@ mod linux_prompt {
     use qmetaobject::{QObjectPinned, prelude::*};
     use zeroize::Zeroizing;
 
-    use super::{PromptMetadata, PromptRequestReceiver};
+    use super::{PromptMetadata, PromptOutcome, PromptRequestReceiver};
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -524,7 +549,7 @@ mod linux_prompt {
     struct QtPromptState {
         receiver: PromptRequestReceiver,
         done_receiver: mpsc::Receiver<()>,
-        pending: HashMap<u32, tokio::sync::oneshot::Sender<Option<Zeroizing<String>>>>,
+        pending: HashMap<u32, tokio::sync::oneshot::Sender<PromptOutcome>>,
         next_id: u32,
         receiver_disconnected: bool,
         server_done: bool,
@@ -576,22 +601,28 @@ mod linux_prompt {
 
         fn allow(&mut self, id: u32, password: QString) {
             if let Some(response) = self.pending.remove(&id) {
-                let _ = response.send(Some(Zeroizing::new(password.to_string())));
+                let _ = response.send(PromptOutcome::Allowed(Zeroizing::new(password.to_string())));
             }
         }
 
         fn deny(&mut self, id: u32) {
             if let Some(response) = self.pending.remove(&id) {
-                let _ = response.send(None);
+                let _ = response.send(PromptOutcome::Denied);
+            }
+        }
+
+        fn dismiss(&mut self, id: u32) {
+            if let Some(response) = self.pending.remove(&id) {
+                let _ = response.send(PromptOutcome::Dismissed);
             }
         }
 
         fn deny_all(&mut self) {
             for (_, response) in self.pending.drain() {
-                let _ = response.send(None);
+                let _ = response.send(PromptOutcome::Dismissed);
             }
             while let Ok(request) = self.receiver.try_recv() {
-                let _ = request.response.send(None);
+                let _ = request.response.send(PromptOutcome::Dismissed);
             }
         }
     }
@@ -713,6 +744,7 @@ mod linux_prompt {
         should_quit: qt_method!(fn(&self) -> bool),
         allow: qt_method!(fn(&self, id: u32, password: QString)),
         deny: qt_method!(fn(&self, id: u32)),
+        dismiss: qt_method!(fn(&self, id: u32)),
         prompt_id: qt_method!(fn(&self) -> u32),
         intro: qt_method!(fn(&self) -> QString),
         app_name: qt_method!(fn(&self) -> QString),
@@ -752,6 +784,14 @@ mod linux_prompt {
             STATE.with(|state| {
                 if let Some(state) = state.borrow_mut().as_mut() {
                     state.deny(id);
+                }
+            });
+        }
+
+        fn dismiss(&self, id: u32) {
+            STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    state.dismiss(id);
                 }
             });
         }
@@ -871,6 +911,15 @@ Window {
                 prompt.close()
             }
 
+            function dismissPrompt() {
+                password.text = ""
+                if (!prompt.completed) {
+                    _promptBridge.dismiss(prompt.promptId)
+                    prompt.completed = true
+                }
+                prompt.close()
+            }
+
             function allowPrompt() {
                 var submitted = password.text
                 password.text = ""
@@ -907,14 +956,14 @@ Window {
 
             onClosing: {
                 if (!completed) {
-                    _promptBridge.deny(promptId)
+                    _promptBridge.dismiss(promptId)
                     completed = true
                 }
             }
 
             onVisibleChanged: {
                 if (!visible && !completed) {
-                    _promptBridge.deny(promptId)
+                    _promptBridge.dismiss(promptId)
                     completed = true
                 }
                 if (!visible) {
@@ -945,7 +994,7 @@ Window {
 
             Shortcut {
                 sequence: "Esc"
-                onActivated: prompt.denyPrompt()
+                onActivated: prompt.dismissPrompt()
             }
 
             ColumnLayout {
@@ -1057,7 +1106,7 @@ mod appkit_prompt {
     use tokio::sync::oneshot;
     use zeroize::Zeroizing;
 
-    use super::{PromptMetadata, PromptRequest, path_to_string};
+    use super::{PromptMetadata, PromptOutcome, PromptRequest, path_to_string};
 
     const WINDOW_WIDTH: f64 = 460.0;
     const WINDOW_HEIGHT: f64 = 196.0;
@@ -1073,7 +1122,7 @@ mod appkit_prompt {
 
     #[derive(Default)]
     struct PromptControllerState {
-        response: Option<oneshot::Sender<Option<Zeroizing<String>>>>,
+        response: Option<oneshot::Sender<PromptOutcome>>,
         window: Option<Retained<NSWindow>>,
         field: Option<Retained<NSSecureTextField>>,
         finished: bool,
@@ -1097,19 +1146,24 @@ mod appkit_prompt {
                 let password = {
                     let state = self.ivars().state.borrow();
                     let Some(field) = state.field.as_ref() else {
-                        return self.finish(None);
+                        return self.finish(PromptOutcome::Dismissed);
                     };
                     let password = field.stringValue().to_string();
                     field.setStringValue(ns_string!(""));
                     Zeroizing::new(password)
                 };
 
-                self.finish(Some(password));
+                self.finish(PromptOutcome::Allowed(password));
             }
 
             #[unsafe(method(deny:))]
             fn deny(&self, _sender: Option<&NSObject>) {
-                self.finish(None);
+                self.finish(PromptOutcome::Denied);
+            }
+
+            #[unsafe(method(dismiss:))]
+            fn dismiss(&self, _sender: Option<&NSObject>) {
+                self.finish(PromptOutcome::Dismissed);
             }
         }
 
@@ -1117,7 +1171,7 @@ mod appkit_prompt {
         unsafe impl NSWindowDelegate for PromptController {
             #[unsafe(method(windowWillClose:))]
             fn window_will_close(&self, _notification: &NSNotification) {
-                self.finish(None);
+                self.finish(PromptOutcome::Dismissed);
             }
         }
     );
@@ -1146,10 +1200,7 @@ mod appkit_prompt {
             controller
         }
 
-        fn new(
-            response: oneshot::Sender<Option<Zeroizing<String>>>,
-            mtm: MainThreadMarker,
-        ) -> Retained<Self> {
+        fn new(response: oneshot::Sender<PromptOutcome>, mtm: MainThreadMarker) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(PromptControllerIvars {
                 state: RefCell::new(PromptControllerState {
                     response: Some(response),
@@ -1161,7 +1212,7 @@ mod appkit_prompt {
             unsafe { msg_send![super(this), init] }
         }
 
-        pub(super) fn finish(&self, password: Option<Zeroizing<String>>) {
+        pub(super) fn finish(&self, outcome: PromptOutcome) {
             let (response, window) = {
                 let mut state = self.ivars().state.borrow_mut();
                 if state.finished {
@@ -1177,7 +1228,7 @@ mod appkit_prompt {
             };
 
             if let Some(response) = response {
-                let _ = response.send(password);
+                let _ = response.send(outcome);
             }
 
             if let Some(window) = window {
@@ -1317,8 +1368,22 @@ mod appkit_prompt {
             ),
             NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT),
         ));
-        deny.setKeyEquivalent(ns_string!("\u{1b}"));
         content.addSubview(&deny);
+
+        let dismiss = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!(""),
+                Some(&**controller),
+                Some(sel!(dismiss:)),
+                mtm,
+            )
+        };
+        dismiss.setFrame(NSRect::new(
+            NSPoint::new(-100.0, -100.0),
+            NSSize::new(1.0, 1.0),
+        ));
+        dismiss.setKeyEquivalent(ns_string!("\u{1b}"));
+        content.addSubview(&dismiss);
 
         let allow = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -1504,11 +1569,13 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_password_with_allows_fake_prompt_injection() {
-        let password = super::prompt_password_with(None, |_| async {
-            Some(Zeroizing::new("correct".to_owned()))
+        let outcome = super::prompt_password_with(None, |_| async {
+            super::PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
         })
-        .await
-        .unwrap();
+        .await;
+        let super::PromptOutcome::Allowed(password) = outcome else {
+            panic!("expected allowed prompt outcome");
+        };
 
         assert_eq!("correct", &*password);
     }

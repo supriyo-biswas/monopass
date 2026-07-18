@@ -94,8 +94,15 @@ The agent prompts once per unlock request. A wrong password, cancelled dialog,
 or closed dialog denies the unlock request without showing a retry prompt.
 Concurrent GUI unlock requests are shown as separate dialogs.
 
+Clicking the explicit **Deny** button returns `403 temporary_lockout` and caches
+that result for the process-lineage scope for `user.denialTtlSeconds`. Later GUI
+unlock requests for the scope fail with the same error without opening a dialog
+until the cache entry expires. Escape, window close, backend failure, and
+wrong-password submission do not populate the denial cache.
+
 Failures:
 - `403 access_denied`
+- `403 temporary_lockout`
 
 ## Direct Unlock
 

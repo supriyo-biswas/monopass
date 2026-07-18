@@ -21,6 +21,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use zeroize::Zeroizing;
 
 use super::error::ApiError;
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
+use super::gui_auth::PromptOutcome;
 use super::models::{
     AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse, ContactResponse,
     CreateContactRequest, CreateFileResponse, CreateItemRequest, JobAcceptedResponse, JobResponse,
@@ -152,16 +157,24 @@ async fn unlock_gui_with_prompt<F, Fut>(
 ) -> Result<StatusCode, ApiError>
 where
     F: Fn(Option<ProcessDisplay>) -> Fut,
-    Fut: std::future::Future<Output = Option<Zeroizing<String>>>,
+    Fut: std::future::Future<Output = PromptOutcome>,
 {
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
     if !gui_unlock_request_allowed(&headers) {
         return Err(ApiError::access_denied());
     }
+    if state.is_scope_denied(&scope_hash).await {
+        return Err(ApiError::temporary_lockout());
+    }
     let display = display.map(|Extension(display)| display);
 
-    let Some(password) = prompt(display).await else {
-        return Err(ApiError::access_denied());
+    let password = match prompt(display).await {
+        PromptOutcome::Allowed(password) => password,
+        PromptOutcome::Denied => {
+            state.deny_scope_hash(scope_hash).await;
+            return Err(ApiError::temporary_lockout());
+        }
+        PromptOutcome::Dismissed => return Err(ApiError::access_denied()),
     };
 
     state
@@ -356,8 +369,8 @@ pub async fn update_setting(
     }
 
     let Json(request) = request.map_err(|error| ApiError::bad_request(error.to_string()))?;
-    database
-        .upsert_setting(name, request.value)
+    state
+        .upsert_user_setting(&database, name, request.value)
         .await
         .map(|()| empty_json())
         .map_err(ApiError::from)
@@ -986,6 +999,11 @@ mod tests {
         bearer_password, export_item, import_item, lock, send_upload_body_bytes, status,
         unlock_methods,
     };
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    use crate::agent::gui_auth::PromptOutcome;
     use crate::agent::models::{CreateContactRequest, CreateItemRequest};
     #[cfg(any(
         target_os = "macos",
@@ -1189,7 +1207,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    Some(Zeroizing::new("correct".to_owned()))
+                    PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
                 }
             }
         };
@@ -1226,23 +1244,25 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    Some(Zeroizing::new("wrong".to_owned()))
+                    PromptOutcome::Allowed(Zeroizing::new("wrong".to_owned()))
                 }
             }
         };
 
-        let error = super::unlock_gui_with_prompt(
-            axum::extract::State(state),
-            Some(axum::Extension(ScopeHash::test(1))),
-            None,
-            gui_unlock_headers(),
-            prompt,
-        )
-        .await
-        .unwrap_err();
+        for _ in 0..2 {
+            let error = super::unlock_gui_with_prompt(
+                axum::extract::State(state.clone()),
+                Some(axum::Extension(ScopeHash::test(1))),
+                None,
+                gui_unlock_headers(),
+                &prompt,
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(StatusCode::FORBIDDEN, error.status);
-        assert_eq!(1, *prompts.lock().unwrap());
+            assert_eq!(StatusCode::FORBIDDEN, error.status);
+        }
+        assert_eq!(2, *prompts.lock().unwrap());
     }
 
     #[tokio::test]
@@ -1257,12 +1277,82 @@ mod tests {
             Some(axum::Extension(ScopeHash::test(1))),
             None,
             gui_unlock_headers(),
-            |_display| async { None },
+            |_display| async { PromptOutcome::Dismissed },
         )
         .await
         .unwrap_err();
 
         assert_eq!(StatusCode::FORBIDDEN, error.status);
+    }
+
+    #[tokio::test]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    async fn unlock_gui_remembers_explicit_denial_for_same_scope_only() {
+        let state = AgentState::from_database_path("missing.db");
+        let prompts = Arc::new(Mutex::new(0usize));
+        let prompt = {
+            let prompts = Arc::clone(&prompts);
+            move |_display: Option<ProcessDisplay>| {
+                let prompts = Arc::clone(&prompts);
+                async move {
+                    *prompts.lock().unwrap() += 1;
+                    PromptOutcome::Denied
+                }
+            }
+        };
+
+        for scope_hash in [ScopeHash::test(1), ScopeHash::test(1), ScopeHash::test(2)] {
+            let error = super::unlock_gui_with_prompt(
+                axum::extract::State(state.clone()),
+                Some(axum::Extension(scope_hash)),
+                None,
+                gui_unlock_headers(),
+                &prompt,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(StatusCode::FORBIDDEN, error.status);
+        }
+
+        assert_eq!(2, *prompts.lock().unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    async fn unlock_gui_does_not_remember_dismissal() {
+        let state = AgentState::from_database_path("missing.db");
+        let prompts = Arc::new(Mutex::new(0usize));
+        let prompt = {
+            let prompts = Arc::clone(&prompts);
+            move |_display: Option<ProcessDisplay>| {
+                let prompts = Arc::clone(&prompts);
+                async move {
+                    *prompts.lock().unwrap() += 1;
+                    PromptOutcome::Dismissed
+                }
+            }
+        };
+
+        for _ in 0..2 {
+            let error = super::unlock_gui_with_prompt(
+                axum::extract::State(state.clone()),
+                Some(axum::Extension(ScopeHash::test(1))),
+                None,
+                gui_unlock_headers(),
+                &prompt,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(StatusCode::FORBIDDEN, error.status);
+        }
+
+        assert_eq!(2, *prompts.lock().unwrap());
     }
 
     #[tokio::test]
@@ -1276,7 +1366,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    Some(Zeroizing::new("correct".to_owned()))
+                    PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
                 }
             }
         };
@@ -1660,6 +1750,7 @@ mod tests {
         headers
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn authorization_headers(password: &str) -> HeaderMap {
         let token = general_purpose::STANDARD.encode(password);
         let mut headers = HeaderMap::new();

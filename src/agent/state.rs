@@ -34,9 +34,11 @@ use super::process::ScopeHash;
 use crate::conceal::inferred_concealed;
 use crate::config::Config;
 use crate::db;
-use crate::settings::{AUTH_TTL_SETTING, GC_SECONDS_SETTING, SettingsError, user_setting};
+use crate::settings::{
+    AUTH_TTL_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING, SettingsError, user_setting,
+};
 
-const AUTH_CACHE_CAPACITY: usize = 32;
+const SCOPE_CACHE_CAPACITY: usize = 32;
 const AUTH_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const DATABASE_READER_WORKERS: usize = 8;
 const ITEM_VERSION_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -138,6 +140,10 @@ impl AgentState {
                 .user_setting_duration(AUTH_TTL_SETTING)
                 .await
                 .map_err(|_| UnlockError::AccessDenied)?;
+            let denial_ttl = database
+                .user_setting_duration(DENIAL_TTL_SETTING)
+                .await
+                .map_err(|_| UnlockError::AccessDenied)?;
             let mut inner = self.inner.lock().await;
             let database_is_current = inner
                 .database
@@ -147,6 +153,8 @@ impl AgentState {
                 return Err(UnlockError::AccessDenied);
             }
             let now = Instant::now();
+            inner.denial_ttl = denial_ttl;
+            inner.denied_scopes.remove(&scope_hash);
             inner.authorized_scopes.insert(scope_hash, now);
             inner.record_authorization_expiry(now + auth_ttl);
             return Ok(());
@@ -170,11 +178,17 @@ impl AgentState {
             .user_setting_duration(AUTH_TTL_SETTING)
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
+        let denial_ttl = handle
+            .user_setting_duration(DENIAL_TTL_SETTING)
+            .await
+            .map_err(|_| UnlockError::AccessDenied)?;
 
         inner.invalidate_auth_epoch();
         inner.database = Some(handle);
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
         let now = Instant::now();
+        inner.denial_ttl = denial_ttl;
+        inner.denied_scopes.remove(&scope_hash);
         inner.last_authorized_database_access = Some(now);
         inner.authorized_scopes.insert(scope_hash, now);
         inner.record_authorization_expiry(now + auth_ttl);
@@ -210,6 +224,56 @@ impl AgentState {
             .await
             .authorized_scopes
             .expires_at(scope_hash, Instant::now(), auth_ttl)
+    }
+
+    // Keep this condition in sync with the GUI unlock route.
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    pub async fn deny_scope_hash(&self, scope_hash: ScopeHash) {
+        self.inner
+            .lock()
+            .await
+            .denied_scopes
+            .insert(scope_hash, Instant::now());
+    }
+
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    pub async fn is_scope_denied(&self, scope_hash: &ScopeHash) -> bool {
+        let mut inner = self.inner.lock().await;
+        let denial_ttl = inner.denial_ttl;
+        inner
+            .denied_scopes
+            .contains(scope_hash, Instant::now(), denial_ttl)
+    }
+
+    pub async fn upsert_user_setting(
+        &self,
+        database: &DbHandle,
+        name: String,
+        value: String,
+    ) -> Result<(), DbError> {
+        let denial_ttl = if name == DENIAL_TTL_SETTING {
+            Some(
+                user_setting(&name)
+                    .and_then(|setting| setting.parse_duration(&value))
+                    .map_err(map_settings_error)?,
+            )
+        } else {
+            None
+        };
+
+        database.upsert_setting(name, value).await?;
+        if let Some(denial_ttl) = denial_ttl {
+            self.inner.lock().await.denial_ttl = denial_ttl;
+        }
+        Ok(())
     }
 
     pub async fn verify_settings_password(&self, password: &str) -> bool {
@@ -349,6 +413,15 @@ impl AgentState {
     }
 
     #[cfg(test)]
+    pub async fn deny_scope_hash_at(&self, scope_hash: ScopeHash, now: Instant) {
+        self.inner
+            .lock()
+            .await
+            .denied_scopes
+            .insert(scope_hash, now);
+    }
+
+    #[cfg(test)]
     pub async fn has_password_verifier(&self) -> bool {
         self.inner.lock().await.password_verifier.is_some()
     }
@@ -430,16 +503,40 @@ pub enum UnlockError {
     UnlockFailed,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct InnerState {
     database: Option<DbHandle>,
     password_verifier: Option<PasswordVerifier>,
     authorized_scopes: AuthCache,
+    denied_scopes: AuthCache,
+    denial_ttl: Duration,
     last_authorized_database_access: Option<Instant>,
     max_authorization_expires_at: Option<Instant>,
     last_cleanup_at: Option<Instant>,
     active_jobs: HashSet<String>,
     auth_epoch: u64,
+}
+
+impl Default for InnerState {
+    fn default() -> Self {
+        let denial_ttl_setting =
+            user_setting(DENIAL_TTL_SETTING).expect("denial ttl setting must be registered");
+        let denial_ttl = denial_ttl_setting
+            .parse_duration(denial_ttl_setting.default)
+            .expect("default denial ttl must be valid");
+        Self {
+            database: None,
+            password_verifier: None,
+            authorized_scopes: AuthCache::default(),
+            denied_scopes: AuthCache::default(),
+            denial_ttl,
+            last_authorized_database_access: None,
+            max_authorization_expires_at: None,
+            last_cleanup_at: None,
+            active_jobs: HashSet::new(),
+            auth_epoch: 0,
+        }
+    }
 }
 
 impl InnerState {
@@ -504,7 +601,7 @@ impl AuthCache {
             inserted_at: now,
         });
 
-        if self.entries.len() > AUTH_CACHE_CAPACITY {
+        if self.entries.len() > SCOPE_CACHE_CAPACITY {
             self.entries.remove(0);
         }
     }
@@ -549,6 +646,10 @@ impl AuthCache {
 
     fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    fn remove(&mut self, scope_hash: &ScopeHash) {
+        self.entries.retain(|entry| &entry.scope_hash != scope_hash);
     }
 }
 
@@ -4247,17 +4348,14 @@ fn insert_test_internal_key_item(
 
 #[cfg(test)]
 fn insert_test_user_settings(connection: &Connection) {
-    connection
-        .execute(
-            "INSERT INTO system_settings (name, value) VALUES (?1, ?2), (?3, ?4)",
-            (
-                AUTH_TTL_SETTING,
-                crate::settings::auth_ttl_setting().default,
-                GC_SECONDS_SETTING,
-                crate::settings::gc_seconds_setting().default,
-            ),
-        )
-        .unwrap();
+    for setting in crate::settings::USER_SETTINGS {
+        connection
+            .execute(
+                "INSERT INTO system_settings (name, value) VALUES (?1, ?2)",
+                (setting.name, setting.default),
+            )
+            .unwrap();
+    }
 }
 
 fn encrypt_chunk_record(
@@ -5167,6 +5265,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denial_cache_uses_default_ttl_and_scope_hash() {
+        let state = AgentState::from_database_path("missing.db");
+        let now = Instant::now();
+        state
+            .deny_scope_hash_at(ScopeHash::test(1), now - Duration::from_secs(59))
+            .await;
+
+        assert!(state.is_scope_denied(&ScopeHash::test(1)).await);
+        assert!(!state.is_scope_denied(&ScopeHash::test(2)).await);
+
+        state
+            .deny_scope_hash_at(ScopeHash::test(2), now - Duration::from_secs(61))
+            .await;
+        assert!(!state.is_scope_denied(&ScopeHash::test(2)).await);
+    }
+
+    #[tokio::test]
+    async fn successful_unlock_clears_denial_for_authorized_scope() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let state = AgentState::from_database_path(file.path());
+        state.deny_scope_hash(ScopeHash::test(1)).await;
+
+        state
+            .unlock(password("correct"), ScopeHash::test(1))
+            .await
+            .unwrap();
+
+        assert!(!state.is_scope_denied(&ScopeHash::test(1)).await);
+    }
+
+    #[tokio::test]
+    async fn explicit_lock_preserves_denials() {
+        let state = AgentState::from_database_path("missing.db");
+        state.deny_scope_hash(ScopeHash::test(1)).await;
+
+        state.lock(Instant::now()).await;
+
+        assert!(state.is_scope_denied(&ScopeHash::test(1)).await);
+    }
+
+    #[tokio::test]
+    async fn database_unload_preserves_denials() {
+        let state = AgentState::from_database_path("missing.db");
+        state.store_database_handle(DbHandle::test()).await;
+        state.deny_scope_hash(ScopeHash::test(1)).await;
+
+        assert!(state.unload_if_authorization_expired(Instant::now()).await);
+
+        assert!(state.is_scope_denied(&ScopeHash::test(1)).await);
+    }
+
+    #[tokio::test]
+    async fn first_unlock_loads_configured_denial_ttl() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let connection =
+            crate::db::open_encrypted_database_with_password(file.path(), "correct").unwrap();
+        connection
+            .execute(
+                "UPDATE system_settings SET value = '1' WHERE name = 'user.denialTtlSeconds'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let state = AgentState::from_database_path(file.path());
+        state
+            .unlock(password("correct"), ScopeHash::test(1))
+            .await
+            .unwrap();
+        state
+            .deny_scope_hash_at(ScopeHash::test(2), Instant::now() - Duration::from_secs(2))
+            .await;
+
+        assert!(!state.is_scope_denied(&ScopeHash::test(2)).await);
+    }
+
+    #[tokio::test]
+    async fn denial_ttl_update_applies_to_existing_entries() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        state.store_database_handle(database.clone()).await;
+        state
+            .deny_scope_hash_at(ScopeHash::test(1), Instant::now() - Duration::from_secs(2))
+            .await;
+
+        state
+            .upsert_user_setting(
+                &database,
+                "user.denialTtlSeconds".to_owned(),
+                "1".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!state.is_scope_denied(&ScopeHash::test(1)).await);
+    }
+
+    #[tokio::test]
     async fn settings_password_verifier_accepts_only_correct_password() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;
@@ -5875,9 +6073,20 @@ mod tests {
                 .validate(crate::settings::gc_seconds_setting().default)
                 .is_ok()
         );
+        assert!(
+            crate::settings::denial_ttl_setting()
+                .validate(crate::settings::denial_ttl_setting().default)
+                .is_ok()
+        );
         assert!(crate::settings::auth_ttl_setting().validate("0").is_err());
         assert!(
             crate::settings::auth_ttl_setting()
+                .validate("604801")
+                .is_err()
+        );
+        assert!(crate::settings::denial_ttl_setting().validate("0").is_err());
+        assert!(
+            crate::settings::denial_ttl_setting()
                 .validate("604801")
                 .is_err()
         );
@@ -5897,6 +6106,10 @@ mod tests {
         assert_eq!(
             Some(&"1200".to_owned()),
             settings.get("user.authTtlSeconds")
+        );
+        assert_eq!(
+            Some(&"60".to_owned()),
+            settings.get("user.denialTtlSeconds")
         );
         assert_eq!(Some(&"3600".to_owned()), settings.get("user.gcSeconds"));
         assert!(!settings.contains_key("sys.fileEncryptionKey"));
