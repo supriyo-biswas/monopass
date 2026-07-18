@@ -12,5 +12,6 @@ module.exports = {
   ],
   rules: {
     "body-required-unless-chore": [2, "always"],
+    "body-max-line-length": [0]
   },
 };
