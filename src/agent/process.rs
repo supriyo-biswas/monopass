@@ -1,6 +1,5 @@
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -64,7 +63,6 @@ struct ProcessInfo {
     session_id: i32,
     executable: Option<ExecutableIdentity>,
     executable_path: Option<PathBuf>,
-    executable_modified: Option<SystemTime>,
 }
 
 impl ProcessInfo {
@@ -132,11 +130,45 @@ pub(crate) enum DirectUnlockCaller {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProcessIconSource {
+    Path(PathBuf),
+    #[cfg_attr(
+        not(all(target_os = "linux", any(feature = "gtk", feature = "qt"))),
+        allow(dead_code)
+    )]
+    ThemeName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuiApplication {
+    pub(crate) name: String,
+    pub(crate) icon: Option<ProcessIconSource>,
+    pub(crate) same_as_primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessDisplay {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
-    pub(crate) icon_path: Option<PathBuf>,
-    pub(crate) modified: Option<SystemTime>,
+    pub(crate) icon: Option<ProcessIconSource>,
+    pub(crate) gui_application: Option<GuiApplication>,
+}
+
+impl ProcessDisplay {
+    pub(crate) fn presentation_name(&self) -> String {
+        match &self.gui_application {
+            Some(application) if application.same_as_primary => application.name.clone(),
+            Some(application) => format!("{} (via {})", self.name, application.name),
+            None => self.name.clone(),
+        }
+    }
+
+    pub(crate) fn preferred_icon(&self) -> Option<&ProcessIconSource> {
+        self.gui_application
+            .as_ref()
+            .and_then(|application| application.icon.as_ref())
+            .or(self.icon.as_ref())
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +187,15 @@ pub(crate) fn resolve_authorization_scope(
 trait ProcessResolver {
     fn process_info(&self, pid: i32) -> Option<ProcessInfo>;
     fn process_uid(&self, pid: i32) -> Option<u32>;
+
+    fn presentation_parent_across_credential_boundary(
+        &self,
+        _child: &ProcessInfo,
+        _parent_pid: i32,
+        _peer_uid: u32,
+    ) -> Option<ProcessInfo> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +212,22 @@ fn resolve_authorization_scope_with_resolver(
     peer_uid: u32,
     resolver: &impl ProcessResolver,
 ) -> Option<ResolvedAuthorizationScope> {
+    resolve_authorization_scope_with_resolver_and_gui(
+        peer_pid,
+        peer_uid,
+        resolver,
+        &PlatformGuiApplicationResolver,
+        current_agent_executable_identity(),
+    )
+}
+
+fn resolve_authorization_scope_with_resolver_and_gui(
+    peer_pid: i32,
+    peer_uid: u32,
+    resolver: &impl ProcessResolver,
+    gui_resolver: &impl GuiApplicationResolver,
+    agent_executable: Option<ExecutableIdentity>,
+) -> Option<ResolvedAuthorizationScope> {
     let mut current = resolver.process_info(peer_pid)?;
     if current.uid != peer_uid {
         return None;
@@ -178,6 +235,7 @@ fn resolve_authorization_scope_with_resolver(
 
     let session_id = current.session_id;
     let mut chain = Vec::new();
+    let mut presentation_parent = None;
 
     for _ in 0..MAX_PROCESS_CHAIN_DEPTH {
         if current.uid != peer_uid || current.session_id != session_id {
@@ -191,18 +249,24 @@ fn resolve_authorization_scope_with_resolver(
         }
 
         let parent_pid = current.parent_pid;
-        chain.push(current);
+        chain.push(current.clone());
         if parent_pid <= 0 {
             break;
         }
 
         let parent_uid = resolver.process_uid(parent_pid)?;
         if parent_uid != peer_uid {
+            presentation_parent = resolver
+                .presentation_parent_across_credential_boundary(&current, parent_pid, peer_uid);
             break;
         }
 
         let parent = resolver.process_info(parent_pid)?;
-        if parent.uid != peer_uid || parent.session_id != session_id {
+        if parent.uid != peer_uid {
+            break;
+        }
+        if parent.session_id != session_id {
+            presentation_parent = Some(parent);
             break;
         }
         current = parent;
@@ -227,11 +291,51 @@ fn resolve_authorization_scope_with_resolver(
     };
 
     let ultimate = ultimate_process_from_chain(&chain)?;
+    let display_chain = presentation_chain(&chain, presentation_parent, peer_uid, resolver);
     Some(ResolvedAuthorizationScope {
         hash: hash_authorization_scope(&scope),
-        display: process_display_from_chain(&chain),
+        display: process_display_from_chain_with_agent_and_gui(
+            &display_chain,
+            agent_executable,
+            gui_resolver,
+        ),
         ultimate,
     })
+}
+
+fn presentation_chain(
+    verified_chain: &[ProcessInfo],
+    first_parent: Option<ProcessInfo>,
+    peer_uid: u32,
+    resolver: &impl ProcessResolver,
+) -> Vec<ProcessInfo> {
+    let mut ancestors = Vec::new();
+    let mut current = first_parent;
+
+    for _ in 0..MAX_PROCESS_CHAIN_DEPTH {
+        let Some(process) = current else {
+            break;
+        };
+        if process.uid != peer_uid
+            || verified_chain
+                .iter()
+                .chain(&ancestors)
+                .any(|seen| seen.instance.pid == process.instance.pid)
+        {
+            break;
+        }
+
+        let parent_pid = process.parent_pid;
+        ancestors.push(process);
+        if parent_pid <= 0 || resolver.process_uid(parent_pid) != Some(peer_uid) {
+            break;
+        }
+        current = resolver.process_info(parent_pid);
+    }
+
+    ancestors.reverse();
+    ancestors.extend_from_slice(verified_chain);
+    ancestors
 }
 
 fn ultimate_process_from_chain(chain: &[ProcessInfo]) -> Option<UltimateProcess> {
@@ -265,19 +369,30 @@ fn direct_unlock_caller_with_agent(
         .map(DirectUnlockCaller::Program)
 }
 
-fn process_display_from_chain(chain: &[ProcessInfo]) -> Option<ProcessDisplay> {
-    let agent_executable = std::env::current_exe()
+fn current_agent_executable_identity() -> Option<ExecutableIdentity> {
+    std::env::current_exe()
         .ok()
-        .and_then(|path| ExecutableIdentity::from_path(&path));
-
-    process_display_from_chain_with_agent(chain, agent_executable)
+        .and_then(|path| ExecutableIdentity::from_path(&path))
 }
 
+#[cfg(test)]
 fn process_display_from_chain_with_agent(
     chain: &[ProcessInfo],
     agent_executable: Option<ExecutableIdentity>,
 ) -> Option<ProcessDisplay> {
-    chain
+    process_display_from_chain_with_agent_and_gui(
+        chain,
+        agent_executable,
+        &PlatformGuiApplicationResolver,
+    )
+}
+
+fn process_display_from_chain_with_agent_and_gui(
+    chain: &[ProcessInfo],
+    agent_executable: Option<ExecutableIdentity>,
+    gui_resolver: &impl GuiApplicationResolver,
+) -> Option<ProcessDisplay> {
+    let primary = chain
         .iter()
         .rev()
         .find(|process| {
@@ -290,8 +405,17 @@ fn process_display_from_chain_with_agent(
                 .iter()
                 .rev()
                 .find(|process| process.executable_path.is_some())
-        })
-        .and_then(process_display)
+        })?;
+    let mut display = process_display(primary)?;
+    display.gui_application = chain.iter().rev().find_map(|process| {
+        let mut application = gui_resolver.gui_application(process)?;
+        application.same_as_primary = process.instance == primary.instance
+            || process
+                .executable
+                .is_some_and(|identity| primary.executable == Some(identity));
+        Some(application)
+    });
+    Some(display)
 }
 
 fn process_display(process: &ProcessInfo) -> Option<ProcessDisplay> {
@@ -308,9 +432,59 @@ fn process_display(process: &ProcessInfo) -> Option<ProcessDisplay> {
     Some(ProcessDisplay {
         name,
         path,
-        icon_path: bundle_path,
-        modified: process.executable_modified,
+        icon: bundle_path.map(ProcessIconSource::Path),
+        gui_application: None,
     })
+}
+
+trait GuiApplicationResolver {
+    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication>;
+}
+
+struct PlatformGuiApplicationResolver;
+
+#[cfg(target_os = "macos")]
+impl GuiApplicationResolver for PlatformGuiApplicationResolver {
+    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication> {
+        use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
+
+        let application =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(process.instance.pid)?;
+        if !matches!(
+            application.activationPolicy(),
+            NSApplicationActivationPolicy::Regular | NSApplicationActivationPolicy::Accessory
+        ) {
+            return None;
+        }
+        let bundle_path = application.bundleURL()?.path()?.to_string();
+        if bundle_path.is_empty() {
+            return None;
+        }
+        let name = application.localizedName()?.to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some(GuiApplication {
+            name,
+            icon: Some(ProcessIconSource::Path(PathBuf::from(bundle_path))),
+            same_as_primary: false,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+impl GuiApplicationResolver for PlatformGuiApplicationResolver {
+    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication> {
+        let executable = process.executable_path.as_deref()?;
+        super::desktop::application_for_process(process.instance.pid, executable)
+    }
+}
+
+#[cfg(all(target_os = "linux", not(any(feature = "gtk", feature = "qt"))))]
+impl GuiApplicationResolver for PlatformGuiApplicationResolver {
+    fn gui_application(&self, _process: &ProcessInfo) -> Option<GuiApplication> {
+        None
+    }
 }
 
 fn app_bundle_path(path: &Path) -> Option<PathBuf> {
@@ -391,6 +565,24 @@ fn executable_generation(metadata: &Metadata) -> Option<u32> {
     Some(std::os::darwin::fs::MetadataExt::st_gen(metadata))
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy)]
+struct MacosCredentialBoundaryEvidence {
+    effective_uid: u32,
+    real_uid: u32,
+    parent_uid: Option<u32>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn crosses_macos_presentation_credential_boundary(
+    peer_uid: u32,
+    evidence: MacosCredentialBoundaryEvidence,
+) -> bool {
+    evidence.effective_uid != evidence.real_uid
+        && evidence.real_uid == peer_uid
+        && evidence.parent_uid == Some(peer_uid)
+}
+
 struct PlatformProcessResolver;
 
 #[cfg(target_os = "linux")]
@@ -420,7 +612,6 @@ impl ProcessResolver for PlatformProcessResolver {
             session_id: stat.session_id,
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
-            executable_modified: executable_metadata.and_then(|metadata| metadata.modified().ok()),
         })
     }
 
@@ -487,7 +678,6 @@ impl ProcessResolver for PlatformProcessResolver {
             session_id,
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
-            executable_modified: executable_metadata.and_then(|metadata| metadata.modified().ok()),
         })
     }
 
@@ -496,6 +686,63 @@ impl ProcessResolver for PlatformProcessResolver {
             .map(|info| info.pbi_uid)
             .or_else(|| macos_short_bsd_info(pid).map(|info| info.pbsi_uid))
     }
+
+    fn presentation_parent_across_credential_boundary(
+        &self,
+        child: &ProcessInfo,
+        parent_pid: i32,
+        peer_uid: u32,
+    ) -> Option<ProcessInfo> {
+        let child_info = macos_bsd_info(child.instance.pid)?;
+        if child_info.pbi_uid != peer_uid
+            || i32::try_from(child_info.pbi_ppid).ok()? != parent_pid
+            || child_info.pbi_start_tvsec != child.instance.start_time.primary
+            || child_info.pbi_start_tvusec != child.instance.start_time.secondary
+        {
+            return None;
+        }
+
+        let boundary_info = macos_short_bsd_info(parent_pid)?;
+        let boundary_parent_pid = i32::try_from(boundary_info.pbsi_ppid).ok()?;
+        if boundary_parent_pid <= 0 {
+            return None;
+        }
+
+        let evidence = MacosCredentialBoundaryEvidence {
+            effective_uid: boundary_info.pbsi_uid,
+            real_uid: boundary_info.pbsi_ruid,
+            parent_uid: self.process_uid(boundary_parent_pid),
+        };
+        if !crosses_macos_presentation_credential_boundary(peer_uid, evidence) {
+            return None;
+        }
+
+        let parent = self.process_info(boundary_parent_pid)?;
+        if parent.uid != peer_uid {
+            return None;
+        }
+
+        let revalidated_boundary = macos_short_bsd_info(parent_pid)?;
+        if !same_macos_short_process(&boundary_info, &revalidated_boundary) {
+            return None;
+        }
+        Some(parent)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn same_macos_short_process(first: &ProcBsdShortInfo, second: &ProcBsdShortInfo) -> bool {
+    first.pbsi_pid == second.pbsi_pid
+        && first.pbsi_ppid == second.pbsi_ppid
+        && first.pbsi_pgid == second.pbsi_pgid
+        && first.pbsi_flags == second.pbsi_flags
+        && first.pbsi_uid == second.pbsi_uid
+        && first.pbsi_gid == second.pbsi_gid
+        && first.pbsi_ruid == second.pbsi_ruid
+        && first.pbsi_rgid == second.pbsi_rgid
+        && first.pbsi_svuid == second.pbsi_svuid
+        && first.pbsi_svgid == second.pbsi_svgid
+        && first.pbsi_comm == second.pbsi_comm
 }
 
 #[cfg(target_os = "macos")]
@@ -537,6 +784,7 @@ fn macos_bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct ProcBsdShortInfo {
     pbsi_pid: u32,
     pbsi_ppid: u32,
@@ -579,7 +827,6 @@ compile_error!("process-lineage authorization is supported only on Linux and mac
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::time::{Duration, UNIX_EPOCH};
 
     use super::{
         ExecutableIdentity, ProcessInfo, ProcessInstanceIdentity, ProcessResolver, ProcessStartTime,
@@ -592,6 +839,7 @@ mod tests {
     struct FakeResolver {
         processes: HashMap<i32, ProcessInfo>,
         visible_uids: HashMap<i32, u32>,
+        presentation_bridges: HashMap<(i32, i32), i32>,
     }
 
     impl FakeResolver {
@@ -613,7 +861,6 @@ mod tests {
         ) -> Self {
             let mut process = process(pid, parent, uid, sid, Some(exe));
             process.executable_path = Some(PathBuf::from(path));
-            process.executable_modified = Some(UNIX_EPOCH + Duration::from_secs(exe));
             self.visible_uids.insert(pid, uid);
             self.processes.insert(pid, process);
             self
@@ -630,6 +877,17 @@ mod tests {
             self.visible_uids.insert(pid, uid);
             self
         }
+
+        fn with_presentation_bridge(
+            mut self,
+            child_pid: i32,
+            bridge_pid: i32,
+            parent_pid: i32,
+        ) -> Self {
+            self.presentation_bridges
+                .insert((child_pid, bridge_pid), parent_pid);
+            self
+        }
     }
 
     impl ProcessResolver for FakeResolver {
@@ -639,6 +897,19 @@ mod tests {
 
         fn process_uid(&self, pid: i32) -> Option<u32> {
             self.visible_uids.get(&pid).copied()
+        }
+
+        fn presentation_parent_across_credential_boundary(
+            &self,
+            child: &ProcessInfo,
+            parent_pid: i32,
+            peer_uid: u32,
+        ) -> Option<ProcessInfo> {
+            let presentation_parent_pid = self
+                .presentation_bridges
+                .get(&(child.instance.pid, parent_pid))?;
+            let parent = self.process_info(*presentation_parent_pid)?;
+            (parent.uid == peer_uid).then_some(parent)
         }
     }
 
@@ -773,6 +1044,196 @@ mod tests {
     }
 
     #[test]
+    fn gui_presentation_crosses_session_boundary_without_changing_scope_hash() {
+        let first = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(10, 9, UID, 8, 2, "/Applications/Helper")
+            .with_path(
+                9,
+                1,
+                UID,
+                8,
+                1,
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Code",
+            )
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(10, 9, UID, 7, 22, "/Applications/Other Helper")
+            .with_path(
+                9,
+                1,
+                UID,
+                7,
+                11,
+                "/Applications/Other.app/Contents/MacOS/Other",
+            )
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default().with(9, "Visual Studio Code");
+
+        let scope = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &first,
+            &gui,
+            Some(test_executable(4)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            "bash (via Visual Studio Code)",
+            scope.display.unwrap().presentation_name()
+        );
+        assert_eq!(
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &second)
+        );
+    }
+
+    #[test]
+    fn gui_presentation_crosses_credential_boundary_without_changing_authorization() {
+        let first = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_uid_only(10, 0)
+            .with_path(9, 8, UID, 8, 2, "/Applications/iTermServer")
+            .with_path(
+                8,
+                1,
+                UID,
+                8,
+                1,
+                "/Applications/iTerm.app/Contents/MacOS/iTerm2",
+            )
+            .with_uid_only(1, 0)
+            .with_presentation_bridge(11, 10, 9);
+        let second = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_uid_only(10, 0)
+            .with_path(19, 18, UID, 7, 22, "/Applications/Other Helper")
+            .with_path(
+                18,
+                1,
+                UID,
+                7,
+                11,
+                "/Applications/Other.app/Contents/MacOS/Other",
+            )
+            .with_uid_only(1, 0)
+            .with_presentation_bridge(11, 10, 19);
+        let gui = FakeGuiResolver::default().with(8, "iTerm2");
+
+        let scope = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &first,
+            &gui,
+            Some(test_executable(4)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            "bash (via iTerm2)",
+            scope.display.unwrap().presentation_name()
+        );
+        assert_eq!(
+            Some(PathBuf::from("/usr/local/bin/monopass")),
+            scope.ultimate.executable_path
+        );
+        assert_eq!(
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &second)
+        );
+    }
+
+    #[test]
+    fn credential_boundary_finds_direct_terminal_parent() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_uid_only(10, 0)
+            .with_path(
+                9,
+                1,
+                UID,
+                8,
+                2,
+                "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            )
+            .with_uid_only(1, 0)
+            .with_presentation_bridge(11, 10, 9);
+        let gui = FakeGuiResolver::default().with(9, "Terminal");
+
+        let scope = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &resolver,
+            &gui,
+            Some(test_executable(4)),
+        )
+        .unwrap();
+        let display = scope.display.unwrap();
+
+        assert_eq!("bash (via Terminal)", display.presentation_name());
+        assert_eq!(PathBuf::from("/bin/bash"), display.path);
+    }
+
+    #[test]
+    fn unrecognized_privileged_boundary_preserves_plain_display() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_uid_only(10, 0);
+        let gui = FakeGuiResolver::default().with(10, "Untrusted");
+
+        let scope = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &resolver,
+            &gui,
+            Some(test_executable(4)),
+        )
+        .unwrap();
+
+        assert_eq!("bash", scope.display.unwrap().presentation_name());
+    }
+
+    #[test]
+    fn macos_presentation_boundary_requires_changed_effective_uid_and_same_user_parent() {
+        let valid = super::MacosCredentialBoundaryEvidence {
+            effective_uid: 0,
+            real_uid: UID,
+            parent_uid: Some(UID),
+        };
+
+        assert!(super::crosses_macos_presentation_credential_boundary(
+            UID, valid
+        ));
+
+        for invalid in [
+            super::MacosCredentialBoundaryEvidence {
+                effective_uid: UID,
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                real_uid: 0,
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                parent_uid: Some(0),
+                ..valid
+            },
+        ] {
+            assert!(!super::crosses_macos_presentation_credential_boundary(
+                UID, invalid
+            ));
+        }
+    }
+
+    #[test]
     fn inaccessible_same_user_parent_is_rejected() {
         let resolver = FakeResolver::default()
             .with(10, 9, UID, SID, 1)
@@ -863,10 +1324,11 @@ mod tests {
             display.path
         );
         assert_eq!(
-            Some(PathBuf::from("/Applications/Google Chrome.app")),
-            display.icon_path
+            Some(super::ProcessIconSource::Path(PathBuf::from(
+                "/Applications/Google Chrome.app"
+            ))),
+            display.icon
         );
-        assert_eq!(Some(UNIX_EPOCH + Duration::from_secs(3)), display.modified);
     }
 
     #[test]
@@ -897,6 +1359,89 @@ mod tests {
             scope.ultimate.executable_path
         );
         assert_eq!(Some(test_executable(3)), scope.ultimate.executable);
+    }
+
+    #[test]
+    fn shell_display_is_attributed_to_nearest_gui_application() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(10, 1, UID, SID, 2, "/usr/bin/gnome-terminal-server")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default().with(10, "Terminal");
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[10, 11, 12]),
+            Some(test_executable(4)),
+            &gui,
+        )
+        .unwrap();
+
+        assert_eq!("bash (via Terminal)", display.presentation_name());
+        assert_eq!(PathBuf::from("/bin/bash"), display.path);
+        assert_eq!(
+            Some(&super::ProcessIconSource::ThemeName("test-icon".into())),
+            display.preferred_icon()
+        );
+    }
+
+    #[test]
+    fn nested_gui_ancestors_choose_nearest_application() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(10, 9, UID, SID, 2, "/usr/bin/inner-terminal")
+            .with_path(9, 1, UID, SID, 1, "/usr/bin/outer-terminal")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default()
+            .with(9, "Outer")
+            .with(10, "Inner");
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[9, 10, 11, 12]),
+            Some(test_executable(4)),
+            &gui,
+        )
+        .unwrap();
+
+        assert_eq!("bash (via Inner)", display.presentation_name());
+    }
+
+    #[test]
+    fn direct_gui_caller_uses_localized_name_without_via() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/monopass")
+            .with_path(11, 1, UID, SID, 2, "/usr/bin/code")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default().with(11, "Visual Studio Code");
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[11, 12]),
+            Some(test_executable(3)),
+            &gui,
+        )
+        .unwrap();
+
+        assert_eq!("Visual Studio Code", display.presentation_name());
+        assert!(display.gui_application.unwrap().same_as_primary);
+    }
+
+    #[test]
+    fn missing_gui_metadata_preserves_plain_display() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/monopass")
+            .with_path(11, 1, UID, SID, 2, "/bin/bash")
+            .with_uid_only(1, 0);
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[11, 12]),
+            Some(test_executable(3)),
+            &FakeGuiResolver::default(),
+        )
+        .unwrap();
+
+        assert_eq!("bash", display.presentation_name());
+        assert!(display.gui_application.is_none());
     }
 
     #[test]
@@ -955,7 +1500,7 @@ mod tests {
 
         assert_eq!("example-tool", display.name);
         assert_eq!(PathBuf::from("/usr/local/bin/example-tool"), display.path);
-        assert_eq!(None, display.icon_path);
+        assert_eq!(None, display.icon);
     }
 
     fn process(
@@ -978,7 +1523,6 @@ mod tests {
             session_id,
             executable: executable.map(test_executable),
             executable_path: executable.map(|inode| PathBuf::from(format!("/bin/test-{inode}"))),
-            executable_modified: executable.map(|inode| UNIX_EPOCH + Duration::from_secs(inode)),
         }
     }
 
@@ -998,6 +1542,31 @@ mod tests {
             modified_nanoseconds: 2,
             changed_seconds: 3,
             changed_nanoseconds: 4,
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeGuiResolver {
+        applications: HashMap<i32, super::GuiApplication>,
+    }
+
+    impl FakeGuiResolver {
+        fn with(mut self, pid: i32, name: &str) -> Self {
+            self.applications.insert(
+                pid,
+                super::GuiApplication {
+                    name: name.to_owned(),
+                    icon: Some(super::ProcessIconSource::ThemeName("test-icon".into())),
+                    same_as_primary: false,
+                },
+            );
+            self
+        }
+    }
+
+    impl super::GuiApplicationResolver for FakeGuiResolver {
+        fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplication> {
+            self.applications.get(&process.instance.pid).cloned()
         }
     }
 }

@@ -287,6 +287,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f7dc094d718f2e1c1559ad110e27eeaae14a5465d3d56dd6dbd793079fbd530"
 dependencies = [
  "memchr",
+ "regex-automata",
  "serde_core",
 ]
 
@@ -874,6 +875,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "freedesktop-desktop-entry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28273c5c6b97a5f07724f6652f064c0c7f637f9aa5e7c09c83bc3bc4ad4ea245"
+dependencies = [
+ "bstr",
+ "log",
+ "memchr",
+ "thiserror 2.0.18",
+ "unicase",
+ "xdg",
 ]
 
 [[package]]
@@ -1870,6 +1885,7 @@ dependencies = [
  "chrono",
  "clap",
  "data-encoding",
+ "freedesktop-desktop-entry",
  "getrandom 0.3.4",
  "globset",
  "gtk4",
@@ -1955,6 +1971,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
@@ -3045,6 +3062,12 @@ dependencies = [
  "serde",
  "tinystr",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

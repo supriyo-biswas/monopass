@@ -97,10 +97,23 @@ HTTP/1.1 200 OK
 ```
 
 The agent displays a scope-specific password dialog for the requesting
-application and accepts one submitted password for the request. Item prompts
-retain the requesting application's icon. Settings prompts use a platform
-settings icon. Both show the application name and executable path. Linux GUI
-unlock requires an accepted GUI session capability (`x-session` or
+application and accepts one submitted password for the request. The nearest
+confidently recognized GUI application in the parent ancestry is used as
+presentation context. Presentation lookup may continue beyond the verified
+lineage's session boundary so terminal-hosting applications can be found. On
+macOS it may also cross exactly one root-owned local `/usr/bin/login` process
+when the login process name, real and saved UIDs, controlling terminal, and
+same-user parent all corroborate the boundary. Other different-user boundaries
+remain excluded. For example, a shell request can be shown as
+`bash (via Terminal)`. A direct GUI caller uses its localized application name
+without redundant `via` text. The executable path always describes the direct
+executable selected for display, not its GUI host. All prompt scopes use the
+same application icon resolution: they prefer the GUI application's icon, then
+use the existing generic icon fallback if GUI application or icon discovery is
+missing or ambiguous. Dialogs do not display executable modification timestamps.
+This GUI metadata is presentation-only and is not part of process
+authorization or direct-unlock trust evaluation. Linux GUI unlock requires an
+accepted GUI session capability (`x-session` or
 `wayland-session`) and uses
 in-process GTK4 or Qt Quick/QML SDK dialogs with forced X11 backend usage. A
 wrong password, cancelled dialog, or closed dialog denies the request.

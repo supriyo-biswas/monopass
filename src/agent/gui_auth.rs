@@ -7,12 +7,11 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use chrono::{DateTime, Local};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use super::models::AccessScope;
-use super::process::ProcessDisplay;
+use super::process::{ProcessDisplay, ProcessIconSource};
 
 pub(crate) type PromptRequestReceiver = mpsc::Receiver<PromptRequest>;
 
@@ -191,7 +190,10 @@ mod linux_prompt {
     use gtk4 as gtk;
     use zeroize::Zeroizing;
 
-    use super::{AccessScope, PromptMetadata, PromptOutcome, PromptRequest, PromptRequestReceiver};
+    use super::{
+        AccessScope, ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequest,
+        PromptRequestReceiver,
+    };
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -356,11 +358,6 @@ mod linux_prompt {
         path.add_css_class("monospace");
         text.append(&intro);
         text.append(&app_name);
-        if let Some(modified) = metadata.modified_text.as_ref() {
-            let modified = gtk::Label::new(Some(modified));
-            modified.set_xalign(0.0);
-            text.append(&modified);
-        }
         text.append(&path);
         header.append(&text);
         root.append(&header);
@@ -383,18 +380,20 @@ mod linux_prompt {
     }
 
     fn icon_for_metadata(metadata: &PromptMetadata) -> Option<gtk::Image> {
-        if metadata.access_scope == AccessScope::Settings {
-            let image = gtk::Image::from_icon_name("preferences-system");
-            image.set_pixel_size(40);
-            return Some(image);
-        }
-
-        if let Some(path) = metadata.preferred_icon_path.as_deref()
-            && path.exists()
-        {
-            let image = gtk::Image::from_file(path);
-            image.set_pixel_size(40);
-            return Some(image);
+        if let Some(icon) = metadata.preferred_icon.as_ref() {
+            match icon {
+                ProcessIconSource::Path(path) if path.exists() => {
+                    let image = gtk::Image::from_file(path);
+                    image.set_pixel_size(40);
+                    return Some(image);
+                }
+                ProcessIconSource::ThemeName(name) if theme_has_icon(name) => {
+                    let image = gtk::Image::from_icon_name(name);
+                    image.set_pixel_size(40);
+                    return Some(image);
+                }
+                ProcessIconSource::Path(_) | ProcessIconSource::ThemeName(_) => {}
+            }
         }
 
         let icon_name = generic_terminal_icon_name()?;
@@ -404,12 +403,16 @@ mod linux_prompt {
     }
 
     fn generic_terminal_icon_name() -> Option<&'static str> {
-        let display = gtk::gdk::Display::default()?;
-        let theme = gtk::IconTheme::for_display(&display);
         GENERIC_TERMINAL_ICON_NAMES
             .iter()
             .copied()
-            .find(|name| theme.has_icon(name))
+            .find(|name| theme_has_icon(name))
+    }
+
+    fn theme_has_icon(name: &str) -> bool {
+        gtk::gdk::Display::default()
+            .map(|display| gtk::IconTheme::for_display(&display).has_icon(name))
+            .unwrap_or(false)
     }
 
     fn wire_prompt_actions(
@@ -522,7 +525,9 @@ mod linux_prompt {
     use qmetaobject::{QObjectPinned, prelude::*};
     use zeroize::Zeroizing;
 
-    use super::{AccessScope, PromptMetadata, PromptOutcome, PromptRequestReceiver};
+    use super::{
+        AccessScope, ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequestReceiver,
+    };
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -657,11 +662,9 @@ mod linux_prompt {
     #[derive(Default)]
     struct CurrentPrompt {
         id: u32,
-        settings_scope: bool,
         title: String,
         intro: String,
         app_name: String,
-        modified_text: String,
         path: String,
         icon_sources: String,
     }
@@ -671,11 +674,9 @@ mod linux_prompt {
             let icon_sources = icon_sources(&metadata);
             Self {
                 id,
-                settings_scope: metadata.access_scope == AccessScope::Settings,
                 title: metadata.title,
                 intro: metadata.intro,
                 app_name: metadata.app_name,
-                modified_text: metadata.modified_text.unwrap_or_default(),
                 path: metadata.executable_path_text,
                 icon_sources,
             }
@@ -683,21 +684,23 @@ mod linux_prompt {
     }
 
     fn icon_sources(metadata: &PromptMetadata) -> String {
-        if metadata.access_scope == AccessScope::Settings {
-            return ["preferences-system", "settings", "preferences-other"]
-                .iter()
-                .filter_map(|name| find_xdg_icon(name))
-                .filter_map(|path| url::Url::from_file_path(path).ok())
-                .map(|url| url.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
-
         let mut sources = Vec::new();
-        if let Some(path) = metadata.preferred_icon_path.as_deref()
-            && path.exists()
-        {
-            sources.push(format!("file://{}", path.display()));
+        if let Some(icon) = metadata.preferred_icon.as_ref() {
+            match icon {
+                ProcessIconSource::Path(path) if path.exists() => {
+                    if let Ok(url) = url::Url::from_file_path(path) {
+                        sources.push(url.to_string());
+                    }
+                }
+                ProcessIconSource::ThemeName(name) => {
+                    if let Some(path) = find_xdg_icon(name)
+                        && let Ok(url) = url::Url::from_file_path(path)
+                    {
+                        sources.push(url.to_string());
+                    }
+                }
+                ProcessIconSource::Path(_) => {}
+            }
         }
         sources.extend(generic_terminal_icon_sources());
         sources.join("\n")
@@ -787,11 +790,9 @@ mod linux_prompt {
         deny: qt_method!(fn(&self, id: u32)),
         dismiss: qt_method!(fn(&self, id: u32)),
         prompt_id: qt_method!(fn(&self) -> u32),
-        settings_scope: qt_method!(fn(&self) -> bool),
         title: qt_method!(fn(&self) -> QString),
         intro: qt_method!(fn(&self) -> QString),
         app_name: qt_method!(fn(&self) -> QString),
-        modified_text: qt_method!(fn(&self) -> QString),
         executable_path: qt_method!(fn(&self) -> QString),
         icon_sources: qt_method!(fn(&self) -> QString),
     }
@@ -843,10 +844,6 @@ mod linux_prompt {
             CURRENT.with(|current| current.borrow().id)
         }
 
-        fn settings_scope(&self) -> bool {
-            CURRENT.with(|current| current.borrow().settings_scope)
-        }
-
         fn title(&self) -> QString {
             CURRENT.with(|current| current.borrow().title.as_str().into())
         }
@@ -857,10 +854,6 @@ mod linux_prompt {
 
         fn app_name(&self) -> QString {
             CURRENT.with(|current| current.borrow().app_name.as_str().into())
-        }
-
-        fn modified_text(&self) -> QString {
-            CURRENT.with(|current| current.borrow().modified_text.as_str().into())
         }
 
         fn executable_path(&self) -> QString {
@@ -913,11 +906,9 @@ Window {
             while (_promptBridge.poll()) {
                 var prompt = promptComponent.createObject(null, {
                     "promptId": _promptBridge.prompt_id(),
-                    "settingsScope": _promptBridge.settings_scope(),
                     "titleText": _promptBridge.title(),
                     "introText": _promptBridge.intro(),
                     "appName": _promptBridge.app_name(),
-                    "modifiedText": _promptBridge.modified_text(),
                     "pathText": _promptBridge.executable_path(),
                     "iconSourcesText": _promptBridge.icon_sources()
                 })
@@ -936,11 +927,9 @@ Window {
         Window {
             id: prompt
             property int promptId: 0
-            property bool settingsScope: false
             property string titleText: ""
             property string introText: ""
             property string appName: ""
-            property string modifiedText: ""
             property string pathText: ""
             property string iconSourcesText: ""
             property var iconSources: iconSourcesText.length > 0 ? iconSourcesText.split("\n") : []
@@ -995,9 +984,9 @@ Window {
             width: 460
             minimumWidth: 460
             maximumWidth: 460
-            height: 220
-            minimumHeight: 220
-            maximumHeight: 220
+            height: 196
+            minimumHeight: 196
+            maximumHeight: 196
             x: 80 + ((promptId - 1) % 8) * 28
             y: 80 + ((promptId - 1) % 8) * 28
             visible: true
@@ -1077,16 +1066,6 @@ Window {
                         }
                     }
 
-                    Label {
-                        text: "⚙"
-                        visible: prompt.settingsScope && !icon.visible
-                        font.pixelSize: 34
-                        Layout.preferredWidth: visible ? 40 : 0
-                        Layout.preferredHeight: visible ? 40 : 0
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-
                     ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 4
@@ -1099,12 +1078,6 @@ Window {
                         Label {
                             text: appName
                             font.bold: true
-                            elide: Text.ElideRight
-                            Layout.fillWidth: true
-                        }
-                        Label {
-                            text: modifiedText
-                            visible: modifiedText.length > 0
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                         }
@@ -1160,8 +1133,8 @@ mod appkit_prompt {
     use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
         NSApplication, NSBackingStoreType, NSButton, NSFloatingWindowLevel, NSFont, NSImage,
-        NSImageNamePreferencesGeneral, NSImageView, NSLineBreakMode, NSSecureTextField,
-        NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+        NSImageView, NSLineBreakMode, NSSecureTextField, NSTextField, NSView, NSWindow,
+        NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
     };
     use objc2_foundation::{
         MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -1171,7 +1144,7 @@ mod appkit_prompt {
     use tokio::sync::oneshot;
     use zeroize::Zeroizing;
 
-    use super::{AccessScope, PromptMetadata, PromptOutcome, PromptRequest, path_to_string};
+    use super::{ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequest, path_to_string};
 
     const WINDOW_WIDTH: f64 = 460.0;
     const WINDOW_HEIGHT: f64 = 196.0;
@@ -1349,7 +1322,7 @@ mod appkit_prompt {
         metadata: PromptMetadata,
         mtm: MainThreadMarker,
     ) {
-        let has_icon = metadata.preferred_icon_path.is_some() || metadata.executable_path.is_some();
+        let has_icon = metadata.preferred_icon.is_some() || metadata.executable_path.is_some();
         let text_x = if has_icon {
             PADDING + ICON_SIZE + 16.0
         } else {
@@ -1373,30 +1346,14 @@ mod appkit_prompt {
         ));
         content.addSubview(&intro);
 
-        let app_width = if metadata.modified_text.is_some() {
-            text_width * 0.52
-        } else {
-            text_width
-        };
         let app_name = label(&metadata.app_name, NSFont::boldSystemFontOfSize(13.0), mtm);
         app_name.setUsesSingleLineMode(true);
         app_name.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         app_name.setFrame(NSRect::new(
             NSPoint::new(text_x, 130.0),
-            NSSize::new(app_width, 18.0),
+            NSSize::new(text_width, 18.0),
         ));
         content.addSubview(&app_name);
-
-        if let Some(modified_text) = metadata.modified_text.as_ref() {
-            let modified = label(modified_text, NSFont::systemFontOfSize(13.0), mtm);
-            modified.setUsesSingleLineMode(true);
-            modified.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            modified.setFrame(NSRect::new(
-                NSPoint::new(text_x + app_width + 6.0, 130.0),
-                NSSize::new(text_width - app_width - 6.0, 18.0),
-            ));
-            content.addSubview(&modified);
-        }
 
         let path = label(
             &metadata.executable_path_text,
@@ -1474,17 +1431,15 @@ mod appkit_prompt {
     }
 
     fn load_icon(metadata: &PromptMetadata) -> Option<Retained<NSImage>> {
-        if metadata.access_scope == AccessScope::Settings {
-            // SAFETY: NSImageNamePreferencesGeneral is a system-provided, immutable name.
-            return NSImage::imageNamed(unsafe { NSImageNamePreferencesGeneral });
-        }
-
         let workspace = NSWorkspace::sharedWorkspace();
 
         if let Some(icon_path) = metadata
-            .preferred_icon_path
-            .as_deref()
-            .and_then(path_to_string)
+            .preferred_icon
+            .as_ref()
+            .and_then(|icon| match icon {
+                ProcessIconSource::Path(path) => path_to_string(path),
+                ProcessIconSource::ThemeName(_) => None,
+            })
         {
             return Some(workspace.iconForFile(&NSString::from_str(&icon_path)));
         }
@@ -1510,10 +1465,9 @@ struct PromptMetadata {
     title: String,
     intro: String,
     app_name: String,
-    modified_text: Option<String>,
     executable_path_text: String,
     executable_path: Option<PathBuf>,
-    preferred_icon_path: Option<PathBuf>,
+    preferred_icon: Option<ProcessIconSource>,
 }
 
 #[cfg(any(
@@ -1530,10 +1484,9 @@ impl PromptMetadata {
                 title,
                 intro,
                 app_name: "this app".to_owned(),
-                modified_text: None,
                 executable_path_text: "Unknown executable".to_owned(),
                 executable_path: None,
-                preferred_icon_path: None,
+                preferred_icon: None,
             };
         };
 
@@ -1541,82 +1494,77 @@ impl PromptMetadata {
             access_scope,
             title,
             intro,
-            app_name: display.name.clone(),
-            modified_text: modified_text(display.modified),
+            app_name: display.presentation_name(),
             executable_path_text: display.path.display().to_string(),
             executable_path: Some(display.path.clone()),
-            preferred_icon_path: display.icon_path.clone(),
+            preferred_icon: display.preferred_icon().cloned(),
         }
     }
 }
 
-fn modified_text(modified: Option<std::time::SystemTime>) -> Option<String> {
-    modified.map(|modified| {
-        let modified: DateTime<Local> = modified.into();
-        format!(
-            "(Modified {})",
-            modified.format("%e %b %Y").to_string().trim_start()
-        )
-    })
-}
-
 fn prompt_text(access_scope: AccessScope) -> String {
-    format!(
-        "Enter your password to allow {} access to this app:",
-        access_scope.as_str()
-    )
+    let scope = match access_scope {
+        AccessScope::Items => "item",
+        AccessScope::Settings => "Monopass settings",
+    };
+    format!("Enter your password to allow {} access to this app:", scope)
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
     use std::path::PathBuf;
-    #[cfg(target_os = "macos")]
-    use std::time::{Duration, UNIX_EPOCH};
 
     use zeroize::{Zeroize, Zeroizing};
 
     use super::AccessScope;
     #[cfg(target_os = "macos")]
-    use super::ProcessDisplay;
+    use super::{ProcessDisplay, ProcessIconSource};
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn metadata_for_app_caller_uses_bundle_name_and_icon_path() {
-        let metadata = super::PromptMetadata::from_display(
-            Some(&ProcessDisplay {
-                name: "Google Chrome".to_owned(),
-                path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
-                icon_path: Some("/Applications/Google Chrome.app".into()),
-                modified: Some(UNIX_EPOCH + Duration::from_secs(1_781_225_600)),
-            }),
-            AccessScope::Items,
-        );
+    fn item_and_settings_metadata_share_caller_icon_and_path() {
+        let display = ProcessDisplay {
+            name: "Google Chrome".to_owned(),
+            path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
+            icon: Some(ProcessIconSource::Path(
+                "/Applications/Google Chrome.app".into(),
+            )),
+            gui_application: None,
+        };
+        let item = super::PromptMetadata::from_display(Some(&display), AccessScope::Items);
+        let settings = super::PromptMetadata::from_display(Some(&display), AccessScope::Settings);
 
         assert_eq!(
             "Enter your password to allow item access to this app:",
-            metadata.intro
-        );
-        assert_eq!("Google Chrome", metadata.app_name);
-        assert!(
-            metadata
-                .modified_text
-                .is_some_and(|text| text.starts_with("(Modified "))
+            item.intro
         );
         assert_eq!(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            metadata.executable_path_text
+            "Enter your password to allow Monopass settings access to this app:",
+            settings.intro
         );
+        assert_ne!(item.title, settings.title);
+        assert_eq!("Google Chrome", item.app_name);
+        assert_eq!(item.app_name, settings.app_name);
+        assert_eq!(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            item.executable_path_text
+        );
+        assert_eq!(item.executable_path_text, settings.executable_path_text);
         assert_eq!(
             Some(PathBuf::from(
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
             )),
-            metadata.executable_path
+            item.executable_path
         );
+        assert_eq!(item.executable_path, settings.executable_path);
         assert_eq!(
-            Some(PathBuf::from("/Applications/Google Chrome.app")),
-            metadata.preferred_icon_path
+            Some(ProcessIconSource::Path(PathBuf::from(
+                "/Applications/Google Chrome.app"
+            ))),
+            item.preferred_icon
         );
+        assert_eq!(item.preferred_icon, settings.preferred_icon);
     }
 
     #[test]
@@ -1626,20 +1574,19 @@ mod tests {
             Some(&ProcessDisplay {
                 name: "example-tool".to_owned(),
                 path: "/usr/local/bin/example-tool".into(),
-                icon_path: None,
-                modified: None,
+                icon: None,
+                gui_application: None,
             }),
             AccessScope::Items,
         );
 
         assert_eq!("example-tool", metadata.app_name);
-        assert_eq!(None, metadata.modified_text);
         assert_eq!("/usr/local/bin/example-tool", metadata.executable_path_text);
         assert_eq!(
             Some(PathBuf::from("/usr/local/bin/example-tool")),
             metadata.executable_path
         );
-        assert_eq!(None, metadata.preferred_icon_path);
+        assert_eq!(None, metadata.preferred_icon);
     }
 
     #[tokio::test]

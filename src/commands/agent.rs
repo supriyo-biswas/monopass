@@ -23,6 +23,9 @@ const LAUNCHD_SOCKET_NAME: &str = "monopass-agent";
 pub fn run(config: &Config) -> AppResult {
     harden_agent_process()?;
 
+    #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+    agent::initialize_gui_application_catalog();
+
     #[cfg(any(
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))

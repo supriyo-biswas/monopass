@@ -342,8 +342,8 @@ mod tests {
         let display = ProcessDisplay {
             name: "Example".to_owned(),
             path: "example".into(),
-            icon_path: None,
-            modified: None,
+            icon: None,
+            gui_application: None,
         };
         let response = display_router()
             .oneshot(request_with_connect_info(PeerConnectInfo {

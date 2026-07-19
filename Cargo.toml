@@ -6,8 +6,8 @@ edition = "2024"
 [features]
 default = ["direct"]
 direct = []
-gtk = ["dep:gtk4"]
-qt = ["dep:qmetaobject"]
+gtk = ["dep:freedesktop-desktop-entry", "dep:gtk4"]
+qt = ["dep:freedesktop-desktop-entry", "dep:qmetaobject"]
 
 [dependencies]
 age = "0.11"
@@ -18,6 +18,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 data-encoding = "2.9.0"
 getrandom = "0.3.4"
 globset = "0.4.19"
+freedesktop-desktop-entry = { version = "0.8.1", default-features = false, optional = true }
 gtk4 = { version = "0.9", optional = true }
 hmac = "0.12.1"
 http-body-util = "0.1.3"
@@ -46,11 +47,12 @@ zxcvbn = "3.1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSImage", "NSImageView", "NSParagraphStyle", "NSResponder", "NSRunningApplication", "NSSecureTextField", "NSTextField", "NSView", "NSWindow", "NSWorkspace", "objc2-core-foundation", "objc2-uniform-type-identifiers"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSDate", "NSRunLoop", "NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSImage", "NSImageView", "NSParagraphStyle", "NSResponder", "NSRunningApplication", "NSSecureTextField", "NSTextField", "NSView", "NSWindow", "NSWorkspace", "libc", "objc2-core-foundation", "objc2-uniform-type-identifiers"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSDate", "NSRunLoop", "NSString", "NSURL"] }
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["UTCoreTypes", "UTType"] }
 
 [dev-dependencies]
+freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
 tower = { version = "0.5.2", features = ["util"] }
 
 [profile.release]

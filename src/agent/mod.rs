@@ -1,5 +1,7 @@
 mod auth;
 mod controller;
+#[cfg(any(test, all(target_os = "linux", any(feature = "gtk", feature = "qt"))))]
+mod desktop;
 mod error;
 mod export;
 #[cfg(any(
@@ -14,6 +16,8 @@ mod server;
 mod state;
 
 pub use auth::PeerConnectInfo;
+#[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
+pub(crate) use desktop::initialize_gui_application_catalog;
 #[cfg(any(
     target_os = "macos",
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))

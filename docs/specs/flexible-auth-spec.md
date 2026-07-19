@@ -84,10 +84,33 @@ The GUI method is available on macOS and on Linux GUI-capable builds. It prompts
 for the master password in a dialog owned by the agent. The dialog identifies
 the requesting application from the authorized process chain, selecting the
 nearest caller after filtering out processes whose executable identity matches
-the running agent binary. The dialog shows the application name, executable path,
-and an icon when the platform backend can resolve one. Item prompts retain the
-requesting application icon. Settings prompts use a platform settings icon.
-Window titles and prompt copy identify the requested scope.
+the running agent binary. It then looks for the nearest confidently recognized
+GUI application in parent ancestry. This presentation-only lookup may continue
+beyond the session boundary where verified authorization traversal stops. On
+macOS, when that traversal reaches a process whose effective UID differs from
+its real UID, and the real UID and parent both match the requesting user,
+presentation lookup resumes from the process above that credential boundary.
+This covers the root-owned `login` process used by Terminal and iTerm2 without
+changing the verified authorization chain. The resumed ancestry still uses the
+normal GUI-application recognition described below. Different identities are
+shown as a composite such as `bash (via Terminal)`; a direct GUI caller uses its
+localized application name without redundant attribution. The executable path
+remains that of the direct executable selected for display. All prompt scopes
+use the same application icon resolution: they prefer the GUI application icon,
+then use the existing generic icon fallback. Dialogs do not display executable
+modification timestamps.
+
+On macOS, regular and accessory application ancestors with an application
+bundle provide localized names and bundle icons. Linux GUI builds use a
+locale-aware XDG desktop-entry catalog loaded at agent startup. Exact unique
+`Exec`/`TryExec` executable matches are preferred, followed by exact desktop-file
+IDs derived from systemd application scopes. Hidden, non-display,
+terminal-hosted, wrong-desktop, and ambiguous entries are ignored. Missing
+metadata or icon-load failures preserve the direct executable label and generic
+icon fallback. GUI application names, desktop IDs, and icons are
+presentation-only: they are not included in `ScopeHash` or `UltimateProcess` and
+do not affect authorization, denial caching, or direct-unlock trust. Window
+titles and prompt copy identify the requested scope.
 
 Linux GUI unlock requires the same accepted GUI session capability on the GUI
 unlock request that was used for method discovery. Linux GTK and Qt variants
