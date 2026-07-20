@@ -1540,7 +1540,7 @@ mod tests {
             item.intro
         );
         assert_eq!(
-            "Enter your password to allow Monopass settings access to this app:",
+            "Enter your password to allow settings access to this app:",
             settings.intro
         );
         assert_ne!(item.title, settings.title);
@@ -1617,7 +1617,7 @@ mod tests {
         assert_eq!("monopass settings access requested", metadata.title);
         assert_eq!(AccessScope::Settings, metadata.access_scope);
         assert_eq!(
-            "Enter your password to allow Monopass settings access to this app:",
+            "Enter your password to allow settings access to this app:",
             metadata.intro
         );
     }
