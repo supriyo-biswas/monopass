@@ -101,13 +101,16 @@ then use the existing generic icon fallback. Dialogs do not display executable
 modification timestamps.
 
 On macOS, regular and accessory application ancestors with an application
-bundle provide localized names and bundle icons. Linux GUI builds use a
-locale-aware XDG desktop-entry catalog loaded at agent startup. Exact unique
-`Exec`/`TryExec` executable matches are preferred, followed by exact desktop-file
-IDs derived from systemd application scopes. Hidden, non-display,
-terminal-hosted, wrong-desktop, and ambiguous entries are ignored. Missing
-metadata or icon-load failures preserve the direct executable label and generic
-icon fallback. GUI application names, desktop IDs, and icons are
+bundle provide localized names and bundle icons. Linux GUI builds use a cached,
+locale-aware XDG desktop-entry catalog. Exact unique `Exec`/`TryExec` executable
+matches are preferred, followed by exact desktop-file IDs derived from systemd
+application scopes and stable application slices. If the complete ancestry has
+no GUI match, the agent refreshes the catalog at runtime and retries once;
+repeated miss-triggered refreshes are briefly throttled. This allows newly
+installed applications to be recognized without restarting the agent. Hidden,
+non-display, terminal-hosted, wrong-desktop, and ambiguous entries are ignored.
+Missing metadata or icon-load failures preserve the direct executable label and
+generic icon fallback. GUI application names, desktop IDs, and icons are
 presentation-only: they are not included in `ScopeHash` or `UltimateProcess` and
 do not affect authorization, denial caching, or direct-unlock trust. Window
 titles and prompt copy identify the requested scope.

@@ -2,22 +2,78 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use freedesktop_desktop_entry::{DesktopEntry, Iter, get_languages_from_env};
 
 use super::process::{GuiApplication, ProcessIconSource};
 
-static CATALOG: OnceLock<DesktopCatalog> = OnceLock::new();
+const MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+
+static CATALOG: OnceLock<DesktopCatalogCache> = OnceLock::new();
 
 pub(crate) fn initialize_gui_application_catalog() {
-    let _ = CATALOG.set(DesktopCatalog::load());
+    let _ = CATALOG.set(DesktopCatalogCache::new(DesktopCatalog::load()));
 }
 
 pub(crate) fn application_for_process(pid: i32, executable: &Path) -> Option<GuiApplication> {
     CATALOG
-        .get_or_init(DesktopCatalog::load)
+        .get_or_init(|| DesktopCatalogCache::new(DesktopCatalog::load()))
         .application_for_process(pid, executable)
+}
+
+pub(crate) fn refresh_gui_application_catalog_after_miss() -> bool {
+    CATALOG
+        .get_or_init(|| DesktopCatalogCache::new(DesktopCatalog::load()))
+        .refresh_after_miss(Instant::now(), DesktopCatalog::load)
+}
+
+#[derive(Debug, Default)]
+struct CatalogRefreshState {
+    last_miss_refresh: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct DesktopCatalogCache {
+    catalog: RwLock<DesktopCatalog>,
+    refresh: Mutex<CatalogRefreshState>,
+}
+
+impl DesktopCatalogCache {
+    fn new(catalog: DesktopCatalog) -> Self {
+        Self {
+            catalog: RwLock::new(catalog),
+            refresh: Mutex::new(CatalogRefreshState::default()),
+        }
+    }
+
+    fn application_for_process(&self, pid: i32, executable: &Path) -> Option<GuiApplication> {
+        self.catalog
+            .read()
+            .ok()?
+            .application_for_process(pid, executable)
+    }
+
+    fn refresh_after_miss(&self, now: Instant, load: impl FnOnce() -> DesktopCatalog) -> bool {
+        let Ok(mut refresh) = self.refresh.lock() else {
+            return false;
+        };
+        if refresh
+            .last_miss_refresh
+            .is_some_and(|last| now.saturating_duration_since(last) < MISS_REFRESH_COOLDOWN)
+        {
+            return false;
+        }
+
+        let replacement = load();
+        let Ok(mut catalog) = self.catalog.write() else {
+            return false;
+        };
+        *catalog = replacement;
+        refresh.last_miss_refresh = Some(now);
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,24 +256,29 @@ fn application_ids_from_cgroup(cgroup: &str) -> Vec<String> {
             let Some(unit) = decode_systemd_unit_name(unit) else {
                 continue;
             };
-            let Some(body) = unit
-                .strip_prefix("app-")
-                .and_then(|unit| unit.strip_suffix(".scope"))
-            else {
+            let Some(body) = unit.strip_prefix("app-") else {
                 continue;
             };
-            let Some((without_random, _random)) = body.rsplit_once('-') else {
-                continue;
-            };
-            push_unique(&mut ids, without_random.to_owned());
-            if let Some((launcher, app_id)) = without_random.split_once('-')
-                && matches!(launcher, "gnome" | "KDE" | "flatpak")
+
+            if let Some(stable_id) = body.strip_suffix(".slice") {
+                push_application_id_candidates(&mut ids, stable_id);
+            } else if let Some(scope) = body.strip_suffix(".scope")
+                && let Some((without_random, _random)) = scope.rsplit_once('-')
             {
-                push_unique(&mut ids, app_id.to_owned());
+                push_application_id_candidates(&mut ids, without_random);
             }
         }
     }
     ids
+}
+
+fn push_application_id_candidates(ids: &mut Vec<String>, value: &str) {
+    push_unique(ids, value.to_owned());
+    if let Some((launcher, app_id)) = value.split_once('-')
+        && matches!(launcher, "gnome" | "KDE" | "flatpak")
+    {
+        push_unique(ids, app_id.to_owned());
+    }
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -259,11 +320,14 @@ fn hex(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
 
     use freedesktop_desktop_entry::DesktopEntry;
     use tempfile::TempDir;
 
-    use super::{DesktopCatalog, ProcessIconSource};
+    use super::{DesktopCatalog, DesktopCatalogCache, ProcessIconSource};
 
     #[test]
     fn parses_gnome_kde_and_escaped_application_scopes() {
@@ -280,6 +344,19 @@ mod tests {
                 "org.kde.konsole",
                 "org.example.Foo-Bar",
             ],
+            super::application_ids_from_cgroup(cgroup)
+        );
+    }
+
+    #[test]
+    fn parses_stable_gnome_application_slice() {
+        let cgroup = concat!(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/",
+            "app-org.gnome.Terminal.slice/gnome-terminal-server.service\n",
+        );
+
+        assert_eq!(
+            vec!["org.gnome.Terminal"],
             super::application_ids_from_cgroup(cgroup)
         );
     }
@@ -434,6 +511,95 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn resolves_gnome_terminal_server_from_stable_application_slice() {
+        let catalog = DesktopCatalog::from_entries(
+            entries(&[(
+                "org.gnome.Terminal.desktop",
+                entry("Terminal", "gnome-terminal", "terminal", ""),
+            )]),
+            &[],
+            &[],
+        );
+        let cgroup = concat!(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/",
+            "app-org.gnome.Terminal.slice/gnome-terminal-server.service\n",
+        );
+
+        assert_eq!(
+            "Terminal",
+            catalog
+                .application(
+                    std::path::Path::new("/usr/libexec/gnome-terminal-server"),
+                    Some(cgroup)
+                )
+                .unwrap()
+                .name
+        );
+    }
+
+    #[test]
+    fn refresh_after_miss_replaces_catalog_and_is_throttled() {
+        let cache = DesktopCatalogCache::new(DesktopCatalog::default());
+        let now = Instant::now();
+
+        assert!(
+            cache.refresh_after_miss(now, || DesktopCatalog::from_entries(
+                entries(&[(
+                    "lxterminal.desktop",
+                    entry("LXTerminal", "lxterminal", "lxterminal", ""),
+                )]),
+                &[],
+                &[],
+            ))
+        );
+        assert_eq!(
+            "LXTerminal",
+            cache
+                .application_for_process(0, std::path::Path::new("/usr/bin/lxterminal"))
+                .unwrap()
+                .name
+        );
+
+        let loads = AtomicUsize::new(0);
+        assert!(!cache.refresh_after_miss(now + Duration::from_secs(1), || {
+            loads.fetch_add(1, Ordering::Relaxed);
+            DesktopCatalog::default()
+        }));
+        assert_eq!(0, loads.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn concurrent_misses_trigger_one_catalog_refresh() {
+        const THREADS: usize = 8;
+        let cache = Arc::new(DesktopCatalogCache::new(DesktopCatalog::default()));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let threads = (0..THREADS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                let loads = Arc::clone(&loads);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.refresh_after_miss(now, || {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        DesktopCatalog::default()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let refreshed = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|refreshed| *refreshed)
+            .count();
+        assert_eq!(1, refreshed);
+        assert_eq!(1, loads.load(Ordering::Relaxed));
     }
 
     fn entries(values: &[(&str, String)]) -> Vec<DesktopEntry> {

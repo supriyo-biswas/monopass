@@ -191,8 +191,7 @@ mod linux_prompt {
     use zeroize::Zeroizing;
 
     use super::{
-        AccessScope, ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequest,
-        PromptRequestReceiver,
+        ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequest, PromptRequestReceiver,
     };
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
@@ -525,9 +524,7 @@ mod linux_prompt {
     use qmetaobject::{QObjectPinned, prelude::*};
     use zeroize::Zeroizing;
 
-    use super::{
-        AccessScope, ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequestReceiver,
-    };
+    use super::{ProcessIconSource, PromptMetadata, PromptOutcome, PromptRequestReceiver};
 
     const GENERIC_TERMINAL_ICON_NAMES: &[&str] = &[
         "utilities-terminal",
@@ -1505,7 +1502,7 @@ impl PromptMetadata {
 fn prompt_text(access_scope: AccessScope) -> String {
     let scope = match access_scope {
         AccessScope::Items => "item",
-        AccessScope::Settings => "Monopass settings",
+        AccessScope::Settings => "settings",
     };
     format!("Enter your password to allow {} access to this app:", scope)
 }
@@ -1604,6 +1601,9 @@ mod tests {
 
     #[test]
     fn prompt_text_without_process_display_is_generic() {
+        let metadata = super::PromptMetadata::from_display(None, AccessScope::Items);
+
+        assert_eq!("monopass items access requested", metadata.title);
         assert_eq!(
             "Enter your password to allow item access to this app:",
             super::prompt_text(AccessScope::Items)

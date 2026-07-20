@@ -110,8 +110,12 @@ without redundant `via` text. The executable path always describes the direct
 executable selected for display, not its GUI host. All prompt scopes use the
 same application icon resolution: they prefer the GUI application's icon, then
 use the existing generic icon fallback if GUI application or icon discovery is
-missing or ambiguous. Dialogs do not display executable modification timestamps.
-This GUI metadata is presentation-only and is not part of process
+missing or ambiguous. Linux resolves exact unique desktop-entry executables and
+systemd desktop IDs from both randomized application scopes and stable
+application slices. Its cached XDG desktop-entry catalog is refreshed and the
+ancestry retried once after a complete miss, with repeated miss-triggered
+refreshes briefly throttled. Dialogs do not display executable modification
+timestamps. This GUI metadata is presentation-only and is not part of process
 authorization or direct-unlock trust evaluation. Linux GUI unlock requires an
 accepted GUI session capability (`x-session` or
 `wayland-session`) and uses

@@ -407,14 +407,20 @@ fn process_display_from_chain_with_agent_and_gui(
                 .find(|process| process.executable_path.is_some())
         })?;
     let mut display = process_display(primary)?;
-    display.gui_application = chain.iter().rev().find_map(|process| {
-        let mut application = gui_resolver.gui_application(process)?;
-        application.same_as_primary = process.instance == primary.instance
-            || process
-                .executable
-                .is_some_and(|identity| primary.executable == Some(identity));
-        Some(application)
-    });
+    let resolve_gui_application = || {
+        chain.iter().rev().find_map(|process| {
+            let mut application = gui_resolver.gui_application(process)?;
+            application.same_as_primary = process.instance == primary.instance
+                || process
+                    .executable
+                    .is_some_and(|identity| primary.executable == Some(identity));
+            Some(application)
+        })
+    };
+    display.gui_application = resolve_gui_application();
+    if display.gui_application.is_none() && gui_resolver.refresh_after_miss() {
+        display.gui_application = resolve_gui_application();
+    }
     Some(display)
 }
 
@@ -439,6 +445,10 @@ fn process_display(process: &ProcessInfo) -> Option<ProcessDisplay> {
 
 trait GuiApplicationResolver {
     fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication>;
+
+    fn refresh_after_miss(&self) -> bool {
+        false
+    }
 }
 
 struct PlatformGuiApplicationResolver;
@@ -477,6 +487,10 @@ impl GuiApplicationResolver for PlatformGuiApplicationResolver {
     fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication> {
         let executable = process.executable_path.as_deref()?;
         super::desktop::application_for_process(process.instance.pid, executable)
+    }
+
+    fn refresh_after_miss(&self) -> bool {
+        super::desktop::refresh_gui_application_catalog_after_miss()
     }
 }
 
@@ -825,6 +839,7 @@ compile_error!("process-lineage authorization is supported only on Linux and mac
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1386,6 +1401,30 @@ mod tests {
     }
 
     #[test]
+    fn missing_gui_metadata_is_retried_after_catalog_refresh() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(10, 1, UID, SID, 2, "/usr/bin/lxterminal")
+            .with_uid_only(1, 0);
+        let gui = RefreshingFakeGuiResolver {
+            application_pid: 10,
+            refreshed: Cell::new(false),
+            refreshes: Cell::new(0),
+        };
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[10, 11, 12]),
+            Some(test_executable(4)),
+            &gui,
+        )
+        .unwrap();
+
+        assert_eq!("bash (via LXTerminal)", display.presentation_name());
+        assert_eq!(1, gui.refreshes.get());
+    }
+
+    #[test]
     fn nested_gui_ancestors_choose_nearest_application() {
         let resolver = FakeResolver::default()
             .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
@@ -1567,6 +1606,30 @@ mod tests {
     impl super::GuiApplicationResolver for FakeGuiResolver {
         fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplication> {
             self.applications.get(&process.instance.pid).cloned()
+        }
+    }
+
+    struct RefreshingFakeGuiResolver {
+        application_pid: i32,
+        refreshed: Cell<bool>,
+        refreshes: Cell<usize>,
+    }
+
+    impl super::GuiApplicationResolver for RefreshingFakeGuiResolver {
+        fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplication> {
+            (self.refreshed.get() && process.instance.pid == self.application_pid).then(|| {
+                super::GuiApplication {
+                    name: "LXTerminal".to_owned(),
+                    icon: Some(super::ProcessIconSource::ThemeName("lxterminal".into())),
+                    same_as_primary: false,
+                }
+            })
+        }
+
+        fn refresh_after_miss(&self) -> bool {
+            self.refreshed.set(true);
+            self.refreshes.set(self.refreshes.get() + 1);
+            true
         }
     }
 }
