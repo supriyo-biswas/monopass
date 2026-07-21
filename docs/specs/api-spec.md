@@ -206,6 +206,12 @@ authorization for the caller's process lineage. An `items` authorization does
 not grant settings access, even if the request includes a valid master-password
 bearer. Settings requests do not consume bearer passwords.
 
+Directories may carry internal bitmask flags. `DIR_HIDDEN = 1 << 0` hides a
+directory from public directory lists, and `DIR_SYSTEM = 1 << 1` blocks public
+item mutations. `DIR_DENY_OVERWRITE = 1 << 2` specifically blocks item PATCH
+and version restoration with `403 access_denied`; item creation, copy, move,
+read, listing, and permanent deletion retain their normal behavior.
+
 Items may also carry internal bitmask flags. `ITEM_HIDDEN = 1 << 0` hides an
 item from public item reads and lists. `ITEM_READ_MUSTAUTH = 1 << 1` adds a
 per-request master-password check for secret-bearing reads: `GET Item` with
@@ -224,7 +230,12 @@ under `user.*` names:
 | `user.settingsAuthTtlSeconds` | `300` | integer seconds, `1..=604800` |
 | `user.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
 | `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
+| `user.autoDeleteTrashItemsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
+| `user.autoDeleteOldVersionsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
 | `user.trustedProgramPaths` | `[]` | JSON-serialized array of valid path globs |
+
+Opening a database inserts any missing registered user settings with their
+defaults and leaves existing rows unchanged.
 
 `user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
 effect immediately for new and existing cached item authorizations.
@@ -234,7 +245,14 @@ and likewise applies immediately to new and existing entries.
 seconds until the encrypted setting is first loaded by a successful unlock,
 then keeps the loaded value in memory through later database unloads. Changes
 take effect immediately for new and existing cached denials. `user.gcSeconds`
-controls the best-effort idle cleanup cadence. `user.trustedProgramPaths`
+controls the best-effort idle cleanup cadence.
+`user.autoDeleteTrashItemsAfterSeconds` controls how long items remain in
+`Trash`, measured from its current `updated_at` timestamp. Moving or renaming
+an item within `Trash` refreshes `updated_at` and postpones deletion.
+`user.autoDeleteOldVersionsAfterSeconds`
+controls retention of non-latest item versions. For either setting, `0`
+disables that category of automatic deletion and positive values take effect
+on the next eligible cleanup. `user.trustedProgramPaths`
 controls which non-agent ultimate executables may use direct unlock. Patterns
 are matched case-sensitively against canonical executable paths. `*` does not
 cross path separators; `**` may match recursive path components. Empty,
@@ -255,6 +273,8 @@ Content-Type: application/json
 
 {
   "user.authTtlSeconds": "900",
+  "user.autoDeleteOldVersionsAfterSeconds": "15552000",
+  "user.autoDeleteTrashItemsAfterSeconds": "15552000",
   "user.settingsAuthTtlSeconds": "300",
   "user.denialTtlSeconds": "60",
   "user.gcSeconds": "3600",
@@ -504,6 +524,8 @@ from item lists and direct public item/reference/version access returns
 deleted through the public API. Internal system directories reject public
 create, copy, move, update, restore, and delete item operations with
 `403 access_denied`.
+Directories with `DIR_DENY_OVERWRITE` reject only update and restore operations
+with `403 access_denied`.
 
 ### Create Item
 
@@ -641,6 +663,9 @@ omitted from the request are retained. Mixed entries such as `{ "name": "...",
 map-shaped `fields`/`files`, and removal entries in create, copy, or move
 requests are rejected as `400 bad_request`.
 
+If the target directory has `DIR_DENY_OVERWRITE`, update returns
+`403 access_denied`.
+
 ### Get Item
 
 ```http
@@ -753,6 +778,8 @@ be a positive integer. Missing, empty, malformed, zero, or negative versions
 return `400 bad_request`; well-formed but missing or cleaned-up versions return
 `404 not_found`. Restoring the current latest version returns
 `400 bad_request`.
+If the target directory has `DIR_DENY_OVERWRITE`, restore returns
+`403 access_denied`.
 
 ### Delete Item
 
@@ -866,22 +893,30 @@ returned by this endpoint.
 `version` is optional and follows the same validation and retained-version
 lookup rules as `GET /api/v1/dir/{dirName}/item/{itemName}?version={n}`.
 
-## Orphan File Cleanup
+## Retention And Orphan File Cleanup
 
 Uploaded files can become orphaned when they are never attached to an item, when
 their item is deleted, or when old item versions that referenced them are
 deleted. Orphan file rows are `files` rows that have no matching rows in
 `item_version_file_mapping`.
 
-The authorization-expiry unload path also performs file cleanup while the
-database is still unlocked. Immediately before unloading the database after all
-cached process-lineage authorizations expire, the agent deletes non-latest item
-versions whose `created_at` timestamp is more than 90 days old, repairs each
-affected item's `oldest_version_id`, then deletes orphan file rows and encrypted
-external blobs whose `created_at` timestamp is more than 1 day old. Recent
-orphan files and files still attached to remaining versions are retained. If
-deleting an external blob fails, the database row is kept so a later cleanup
-pass can retry.
+The authorization-expiry unload path performs best-effort cleanup while the
+database is still unlocked and `user.gcSeconds` says cleanup is due. It
+permanently deletes items joined to the reserved `Trash` directory whose
+`updated_at` timestamp has reached the configured Trash retention period, then
+deletes non-latest item versions whose
+`created_at` timestamp has reached the configured old-version retention period
+and repairs each affected item's `oldest_version_id`. The latest version of an
+item is never deleted by version cleanup. Either category is skipped when its
+setting is `0` or cannot be read as a valid duration.
+
+Moving or renaming an item within Trash refreshes `updated_at`, postponing its
+automatic deletion.
+
+Cleanup then deletes orphan file rows and encrypted external blobs whose
+`created_at` timestamp is more than 1 day old. Recent orphan files and files
+still attached to remaining versions are retained. If deleting an external
+blob fails, the database row is kept so a later cleanup pass can retry.
 
 Item version listing and historical reads only expose retained rows. A version
 that existed previously can return `404 not_found` after idle cleanup removes
@@ -925,11 +960,13 @@ VALUES
   ('user.settingsAuthTtlSeconds', '300'),
   ('user.denialTtlSeconds', '60'),
   ('user.gcSeconds', '3600'),
+  ('user.autoDeleteTrashItemsAfterSeconds', '15552000'),
+  ('user.autoDeleteOldVersionsAfterSeconds', '15552000'),
   ('user.trustedProgramPaths', '[]');
 
 -- Init also creates:
--- - hidden dir `Trash`
--- - hidden + system dir `_Internal`
+-- - dir `Trash` with bitmask `DIR_HIDDEN | DIR_DENY_OVERWRITE`
+-- - dir `_Internal` with bitmask `DIR_HIDDEN | DIR_SYSTEM`
 -- - normal dir `Personal`
 -- - hidden item `_Internal/FileEncryptionKey` with bitmask
 --   `ITEM_HIDDEN | ITEM_READ_MUSTAUTH` and a concealed string field named
@@ -1012,8 +1049,12 @@ CREATE TABLE jobs (
     error_message TEXT
 ) WITHOUT ROWID;
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 ```
+
+The schema-v2 migration leaves the table schema unchanged and adds
+`DIR_DENY_OVERWRITE` to the reserved Trash directory bitmask while preserving
+all existing directory flags and setting values.
 
 Fresh databases store encrypted file blobs outside the SQLCipher database under
 `files/` in the app data directory. This is the app XDG data directory, except

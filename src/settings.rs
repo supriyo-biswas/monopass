@@ -6,7 +6,13 @@ pub(crate) const AUTH_TTL_SETTING: &str = "user.authTtlSeconds";
 pub(crate) const SETTINGS_AUTH_TTL_SETTING: &str = "user.settingsAuthTtlSeconds";
 pub(crate) const DENIAL_TTL_SETTING: &str = "user.denialTtlSeconds";
 pub(crate) const GC_SECONDS_SETTING: &str = "user.gcSeconds";
+pub(crate) const AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING: &str =
+    "user.autoDeleteTrashItemsAfterSeconds";
+pub(crate) const AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING: &str =
+    "user.autoDeleteOldVersionsAfterSeconds";
 pub(crate) const TRUSTED_PROGRAM_PATHS_SETTING: &str = "user.trustedProgramPaths";
+
+const FIVE_YEARS_SECONDS: u64 = 5 * 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UserSettingKind {
@@ -97,6 +103,22 @@ pub(crate) const USER_SETTINGS: &[UserSetting] = &[
         kind: UserSettingKind::Seconds {
             min: 60,
             max: 2_592_000,
+        },
+    },
+    UserSetting {
+        name: AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING,
+        default: "15552000",
+        kind: UserSettingKind::Seconds {
+            min: 0,
+            max: FIVE_YEARS_SECONDS,
+        },
+    },
+    UserSetting {
+        name: AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
+        default: "15552000",
+        kind: UserSettingKind::Seconds {
+            min: 0,
+            max: FIVE_YEARS_SECONDS,
         },
     },
     UserSetting {

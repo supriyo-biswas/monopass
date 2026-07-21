@@ -122,6 +122,14 @@ the name is absent. Both commands append a newline to each printed value.
 argument is passed through unchanged. It produces no output on success. The
 agent remains responsible for rejecting unknown settings and invalid values.
 
+The retention settings `user.autoDeleteTrashItemsAfterSeconds` and
+`user.autoDeleteOldVersionsAfterSeconds` default to `15552000` seconds (180
+days), accept values from `0` through `157680000` seconds (five 365-day years),
+and use `0` to disable their respective cleanup category. Trash retention is
+measured from an item's current `updated_at`; moving or renaming it within Trash
+refreshes that timestamp and postpones deletion. Cleanup is best-effort on
+authorization-expiry unloads at the `user.gcSeconds` cadence.
+
 ## init command
 
 ```
@@ -299,6 +307,8 @@ version. Omitted fields and files are retained. Field and file names must stay
 unique in the resulting item version. Fields or files deleted during editing
 are sent as update-only removal entries, for example
 `{ "name": "old_password", "remove": true }`.
+`monopass edit Trash/...` fails with `403 access_denied` because Trash denies
+item overwrites.
 
 ## remove command
 
@@ -442,7 +452,8 @@ monopass restore <dir>/<item> <version>
 
 Restore a retained version with
 `PUT /api/v1/dir/{dirName}/item/{itemName}/restore?version={n}` so it becomes
-the latest version.
+the latest version. `monopass restore Trash/...` fails with
+`403 access_denied` because Trash denies item overwrites.
 
 ## show item
 

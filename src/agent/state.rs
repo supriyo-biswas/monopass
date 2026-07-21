@@ -37,14 +37,15 @@ use crate::conceal::inferred_concealed;
 use crate::config::Config;
 use crate::db;
 use crate::settings::{
-    AUTH_TTL_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING, SETTINGS_AUTH_TTL_SETTING,
-    SettingsError, TRUSTED_PROGRAM_PATHS_SETTING, trusted_program_path_matcher, user_setting,
+    AUTH_TTL_SETTING, AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
+    AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING,
+    SETTINGS_AUTH_TTL_SETTING, SettingsError, TRUSTED_PROGRAM_PATHS_SETTING,
+    trusted_program_path_matcher, user_setting,
 };
 
 const SCOPE_CACHE_CAPACITY: usize = 32;
 const AUTH_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const DATABASE_READER_WORKERS: usize = 8;
-const ITEM_VERSION_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const FILE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const FILE_ID_BYTES: usize = 16;
 const FILE_KEY_BYTES: usize = 32;
@@ -59,12 +60,14 @@ pub(crate) const MAX_FILE_UPLOAD_BYTES: u64 = MAX_FILE_RECORDS * FILE_RECORD_PLA
 const PAGE_MARKER_VERSION: u8 = 1;
 const PASSWORD_ITERATIONS: u32 = 5_000;
 const INTERNAL_DIR_NAME: &str = "_Internal";
+const TRASH_DIR_NAME: &str = "Trash";
 const FILE_ENCRYPTION_KEY_ITEM_NAME: &str = "FileEncryptionKey";
 #[cfg(test)]
 const AGE_PUBLIC_KEY_ITEM_NAME: &str = "AgePublicKey";
 const AGE_PRIVATE_KEY_ITEM_NAME: &str = "AgePrivateKey";
 const DIR_HIDDEN: i64 = 1 << 0;
 const DIR_SYSTEM: i64 = 1 << 1;
+pub(crate) const DIR_DENY_OVERWRITE: i64 = 1 << 2;
 const ITEM_HIDDEN: i64 = 1 << 0;
 pub(crate) const ITEM_READ_MUSTAUTH: i64 = 1 << 1;
 
@@ -444,6 +447,16 @@ impl AgentState {
             .user_setting_duration(GC_SECONDS_SETTING)
             .await
             .ok();
+        let trash_retention = database
+            .user_setting_duration(AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING)
+            .await
+            .ok()
+            .filter(|duration| !duration.is_zero());
+        let version_retention = database
+            .user_setting_duration(AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING)
+            .await
+            .ok()
+            .filter(|duration| !duration.is_zero());
 
         let cleanup_due = {
             let mut inner = self.inner.lock().await;
@@ -478,10 +491,13 @@ impl AgentState {
         };
 
         if cleanup_due {
-            let version_cutoff = now.checked_sub(ITEM_VERSION_RETENTION).unwrap_or(now);
+            let trash_cutoff =
+                trash_retention.map(|retention| now.checked_sub(retention).unwrap_or(now));
+            let version_cutoff =
+                version_retention.map(|retention| now.checked_sub(retention).unwrap_or(now));
             let file_cutoff = now.checked_sub(FILE_ORPHAN_RETENTION).unwrap_or(now);
             let _ = database
-                .cleanup_before_unload(version_cutoff, file_cutoff)
+                .cleanup_before_unload(trash_cutoff, version_cutoff, file_cutoff)
                 .await;
         }
 
@@ -1271,7 +1287,8 @@ impl DbHandle {
 
     async fn cleanup_before_unload(
         &self,
-        version_cutoff: Instant,
+        trash_cutoff: Option<Instant>,
+        version_cutoff: Option<Instant>,
         file_cutoff: Instant,
     ) -> Result<(), DbError> {
         #[cfg(test)]
@@ -1284,6 +1301,7 @@ impl DbHandle {
         }
 
         self.request_writer(|reply| DbCommand::CleanupBeforeUnload {
+            trash_cutoff,
             version_cutoff,
             file_cutoff,
             reply,
@@ -1524,7 +1542,11 @@ impl DbHandle {
     }
 
     #[cfg(test)]
-    async fn test_set_dir_bitmask(&self, name: &str, bitmask: i64) -> Result<(), DbError> {
+    pub(crate) async fn test_set_dir_bitmask(
+        &self,
+        name: &str,
+        bitmask: i64,
+    ) -> Result<(), DbError> {
         self.request_writer(|reply| DbCommand::TestSetDirBitmask {
             name: name.to_owned(),
             bitmask,
@@ -1590,6 +1612,22 @@ impl DbHandle {
             item_name: item_name.to_owned(),
             include_latest,
             created_at,
+            reply,
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn test_set_item_updated_at(
+        &self,
+        dir_name: &str,
+        item_name: &str,
+        updated_at: i64,
+    ) -> Result<(), DbError> {
+        self.request_writer(|reply| DbCommand::TestSetItemUpdatedAt {
+            dir_name: dir_name.to_owned(),
+            item_name: item_name.to_owned(),
+            updated_at,
             reply,
         })
         .await
@@ -1881,7 +1919,8 @@ enum DbCommand {
         reply: oneshot::Sender<Result<Duration, DbError>>,
     },
     CleanupBeforeUnload {
-        version_cutoff: Instant,
+        trash_cutoff: Option<Instant>,
+        version_cutoff: Option<Instant>,
         file_cutoff: Instant,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
@@ -1932,6 +1971,13 @@ enum DbCommand {
         item_name: String,
         include_latest: bool,
         created_at: i64,
+        reply: oneshot::Sender<Result<(), DbError>>,
+    },
+    #[cfg(test)]
+    TestSetItemUpdatedAt {
+        dir_name: String,
+        item_name: String,
+        updated_at: i64,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
     #[cfg(test)]
@@ -2148,11 +2194,16 @@ impl DatabaseWorker {
                 let _ = reply.send(self.user_setting_duration(&name));
             }
             DbCommand::CleanupBeforeUnload {
+                trash_cutoff,
                 version_cutoff,
                 file_cutoff,
                 reply,
             } => {
-                let _ = reply.send(self.cleanup_before_unload(version_cutoff, file_cutoff));
+                let _ = reply.send(self.cleanup_before_unload(
+                    trash_cutoff,
+                    version_cutoff,
+                    file_cutoff,
+                ));
             }
             #[cfg(test)]
             DbCommand::TestSleep { duration, reply } => {
@@ -2271,6 +2322,16 @@ impl DatabaseWorker {
                     include_latest,
                     created_at,
                 ));
+            }
+            #[cfg(test)]
+            DbCommand::TestSetItemUpdatedAt {
+                dir_name,
+                item_name,
+                updated_at,
+                reply,
+            } => {
+                let _ =
+                    reply.send(self.test_set_item_updated_at(&dir_name, &item_name, updated_at));
             }
             #[cfg(test)]
             DbCommand::TestOldestVersionIsEarliest {
@@ -3214,7 +3275,7 @@ impl DatabaseWorker {
             .connection
             .transaction()
             .map_err(|_| DbError::Internal)?;
-        let dir_id = writable_dir_id_in(&transaction, dir_name)?;
+        let dir_id = overwriteable_dir_id_in(&transaction, dir_name)?;
         let item_id = public_item_id_in(&transaction, dir_id, item_name)?
             .ok_or_else(|| item_not_found(dir_name, item_name))?;
 
@@ -3260,7 +3321,7 @@ impl DatabaseWorker {
             .connection
             .transaction()
             .map_err(|_| DbError::Internal)?;
-        let dir_id = writable_dir_id_in(&transaction, dir_name)?;
+        let dir_id = overwriteable_dir_id_in(&transaction, dir_name)?;
         let item = transaction
             .query_row(
                 r#"
@@ -3388,71 +3449,97 @@ impl DatabaseWorker {
 
     fn cleanup_before_unload(
         &mut self,
-        version_cutoff: Instant,
+        trash_cutoff: Option<Instant>,
+        version_cutoff: Option<Instant>,
         file_cutoff: Instant,
     ) -> Result<(), DbError> {
-        self.cleanup_old_item_versions(version_cutoff)?;
+        self.cleanup_expired_items_and_versions(trash_cutoff, version_cutoff)?;
         self.cleanup_orphan_files(file_cutoff)
     }
 
-    fn cleanup_old_item_versions(&mut self, cutoff: Instant) -> Result<(), DbError> {
-        let cutoff_timestamp = instant_to_timestamp(cutoff);
+    fn cleanup_expired_items_and_versions(
+        &mut self,
+        trash_cutoff: Option<Instant>,
+        version_cutoff: Option<Instant>,
+    ) -> Result<(), DbError> {
         let transaction = self
             .connection
             .transaction()
             .map_err(|_| DbError::Internal)?;
-        let affected_item_ids = {
-            let mut statement = transaction
-                .prepare(
-                    r#"
-                    SELECT DISTINCT item_id
-                    FROM item_versions v
-                    JOIN items i ON i.id = v.item_id
-                    WHERE v.created_at <= ?1
-                      AND v.version_id <> i.latest_version_id
-                    "#,
-                )
-                .map_err(|_| DbError::Internal)?;
-            statement
-                .query_map([cutoff_timestamp], |row| row.get::<_, i64>(0))
-                .map_err(|_| DbError::Internal)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|_| DbError::Internal)?
-        };
 
-        transaction
-            .execute(
-                r#"
-                DELETE FROM item_versions
-                WHERE created_at <= ?1
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM items i
-                    WHERE i.id = item_versions.item_id
-                      AND i.latest_version_id = item_versions.version_id
-                  )
-                "#,
-                [cutoff_timestamp],
-            )
-            .map_err(|_| DbError::Internal)?;
-
-        for item_id in affected_item_ids {
+        if let Some(cutoff) = trash_cutoff {
             transaction
                 .execute(
                     r#"
-                    UPDATE items
-                    SET oldest_version_id = (
-                        SELECT version_id
-                        FROM item_versions
-                        WHERE item_id = ?1
-                        ORDER BY created_at, version_id
-                        LIMIT 1
-                    )
-                    WHERE id = ?1
+                    DELETE FROM items AS i
+                    WHERE i.updated_at <= ?1
+                      AND EXISTS (
+                        SELECT 1
+                        FROM dirs AS d
+                        WHERE d.id = i.dir_id
+                          AND d.name = ?2
+                      )
                     "#,
-                    [item_id],
+                    (instant_to_timestamp(cutoff), TRASH_DIR_NAME),
                 )
                 .map_err(|_| DbError::Internal)?;
+        }
+
+        if let Some(cutoff) = version_cutoff {
+            let cutoff_timestamp = instant_to_timestamp(cutoff);
+            let affected_item_ids = {
+                let mut statement = transaction
+                    .prepare(
+                        r#"
+                        SELECT DISTINCT item_id
+                        FROM item_versions v
+                        JOIN items i ON i.id = v.item_id
+                        WHERE v.created_at <= ?1
+                          AND v.version_id <> i.latest_version_id
+                        "#,
+                    )
+                    .map_err(|_| DbError::Internal)?;
+                statement
+                    .query_map([cutoff_timestamp], |row| row.get::<_, i64>(0))
+                    .map_err(|_| DbError::Internal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|_| DbError::Internal)?
+            };
+
+            transaction
+                .execute(
+                    r#"
+                    DELETE FROM item_versions
+                    WHERE created_at <= ?1
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM items i
+                        WHERE i.id = item_versions.item_id
+                          AND i.latest_version_id = item_versions.version_id
+                      )
+                    "#,
+                    [cutoff_timestamp],
+                )
+                .map_err(|_| DbError::Internal)?;
+
+            for item_id in affected_item_ids {
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE items
+                        SET oldest_version_id = (
+                            SELECT version_id
+                            FROM item_versions
+                            WHERE item_id = ?1
+                            ORDER BY created_at, version_id
+                            LIMIT 1
+                        )
+                        WHERE id = ?1
+                        "#,
+                        [item_id],
+                    )
+                    .map_err(|_| DbError::Internal)?;
+            }
         }
 
         transaction.commit().map_err(|_| DbError::Internal)
@@ -3705,6 +3792,32 @@ impl DatabaseWorker {
     }
 
     #[cfg(test)]
+    fn test_set_item_updated_at(
+        &self,
+        dir_name: &str,
+        item_name: &str,
+        updated_at: i64,
+    ) -> Result<(), DbError> {
+        let changed = self
+            .connection
+            .execute(
+                r#"
+                UPDATE items
+                SET updated_at = ?1
+                WHERE name = ?2
+                  AND dir_id = (SELECT id FROM dirs WHERE name = ?3)
+                "#,
+                (updated_at, item_name, dir_name),
+            )
+            .map_err(|_| DbError::Internal)?;
+        if changed == 0 {
+            Err(DbError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
     fn test_oldest_version_is_earliest(
         &self,
         dir_name: &str,
@@ -3816,6 +3929,16 @@ fn writable_dir_id_in(connection: &Connection, name: &str) -> Result<i64, DbErro
         return Err(dir_not_found(name));
     };
     if bitmask_has(bitmask, DIR_SYSTEM) {
+        return Err(DbError::AccessDenied);
+    }
+    Ok(id)
+}
+
+fn overwriteable_dir_id_in(connection: &Connection, name: &str) -> Result<i64, DbError> {
+    let Some((id, bitmask)) = dir_row_in(connection, name)? else {
+        return Err(dir_not_found(name));
+    };
+    if bitmask_has(bitmask, DIR_SYSTEM) || bitmask_has(bitmask, DIR_DENY_OVERWRITE) {
         return Err(DbError::AccessDenied);
     }
     Ok(id)
@@ -3947,17 +4070,20 @@ fn move_item_in(
         return Err(DbError::Conflict("item already exists".to_owned()));
     }
 
+    let now = now_timestamp();
     transaction
         .execute(
             r#"
             UPDATE items
-            SET dir_id = ?1, name = ?2, updated_at = ?3
+            SET dir_id = ?1,
+                name = ?2,
+                updated_at = ?3
             WHERE id = ?4
             "#,
             (
                 destination_dir_id,
                 destination_item_name,
-                now_timestamp(),
+                now,
                 source_item_id,
             ),
         )
@@ -5243,7 +5369,7 @@ mod tests {
         AccessScope, AgentState, AuthCache, CreateContactRequest, CreateItemRequest,
         DATABASE_READER_WORKERS, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
         ListDirection, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
-        PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest,
+        PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest, UpdateItemRequest,
     };
     use crate::agent::process::{DirectUnlockCaller, ScopeHash};
 
@@ -6502,6 +6628,17 @@ mod tests {
                 .is_err()
         );
         assert!(crate::settings::auth_ttl_setting().validate("abc").is_err());
+        for name in [
+            crate::settings::AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING,
+            crate::settings::AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
+        ] {
+            let setting = crate::settings::user_setting(name).unwrap();
+            assert!(setting.validate(setting.default).is_ok());
+            assert!(setting.validate("0").is_ok());
+            assert!(setting.validate("157680000").is_ok());
+            assert!(setting.validate("157680001").is_err());
+            assert!(setting.validate("abc").is_err());
+        }
         assert!(
             crate::settings::settings_auth_ttl_setting()
                 .validate("0")
@@ -6558,6 +6695,14 @@ mod tests {
             settings.get("user.denialTtlSeconds")
         );
         assert_eq!(Some(&"3600".to_owned()), settings.get("user.gcSeconds"));
+        assert_eq!(
+            Some(&"15552000".to_owned()),
+            settings.get("user.autoDeleteTrashItemsAfterSeconds")
+        );
+        assert_eq!(
+            Some(&"15552000".to_owned()),
+            settings.get("user.autoDeleteOldVersionsAfterSeconds")
+        );
         assert_eq!(
             Some(&"[]".to_owned()),
             settings.get("user.trustedProgramPaths")
@@ -8616,6 +8761,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deny_overwrite_dirs_reject_only_update_and_restore() {
+        let database = DbHandle::test();
+        for dir in ["frozen", "source"] {
+            database.create_dir(dir.to_owned()).await.unwrap();
+        }
+        for (dir, item) in [
+            ("frozen", "item"),
+            ("source", "copy-source"),
+            ("source", "move-source"),
+        ] {
+            database
+                .create_item(
+                    dir.to_owned(),
+                    item.to_owned(),
+                    CreateItemRequest::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        database
+            .update_item(
+                "frozen".to_owned(),
+                "item".to_owned(),
+                UpdateItemRequest::default(),
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_dir_bitmask("frozen", super::DIR_DENY_OVERWRITE)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            DbError::AccessDenied,
+            database
+                .update_item(
+                    "frozen".to_owned(),
+                    "item".to_owned(),
+                    UpdateItemRequest::default(),
+                )
+                .await
+                .unwrap_err()
+        );
+        assert_eq!(
+            DbError::AccessDenied,
+            database
+                .restore_item_version("frozen".to_owned(), "item".to_owned(), 1)
+                .await
+                .unwrap_err()
+        );
+
+        database
+            .create_item(
+                "frozen".to_owned(),
+                "created".to_owned(),
+                CreateItemRequest::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "frozen".to_owned(),
+                "copied".to_owned(),
+                CreateItemRequest::default(),
+                Some(super::ItemSource::Copy(super::CopySource {
+                    dir_name: "source".to_owned(),
+                    item_name: "copy-source".to_owned(),
+                })),
+            )
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "frozen".to_owned(),
+                "moved".to_owned(),
+                CreateItemRequest::default(),
+                Some(super::ItemSource::Move(super::CopySource {
+                    dir_name: "source".to_owned(),
+                    item_name: "move-source".to_owned(),
+                })),
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_item_updated_at("frozen", "moved", 1)
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "frozen".to_owned(),
+                "renamed".to_owned(),
+                CreateItemRequest::default(),
+                Some(super::ItemSource::Move(super::CopySource {
+                    dir_name: "frozen".to_owned(),
+                    item_name: "moved".to_owned(),
+                })),
+            )
+            .await
+            .unwrap();
+
+        let renamed = database
+            .get_item(
+                "frozen".to_owned(),
+                "renamed".to_owned(),
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_ne!(super::format_timestamp(1), renamed.updated_at);
+        assert_eq!(
+            2,
+            database
+                .list_item_versions(
+                    "frozen".to_owned(),
+                    "item".to_owned(),
+                    PageRequest {
+                        count: 200,
+                        marker: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .count
+        );
+        assert_eq!(
+            4,
+            database
+                .list_items(
+                    "frozen".to_owned(),
+                    ItemListRequest {
+                        page: PageRequest {
+                            count: 200,
+                            marker: None,
+                        },
+                        glob: None,
+                        direction: ListDirection::Asc,
+                    },
+                )
+                .await
+                .unwrap()
+                .count
+        );
+        database
+            .delete_item("frozen".to_owned(), "renamed".to_owned())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn get_reference_dispatches_to_reader_worker() {
         let database = DbHandle::test();
         database.create_dir("dir".to_owned()).await.unwrap();
@@ -9335,7 +9634,7 @@ mod tests {
                 "dir",
                 "item",
                 false,
-                super::now_timestamp() - 91 * 24 * 60 * 60,
+                super::now_timestamp() - 181 * 24 * 60 * 60,
             )
             .await
             .unwrap();
@@ -9386,6 +9685,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorization_expiry_unload_removes_only_expired_trash_items_when_cleanup_due() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        database.create_dir("Trash".to_owned()).await.unwrap();
+        database.create_dir("Personal".to_owned()).await.unwrap();
+        for (dir, item) in [
+            ("Trash", "expired"),
+            ("Trash", "boundary"),
+            ("Trash", "recent"),
+            ("Personal", "outside"),
+        ] {
+            database
+                .create_item(
+                    dir.to_owned(),
+                    item.to_owned(),
+                    CreateItemRequest::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        database
+            .test_set_item_updated_at(
+                "Trash",
+                "expired",
+                super::now_timestamp() - 181 * 24 * 60 * 60,
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_item_updated_at(
+                "Trash",
+                "recent",
+                super::now_timestamp() - 179 * 24 * 60 * 60,
+            )
+            .await
+            .unwrap();
+
+        let last_access = Instant::now();
+        let cleanup_at = last_access + AUTH_TTL;
+        let boundary_cutoff = cleanup_at
+            .checked_sub(Duration::from_secs(180 * 24 * 60 * 60))
+            .unwrap();
+        database
+            .test_set_item_updated_at(
+                "Trash",
+                "boundary",
+                super::instant_to_timestamp(boundary_cutoff),
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_item_updated_at(
+                "Personal",
+                "outside",
+                super::now_timestamp() - 181 * 24 * 60 * 60,
+            )
+            .await
+            .unwrap();
+
+        state.store_database_handle(database.clone()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .set_max_authorization_expires_at(Some(last_access + AUTH_TTL))
+            .await;
+        state
+            .set_last_cleanup_at(Some(last_access - CLEANUP_INTERVAL))
+            .await;
+
+        assert!(state.unload_if_authorization_expired(cleanup_at).await);
+        for item in ["expired", "boundary"] {
+            assert!(
+                database
+                    .get_item(
+                        "Trash".to_owned(),
+                        item.to_owned(),
+                        None,
+                        false,
+                        false,
+                        false,
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        for (dir, item) in [("Trash", "recent"), ("Personal", "outside")] {
+            assert!(
+                database
+                    .get_item(dir.to_owned(), item.to_owned(), None, false, false, false,)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_retention_settings_disable_trash_and_old_version_cleanup() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        database
+            .upsert_setting(
+                crate::settings::AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING.to_owned(),
+                "0".to_owned(),
+            )
+            .await
+            .unwrap();
+        database
+            .upsert_setting(
+                crate::settings::AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING.to_owned(),
+                "0".to_owned(),
+            )
+            .await
+            .unwrap();
+        database.create_dir("Trash".to_owned()).await.unwrap();
+        database.create_dir("Personal".to_owned()).await.unwrap();
+        database
+            .create_item(
+                "Trash".to_owned(),
+                "item".to_owned(),
+                CreateItemRequest::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_item_updated_at("Trash", "item", super::now_timestamp() - 365 * 24 * 60 * 60)
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "Personal".to_owned(),
+                "item".to_owned(),
+                CreateItemRequest::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .update_item(
+                "Personal".to_owned(),
+                "item".to_owned(),
+                UpdateItemRequest::default(),
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_item_versions_created_at(
+                "Personal",
+                "item",
+                false,
+                super::now_timestamp() - 365 * 24 * 60 * 60,
+            )
+            .await
+            .unwrap();
+
+        let last_access = Instant::now();
+        state.store_database_handle(database.clone()).await;
+        state.store_password_verifier("correct").await;
+        state
+            .set_max_authorization_expires_at(Some(last_access + AUTH_TTL))
+            .await;
+        state
+            .set_last_cleanup_at(Some(last_access - CLEANUP_INTERVAL))
+            .await;
+
+        assert!(
+            state
+                .unload_if_authorization_expired(last_access + AUTH_TTL)
+                .await
+        );
+        assert!(
+            database
+                .get_item(
+                    "Trash".to_owned(),
+                    "item".to_owned(),
+                    None,
+                    false,
+                    false,
+                    false,
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            2,
+            database
+                .test_item_version_count("Personal", "item")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn authorization_expiry_unload_keeps_latest_version_even_when_cleanup_due() {
         let state = AgentState::from_database_path("missing.db");
         let database = DbHandle::test();
@@ -9404,7 +9896,7 @@ mod tests {
                 "dir",
                 "item",
                 true,
-                super::now_timestamp() - 91 * 24 * 60 * 60,
+                super::now_timestamp() - 181 * 24 * 60 * 60,
             )
             .await
             .unwrap();
@@ -9495,7 +9987,7 @@ mod tests {
                 "dir",
                 "item",
                 false,
-                super::now_timestamp() - 91 * 24 * 60 * 60,
+                super::now_timestamp() - 181 * 24 * 60 * 60,
             )
             .await
             .unwrap();

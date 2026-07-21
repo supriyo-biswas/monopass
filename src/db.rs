@@ -99,8 +99,10 @@ const AGE_PUBLIC_KEY_ITEM_NAME: &str = "AgePublicKey";
 const AGE_PRIVATE_KEY_ITEM_NAME: &str = "AgePrivateKey";
 const DIR_HIDDEN: i64 = 1 << 0;
 const DIR_SYSTEM: i64 = 1 << 1;
+const DIR_DENY_OVERWRITE: i64 = 1 << 2;
 const ITEM_HIDDEN: i64 = 1 << 0;
 const ITEM_READ_MUSTAUTH: i64 = 1 << 1;
+const DATABASE_SCHEMA_VERSION: i64 = 2;
 
 #[cfg(debug_assertions)]
 pub fn open_encrypted_database(config: &Config) -> AppResult<Connection> {
@@ -119,6 +121,7 @@ pub fn open_encrypted_database_with_password(
     conn.pragma_update(None, "key", password)?;
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
     configure_open_connection(&conn)?;
+    migrate_database(&conn)?;
     insert_missing_user_setting_defaults(&conn)?;
 
     Ok(conn)
@@ -161,7 +164,7 @@ pub(crate) fn create_encrypted_database_with_password(
     create_file_encryption_key_item(&conn)?;
     create_age_keypair_items(&conn)?;
     create_default_user_settings(&conn)?;
-    conn.pragma_update(None, "user_version", 1)?;
+    conn.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
 
     Ok(())
 }
@@ -270,10 +273,32 @@ fn insert_missing_user_setting_defaults(conn: &Connection) -> rusqlite::Result<(
     Ok(())
 }
 
+fn migrate_database(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > DATABASE_SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if version >= 2 {
+        return Ok(());
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        r#"
+        UPDATE dirs
+        SET bitmask = bitmask | ?1
+        WHERE name = ?2
+        "#,
+        (DIR_DENY_OVERWRITE, TRASH_DIR_NAME),
+    )?;
+    transaction.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+    transaction.commit()
+}
+
 fn create_default_dirs(conn: &Connection) -> rusqlite::Result<()> {
     let now = now_timestamp();
     for (name, bitmask) in [
-        (TRASH_DIR_NAME, DIR_HIDDEN),
+        (TRASH_DIR_NAME, DIR_HIDDEN | DIR_DENY_OVERWRITE),
         (INTERNAL_DIR_NAME, DIR_HIDDEN | DIR_SYSTEM),
         (DEFAULT_DIR_NAME, 0),
     ] {
@@ -368,6 +393,7 @@ mod tests {
         assert_unique_index(&conn, "files", &["sha256"]);
         assert_column_exists(&conn, "dirs", "bitmask");
         assert_column_exists(&conn, "items", "bitmask");
+        assert_no_column(&conn, "items", "trashed_at");
         assert_column_exists(&conn, "contacts", "created_at");
         assert_primary_key(&conn, "item_versions", &["item_id", "version_id"]);
         assert_primary_key(
@@ -383,10 +409,14 @@ mod tests {
         assert_eq!(1, pragma_i64(&conn, "foreign_keys"));
         assert_eq!(2, pragma_i64(&conn, "auto_vacuum"));
         assert_eq!("wal", pragma_string(&conn, "journal_mode"));
-        assert_eq!(1, pragma_i64(&conn, "user_version"));
+        assert_eq!(2, pragma_i64(&conn, "user_version"));
         assert_eq!(1, dir_count(&conn, "Personal"));
         assert_dir_bitmask(&conn, "Personal", 0);
-        assert_dir_bitmask(&conn, "Trash", super::DIR_HIDDEN);
+        assert_dir_bitmask(
+            &conn,
+            "Trash",
+            super::DIR_HIDDEN | super::DIR_DENY_OVERWRITE,
+        );
         assert_dir_bitmask(&conn, "_Internal", super::DIR_HIDDEN | super::DIR_SYSTEM);
         assert_internal_file_encryption_key_exists(&conn);
         assert_internal_age_keypair_exists(&conn);
@@ -395,6 +425,8 @@ mod tests {
         assert_setting_value(&conn, "user.settingsAuthTtlSeconds", "300");
         assert_setting_value(&conn, "user.denialTtlSeconds", "60");
         assert_setting_value(&conn, "user.gcSeconds", "3600");
+        assert_setting_value(&conn, "user.autoDeleteTrashItemsAfterSeconds", "15552000");
+        assert_setting_value(&conn, "user.autoDeleteOldVersionsAfterSeconds", "15552000");
         assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
     }
 
@@ -434,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_existing_database_inserts_missing_user_settings_without_version_bump() {
+    fn opening_existing_database_migrates_schema_and_inserts_only_missing_user_settings() {
         let file = NamedTempFile::new().unwrap();
         let conn = Connection::open_with_flags(
             file.path(),
@@ -443,16 +475,35 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "key", "correct").unwrap();
         conn.execute_batch(super::SCHEMA).unwrap();
+        super::create_default_dirs(&conn).unwrap();
+        conn.execute(
+            "UPDATE dirs SET bitmask = ?1 WHERE name = 'Trash'",
+            [super::DIR_HIDDEN | (1_i64 << 8)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_settings (name, value) VALUES ('user.autoDeleteTrashItemsAfterSeconds', '0')",
+            [],
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
         drop(conn);
 
         let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
 
-        assert_eq!(1, pragma_i64(&conn, "user_version"));
+        assert_eq!(2, pragma_i64(&conn, "user_version"));
+        assert_no_column(&conn, "items", "trashed_at");
+        assert_dir_bitmask(
+            &conn,
+            "Trash",
+            super::DIR_HIDDEN | super::DIR_DENY_OVERWRITE | (1_i64 << 8),
+        );
         assert_setting_value(&conn, "user.authTtlSeconds", "900");
         assert_setting_value(&conn, "user.settingsAuthTtlSeconds", "300");
         assert_setting_value(&conn, "user.denialTtlSeconds", "60");
         assert_setting_value(&conn, "user.gcSeconds", "3600");
+        assert_setting_value(&conn, "user.autoDeleteTrashItemsAfterSeconds", "0");
+        assert_setting_value(&conn, "user.autoDeleteOldVersionsAfterSeconds", "15552000");
         assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
     }
 

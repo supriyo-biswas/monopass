@@ -141,7 +141,9 @@ mod tests {
 
     use crate::agent::models::AccessScope;
     use crate::agent::process::{ScopeHash, UltimateProcess};
-    use crate::agent::state::{AgentState, DbHandle, ITEM_READ_MUSTAUTH, MAX_FILE_UPLOAD_BYTES};
+    use crate::agent::state::{
+        AgentState, DIR_DENY_OVERWRITE, DbHandle, ITEM_READ_MUSTAUTH, MAX_FILE_UPLOAD_BYTES,
+    };
 
     #[tokio::test]
     async fn locked_database_route_returns_access_denied() {
@@ -1981,6 +1983,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn item_api_denies_patch_and_restore_in_deny_overwrite_dirs() {
+        let state = authorized_state().await;
+        let database = state.database_handle().await.unwrap();
+        database.create_dir("frozen".to_owned()).await.unwrap();
+        database
+            .create_item(
+                "frozen".to_owned(),
+                "item".to_owned(),
+                Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .update_item("frozen".to_owned(), "item".to_owned(), Default::default())
+            .await
+            .unwrap();
+        database
+            .test_set_dir_bitmask("frozen", DIR_DENY_OVERWRITE)
+            .await
+            .unwrap();
+        let router = super::database_routes(state.clone()).with_state(state);
+
+        let patch_response = router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PATCH",
+                "/api/v1/dir/frozen/item/item",
+                json!({}),
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, patch_response.status());
+        assert_eq!(
+            "access_denied",
+            json_body(patch_response).await["error"]["code"]
+        );
+
+        let restore_response = router
+            .oneshot(put_request_with_hash(
+                "/api/v1/dir/frozen/item/item/restore?version=1",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, restore_response.status());
+        assert_eq!(
+            "access_denied",
+            json_body(restore_response).await["error"]["code"]
+        );
+    }
+
+    #[tokio::test]
     async fn item_api_supports_copy_from_and_move_from_query_params() {
         let state = authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);
@@ -2419,6 +2475,8 @@ mod tests {
         assert_eq!(
             json!({
                 "user.authTtlSeconds":"900",
+                "user.autoDeleteOldVersionsAfterSeconds":"15552000",
+                "user.autoDeleteTrashItemsAfterSeconds":"15552000",
                 "user.denialTtlSeconds":"60",
                 "user.gcSeconds":"3600",
                 "user.settingsAuthTtlSeconds":"300",
@@ -2440,6 +2498,19 @@ mod tests {
             .unwrap();
         assert_eq!(StatusCode::OK, response.status());
         assert_eq!(json!({}), json_body(response).await);
+
+        let response = router
+            .clone()
+            .oneshot(json_request_with_hash_and_password(
+                "PUT",
+                "/api/v1/settings/user.autoDeleteTrashItemsAfterSeconds",
+                json!({"value":"0"}),
+                ScopeHash::test(1),
+                "correct",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
 
         let response = router
             .clone()
@@ -2491,6 +2562,7 @@ mod tests {
         assert_eq!("1200", body["user.authTtlSeconds"]);
         assert_eq!("120", body["user.denialTtlSeconds"]);
         assert_eq!("600", body["user.settingsAuthTtlSeconds"]);
+        assert_eq!("0", body["user.autoDeleteTrashItemsAfterSeconds"]);
         assert_eq!(
             r#"["","relative","relative"]"#,
             body["user.trustedProgramPaths"]
