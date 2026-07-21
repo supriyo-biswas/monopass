@@ -1,6 +1,6 @@
 [package]
 name = "monopass"
-version = "0.0.1-alpha13"
+version = "0.0.1-alpha14"
 edition = "2024"
 
 [features]
