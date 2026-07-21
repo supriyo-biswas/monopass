@@ -14,9 +14,20 @@ monopass is a local-first password manager and credential storage daemon that st
 
 ## Getting started
 
+monopass supports Linux on x86-64/aarch64 and MacOS on Apple Silicon. Use the installation script to get started, which will start monopass agent in the background process.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/supriyo-biswas/monopass/master/install.sh | sh
 monopass init
+```
+
+And then, add your first password and retrieve it:
+
+```sh
+monopass add Personal/GitHub --username my-username --password-prompt
+monopass ls
+monopass ls Personal
+monopass show Personal/GitHub --reveal
 ```
 
 ## License
