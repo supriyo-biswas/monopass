@@ -88,17 +88,19 @@ the running agent binary. It then looks for the nearest confidently recognized
 GUI application in parent ancestry. Same-user ancestry remains verified across
 process session boundaries, so terminal hosts such as Visual Studio Code and
 GNOME Terminal are available directly to presentation lookup. On macOS, when
-traversal reaches a process whose effective UID differs from its real UID, and
-the real UID and parent both match the requesting user, presentation lookup
-resumes from the process above that credential boundary. This covers the
-root-owned `login` process used by Terminal and iTerm2 without changing the
-verified authorization chain. The resumed ancestry still uses the normal
-GUI-application recognition described below. Different identities are
-shown as a composite such as `bash (via Terminal)`; a direct GUI caller uses its
-localized application name without redundant attribution. The executable path
-remains that of the direct executable selected for display. All prompt scopes
-use the same application icon resolution: they prefer the GUI application icon,
-then use the existing generic icon fallback. Dialogs do not display executable
+traversal reaches the root-owned `login` process used by Terminal and iTerm2,
+it may skip exactly one such process and resume from its same-user terminal host
+only after verifying the process name, effective, real, and saved UIDs, process
+group, controlling terminal and session, parent relationship, and stable process
+observations. The `login` process is excluded from the authorization chain. If
+verification fails, traversal stops at the boundary and preserves the narrower
+per-shell scope. The resulting verified ancestry also uses the normal
+GUI-application recognition described below. Different identities are shown as
+a composite such as `bash (via Terminal)`; a direct GUI caller uses its localized
+application name without redundant attribution. The executable path remains
+that of the direct executable selected for display. All prompt scopes use the
+same application icon resolution: they prefer the GUI application icon, then
+use the existing generic icon fallback. Dialogs do not display executable
 modification timestamps.
 
 On macOS, regular and accessory application ancestors with an application

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const MAX_PROCESS_CHAIN_DEPTH: usize = 256;
+#[cfg(target_os = "macos")]
+const MACOS_NODEV: u32 = u32::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ScopeHash([u8; 32]);
@@ -196,7 +198,7 @@ trait ProcessResolver {
     fn process_info(&self, pid: i32) -> Option<ProcessInfo>;
     fn process_uid(&self, pid: i32) -> Option<u32>;
 
-    fn presentation_parent_across_credential_boundary(
+    fn verified_parent_across_macos_login_boundary(
         &self,
         _child: &ProcessInfo,
         _parent_pid: i32,
@@ -242,9 +244,15 @@ fn resolve_authorization_scope_with_resolver_and_gui(
     }
 
     let mut chain = Vec::new();
-    let mut presentation_parent = None;
+    let mut crossed_macos_login_boundary = false;
+    let mut remaining_depth = MAX_PROCESS_CHAIN_DEPTH;
 
-    for _ in 0..MAX_PROCESS_CHAIN_DEPTH {
+    loop {
+        if remaining_depth == 0 {
+            return None;
+        }
+        remaining_depth -= 1;
+
         if current.uid != peer_uid {
             break;
         }
@@ -260,11 +268,21 @@ fn resolve_authorization_scope_with_resolver_and_gui(
         if parent_pid <= 0 {
             break;
         }
+        if remaining_depth == 0 {
+            return None;
+        }
 
         let parent_uid = resolver.process_uid(parent_pid)?;
         if parent_uid != peer_uid {
-            presentation_parent = resolver
-                .presentation_parent_across_credential_boundary(&current, parent_pid, peer_uid);
+            if !crossed_macos_login_boundary
+                && let Some(parent) = resolver
+                    .verified_parent_across_macos_login_boundary(&current, parent_pid, peer_uid)
+            {
+                crossed_macos_login_boundary = true;
+                remaining_depth -= 1;
+                current = parent;
+                continue;
+            }
             break;
         }
 
@@ -278,11 +296,6 @@ fn resolve_authorization_scope_with_resolver_and_gui(
     if chain.is_empty() {
         return None;
     }
-    if chain.len() == MAX_PROCESS_CHAIN_DEPTH
-        && chain.last().is_some_and(|process| process.parent_pid > 0)
-    {
-        return None;
-    }
 
     chain.reverse();
     let anchor = chain.first()?.instance;
@@ -293,56 +306,13 @@ fn resolve_authorization_scope_with_resolver_and_gui(
     };
 
     let ultimate = ultimate_process_from_chain(&chain)?;
-    let display = if presentation_parent.is_some() {
-        let display_chain = presentation_chain(&chain, presentation_parent, peer_uid, resolver);
-        process_display_from_chain_with_agent_and_gui(
-            &display_chain,
-            agent_executable,
-            gui_resolver,
-        )
-    } else {
-        process_display_from_chain_with_agent_and_gui(&chain, agent_executable, gui_resolver)
-    };
+    let display =
+        process_display_from_chain_with_agent_and_gui(&chain, agent_executable, gui_resolver);
     Some(ResolvedAuthorizationScope {
         hash: hash_authorization_scope(&scope),
         display,
         ultimate,
     })
-}
-
-fn presentation_chain(
-    verified_chain: &[ProcessInfo],
-    first_parent: Option<ProcessInfo>,
-    peer_uid: u32,
-    resolver: &impl ProcessResolver,
-) -> Vec<ProcessInfo> {
-    let mut ancestors = Vec::new();
-    let mut current = first_parent;
-
-    for _ in 0..MAX_PROCESS_CHAIN_DEPTH {
-        let Some(process) = current else {
-            break;
-        };
-        if process.uid != peer_uid
-            || verified_chain
-                .iter()
-                .chain(&ancestors)
-                .any(|seen| seen.instance.pid == process.instance.pid)
-        {
-            break;
-        }
-
-        let parent_pid = process.parent_pid;
-        ancestors.push(process);
-        if parent_pid <= 0 || resolver.process_uid(parent_pid) != Some(peer_uid) {
-            break;
-        }
-        current = resolver.process_info(parent_pid);
-    }
-
-    ancestors.reverse();
-    ancestors.extend_from_slice(verified_chain);
-    ancestors
 }
 
 fn ultimate_process_from_chain(chain: &[ProcessInfo]) -> Option<UltimateProcess> {
@@ -588,19 +558,28 @@ fn executable_generation(metadata: &Metadata) -> Option<u32> {
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy)]
 struct MacosCredentialBoundaryEvidence {
+    boundary_pid: i32,
+    boundary_process_group: i32,
     effective_uid: u32,
     real_uid: u32,
+    saved_uid: u32,
     parent_uid: Option<u32>,
+    command_is_login: bool,
+    child_session_id: Option<i32>,
+    child_has_controlling_terminal: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn crosses_macos_presentation_credential_boundary(
-    peer_uid: u32,
-    evidence: MacosCredentialBoundaryEvidence,
-) -> bool {
-    evidence.effective_uid != evidence.real_uid
+fn crosses_macos_login_boundary(peer_uid: u32, evidence: MacosCredentialBoundaryEvidence) -> bool {
+    evidence.boundary_pid > 0
+        && evidence.boundary_process_group == evidence.boundary_pid
+        && evidence.effective_uid == 0
         && evidence.real_uid == peer_uid
+        && evidence.saved_uid == 0
         && evidence.parent_uid == Some(peer_uid)
+        && evidence.command_is_login
+        && evidence.child_session_id == Some(evidence.boundary_pid)
+        && evidence.child_has_controlling_terminal
 }
 
 struct PlatformProcessResolver;
@@ -699,7 +678,7 @@ impl ProcessResolver for PlatformProcessResolver {
             .or_else(|| macos_short_bsd_info(pid).map(|info| info.pbsi_uid))
     }
 
-    fn presentation_parent_across_credential_boundary(
+    fn verified_parent_across_macos_login_boundary(
         &self,
         child: &ProcessInfo,
         parent_pid: i32,
@@ -715,17 +694,26 @@ impl ProcessResolver for PlatformProcessResolver {
         }
 
         let boundary_info = macos_short_bsd_info(parent_pid)?;
+        if i32::try_from(boundary_info.pbsi_pid).ok()? != parent_pid {
+            return None;
+        }
         let boundary_parent_pid = i32::try_from(boundary_info.pbsi_ppid).ok()?;
         if boundary_parent_pid <= 0 {
             return None;
         }
 
         let evidence = MacosCredentialBoundaryEvidence {
+            boundary_pid: i32::try_from(boundary_info.pbsi_pid).ok()?,
+            boundary_process_group: i32::try_from(boundary_info.pbsi_pgid).ok()?,
             effective_uid: boundary_info.pbsi_uid,
             real_uid: boundary_info.pbsi_ruid,
+            saved_uid: boundary_info.pbsi_svuid,
             parent_uid: self.process_uid(boundary_parent_pid),
+            command_is_login: macos_short_process_name_is(&boundary_info, b"login"),
+            child_session_id: macos_session_id(child.instance.pid),
+            child_has_controlling_terminal: child_info.e_tdev != MACOS_NODEV,
         };
-        if !crosses_macos_presentation_credential_boundary(peer_uid, evidence) {
+        if !crosses_macos_login_boundary(peer_uid, evidence) {
             return None;
         }
 
@@ -738,8 +726,39 @@ impl ProcessResolver for PlatformProcessResolver {
         if !same_macos_short_process(&boundary_info, &revalidated_boundary) {
             return None;
         }
+        let revalidated_child = macos_bsd_info(child.instance.pid)?;
+        if !same_macos_process(&child_info, &revalidated_child) {
+            return None;
+        }
         Some(parent)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_short_process_name_is(info: &ProcBsdShortInfo, expected: &[u8]) -> bool {
+    info.pbsi_comm
+        .iter()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .eq(expected.iter().copied())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_session_id(pid: i32) -> Option<i32> {
+    let session_id = unsafe { libc::getsid(pid) };
+    (session_id >= 0).then_some(session_id)
+}
+
+#[cfg(target_os = "macos")]
+fn same_macos_process(first: &libc::proc_bsdinfo, second: &libc::proc_bsdinfo) -> bool {
+    first.pbi_pid == second.pbi_pid
+        && first.pbi_ppid == second.pbi_ppid
+        && first.pbi_uid == second.pbi_uid
+        && first.pbi_ruid == second.pbi_ruid
+        && first.pbi_svuid == second.pbi_svuid
+        && first.pbi_start_tvsec == second.pbi_start_tvsec
+        && first.pbi_start_tvusec == second.pbi_start_tvusec
+        && first.e_tdev == second.e_tdev
 }
 
 #[cfg(target_os = "macos")]
@@ -850,7 +869,7 @@ mod tests {
     struct FakeResolver {
         processes: HashMap<i32, ProcessInfo>,
         visible_uids: HashMap<i32, u32>,
-        presentation_bridges: HashMap<(i32, i32), i32>,
+        verified_macos_login_bridges: HashMap<(i32, i32), i32>,
     }
 
     impl FakeResolver {
@@ -881,13 +900,13 @@ mod tests {
             self
         }
 
-        fn with_presentation_bridge(
+        fn with_verified_macos_login_bridge(
             mut self,
             child_pid: i32,
             bridge_pid: i32,
             parent_pid: i32,
         ) -> Self {
-            self.presentation_bridges
+            self.verified_macos_login_bridges
                 .insert((child_pid, bridge_pid), parent_pid);
             self
         }
@@ -902,16 +921,16 @@ mod tests {
             self.visible_uids.get(&pid).copied()
         }
 
-        fn presentation_parent_across_credential_boundary(
+        fn verified_parent_across_macos_login_boundary(
             &self,
             child: &ProcessInfo,
             parent_pid: i32,
             peer_uid: u32,
         ) -> Option<ProcessInfo> {
-            let presentation_parent_pid = self
-                .presentation_bridges
+            let verified_parent_pid = self
+                .verified_macos_login_bridges
                 .get(&(child.instance.pid, parent_pid))?;
-            let parent = self.process_info(*presentation_parent_pid)?;
+            let parent = self.process_info(*verified_parent_pid)?;
             (parent.uid == peer_uid).then_some(parent)
         }
     }
@@ -1084,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn gui_presentation_crosses_credential_boundary_without_changing_authorization() {
+    fn verified_macos_login_boundary_shares_iterm_scope_across_tabs() {
         let first = FakeResolver::default()
             .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
             .with_path(11, 10, UID, 3, "/bin/bash")
@@ -1098,21 +1117,21 @@ mod tests {
                 "/Applications/iTerm.app/Contents/MacOS/iTerm2",
             )
             .with_uid_only(1, 0)
-            .with_presentation_bridge(11, 10, 9);
+            .with_verified_macos_login_bridge(11, 10, 9);
         let second = FakeResolver::default()
-            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, 3, "/bin/bash")
-            .with_uid_only(10, 0)
-            .with_path(19, 18, UID, 22, "/Applications/Other Helper")
+            .with_path(22, 21, UID, 4, "/usr/local/bin/monopass")
+            .with_path(21, 20, UID, 3, "/bin/bash")
+            .with_uid_only(20, 0)
+            .with_path(9, 8, UID, 2, "/Applications/iTermServer")
             .with_path(
-                18,
+                8,
                 1,
                 UID,
-                11,
-                "/Applications/Other.app/Contents/MacOS/Other",
+                1,
+                "/Applications/iTerm.app/Contents/MacOS/iTerm2",
             )
             .with_uid_only(1, 0)
-            .with_presentation_bridge(11, 10, 19);
+            .with_verified_macos_login_bridge(21, 20, 9);
         let gui = FakeGuiResolver::default().with(8, "iTerm2");
 
         let scope = super::resolve_authorization_scope_with_resolver_and_gui(
@@ -1134,13 +1153,13 @@ mod tests {
         );
         assert_eq!(
             super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
-            super::resolve_authorization_scope_hash_with_resolver(12, UID, &second)
+            super::resolve_authorization_scope_hash_with_resolver(22, UID, &second)
         );
     }
 
     #[test]
-    fn credential_boundary_finds_direct_terminal_parent() {
-        let resolver = FakeResolver::default()
+    fn verified_macos_login_boundary_shares_terminal_scope_across_windows() {
+        let first = FakeResolver::default()
             .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
             .with_path(11, 10, UID, 3, "/bin/bash")
             .with_uid_only(10, 0)
@@ -1152,13 +1171,26 @@ mod tests {
                 "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
             )
             .with_uid_only(1, 0)
-            .with_presentation_bridge(11, 10, 9);
+            .with_verified_macos_login_bridge(11, 10, 9);
+        let second = FakeResolver::default()
+            .with_path(22, 21, UID, 4, "/usr/local/bin/monopass")
+            .with_path(21, 20, UID, 3, "/bin/bash")
+            .with_uid_only(20, 0)
+            .with_path(
+                9,
+                1,
+                UID,
+                2,
+                "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            )
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(21, 20, 9);
         let gui = FakeGuiResolver::default().with(9, "Terminal");
 
         let scope = super::resolve_authorization_scope_with_resolver_and_gui(
             12,
             UID,
-            &resolver,
+            &first,
             &gui,
             Some(test_executable(4)),
         )
@@ -1167,6 +1199,100 @@ mod tests {
 
         assert_eq!("bash (via Terminal)", display.presentation_name());
         assert_eq!(PathBuf::from("/bin/bash"), display.path);
+        assert_eq!(
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(22, UID, &second)
+        );
+    }
+
+    #[test]
+    fn different_terminal_hosts_and_shells_have_distinct_scopes() {
+        let bash = FakeResolver::default()
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_uid_only(10, 0)
+            .with_path(9, 1, UID, 2, "/Applications/Terminal")
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(11, 10, 9);
+        let zsh = FakeResolver::default()
+            .with_path(22, 21, UID, 4, "/usr/local/bin/monopass")
+            .with_path(21, 20, UID, 5, "/bin/zsh")
+            .with_uid_only(20, 0)
+            .with_path(9, 1, UID, 2, "/Applications/Terminal")
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(21, 20, 9);
+        let other_host = FakeResolver::default()
+            .with_path(32, 31, UID, 4, "/usr/local/bin/monopass")
+            .with_path(31, 30, UID, 3, "/bin/bash")
+            .with_uid_only(30, 0)
+            .with_path(29, 1, UID, 2, "/Applications/Terminal")
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(31, 30, 29);
+        let other_emulator = FakeResolver::default()
+            .with_path(42, 41, UID, 4, "/usr/local/bin/monopass")
+            .with_path(41, 40, UID, 3, "/bin/bash")
+            .with_uid_only(40, 0)
+            .with_path(9, 1, UID, 6, "/Applications/iTerm2")
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(41, 40, 9);
+
+        let bash_hash = super::resolve_authorization_scope_hash_with_resolver(12, UID, &bash);
+        assert_ne!(
+            bash_hash,
+            super::resolve_authorization_scope_hash_with_resolver(22, UID, &zsh)
+        );
+        assert_ne!(
+            bash_hash,
+            super::resolve_authorization_scope_hash_with_resolver(32, UID, &other_host)
+        );
+        assert_ne!(
+            bash_hash,
+            super::resolve_authorization_scope_hash_with_resolver(42, UID, &other_emulator)
+        );
+    }
+
+    #[test]
+    fn only_one_macos_login_boundary_is_crossed() {
+        let single_bridge = FakeResolver::default()
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_uid_only(10, 0)
+            .with_path(9, 8, UID, 2, "/Applications/TerminalHelper")
+            .with_uid_only(8, 0)
+            .with_path(7, 1, UID, 1, "/Applications/Terminal")
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(11, 10, 9);
+        let two_bridges = FakeResolver::default()
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_uid_only(10, 0)
+            .with_path(9, 8, UID, 2, "/Applications/TerminalHelper")
+            .with_uid_only(8, 0)
+            .with_path(7, 1, UID, 1, "/Applications/Terminal")
+            .with_uid_only(1, 0)
+            .with_verified_macos_login_bridge(11, 10, 9)
+            .with_verified_macos_login_bridge(9, 8, 7);
+
+        assert_eq!(
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &single_bridge),
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &two_bridges)
+        );
+    }
+
+    #[test]
+    fn macos_login_boundary_counts_toward_traversal_limit() {
+        let mut resolver = FakeResolver::default();
+        for pid in 3..=257 {
+            resolver = resolver.with(pid, pid - 1, UID, pid as u64);
+        }
+        resolver = resolver
+            .with_uid_only(2, 0)
+            .with(1, 0, UID, 1)
+            .with_verified_macos_login_bridge(3, 2, 1);
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(257, UID, &resolver).is_none()
+        );
     }
 
     #[test]
@@ -1190,18 +1316,32 @@ mod tests {
     }
 
     #[test]
-    fn macos_presentation_boundary_requires_changed_effective_uid_and_same_user_parent() {
+    fn macos_login_boundary_requires_complete_terminal_evidence() {
         let valid = super::MacosCredentialBoundaryEvidence {
+            boundary_pid: 10,
+            boundary_process_group: 10,
             effective_uid: 0,
             real_uid: UID,
+            saved_uid: 0,
             parent_uid: Some(UID),
+            command_is_login: true,
+            child_session_id: Some(10),
+            child_has_controlling_terminal: true,
         };
 
-        assert!(super::crosses_macos_presentation_credential_boundary(
-            UID, valid
-        ));
+        assert!(super::crosses_macos_login_boundary(UID, valid));
 
         for invalid in [
+            super::MacosCredentialBoundaryEvidence {
+                boundary_pid: 0,
+                boundary_process_group: 0,
+                child_session_id: Some(0),
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                boundary_process_group: 11,
+                ..valid
+            },
             super::MacosCredentialBoundaryEvidence {
                 effective_uid: UID,
                 ..valid
@@ -1211,13 +1351,35 @@ mod tests {
                 ..valid
             },
             super::MacosCredentialBoundaryEvidence {
+                saved_uid: UID,
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
                 parent_uid: Some(0),
                 ..valid
             },
+            super::MacosCredentialBoundaryEvidence {
+                parent_uid: None,
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                command_is_login: false,
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                child_session_id: Some(11),
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                child_session_id: None,
+                ..valid
+            },
+            super::MacosCredentialBoundaryEvidence {
+                child_has_controlling_terminal: false,
+                ..valid
+            },
         ] {
-            assert!(!super::crosses_macos_presentation_credential_boundary(
-                UID, invalid
-            ));
+            assert!(!super::crosses_macos_login_boundary(UID, invalid));
         }
     }
 

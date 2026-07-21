@@ -24,8 +24,14 @@ generation, size, modification time, and change time) when available. If the
 executable cannot be inspected, the element falls back to PID plus process
 start time. A different scope, changed executable, changed ordered lineage, or
 PID/start-time fallback from a new process requires reauthorization. Traversal
-stops before a different-user ancestor and otherwise fails closed when required
-same-user process identity cannot be resolved.
+normally stops before a different-user ancestor and otherwise fails closed when
+required same-user process identity cannot be resolved. On macOS, traversal may
+skip exactly one root-owned local `/usr/bin/login` process and resume from its
+same-user terminal host when the process name, effective, real, and saved UIDs,
+process group, controlling terminal and session, parent relationship, and stable
+process observations all corroborate the boundary. The `login` process itself
+is excluded from the scope. If any evidence is missing or inconsistent,
+traversal stops at the boundary and preserves the narrower per-shell scope.
 
 Authorization is recorded independently for the `items` and `settings` access
 scopes. Auth endpoints that accept `scope` default to `items` when it is omitted.
@@ -103,29 +109,26 @@ application and accepts one submitted password for the request. The nearest
 confidently recognized GUI application in the parent ancestry is used as
 presentation context. Same-user terminal hosts such as Visual Studio Code and
 GNOME Terminal are part of the verified lineage even when a child terminal
-creates a new process session. On macOS, presentation lookup may also cross
-exactly one root-owned local `/usr/bin/login` process when the login process
-name, real and saved UIDs, controlling terminal, and same-user parent all
-corroborate the boundary. This credential-boundary extension is
-presentation-only and does not change the authorization scope. Other
-different-user boundaries remain excluded. For example, a shell request can be
-shown as `bash (via Terminal)`. A direct GUI caller uses its localized
-application name without redundant `via` text. The executable path always
-describes the direct executable selected for display, not its GUI host. All prompt scopes use the
-same application icon resolution: they prefer the GUI application's icon, then
-use the existing generic icon fallback if GUI application or icon discovery is
-missing or ambiguous. Linux resolves exact unique desktop-entry executables and
-systemd desktop IDs from both randomized application scopes and stable
-application slices. Its cached XDG desktop-entry catalog is refreshed and the
-ancestry retried once after a complete miss, with repeated miss-triggered
-refreshes briefly throttled. Dialogs do not display executable modification
-timestamps. This GUI metadata is presentation-only and is not part of process
-authorization or direct-unlock trust evaluation. Linux GUI unlock requires an
-accepted GUI session capability (`x-session` or
-`wayland-session`) and uses
-in-process GTK4 or Qt Quick/QML SDK dialogs with forced X11 backend usage. A
-wrong password, cancelled dialog, or closed dialog denies the request.
-Concurrent GUI unlock requests are displayed as separate dialogs.
+creates a new process session. On macOS, the verified `/usr/bin/login` bridge
+described above lets Terminal and iTerm2 participate in both authorization and
+presentation. Other different-user boundaries remain excluded. For example, a
+shell request can be shown as `bash (via Terminal)`. A direct GUI caller uses
+its localized application name without redundant `via` text. The executable
+path always describes the direct executable selected for display, not its GUI
+host. All prompt scopes use the same application icon resolution: they prefer
+the GUI application's icon, then use the existing generic icon fallback if GUI
+application or icon discovery is missing or ambiguous. Linux resolves exact
+unique desktop-entry executables and systemd desktop IDs from both randomized
+application scopes and stable application slices. Its cached XDG desktop-entry
+catalog is refreshed and the ancestry retried once after a complete miss, with
+repeated miss-triggered refreshes briefly throttled. Dialogs do not display
+executable modification timestamps. This GUI metadata is presentation-only and
+is not part of process authorization or direct-unlock trust evaluation. Linux
+GUI unlock requires an accepted GUI session capability (`x-session` or
+`wayland-session`) and uses in-process GTK4 or Qt Quick/QML SDK dialogs with
+forced X11 backend usage. A wrong password, cancelled dialog, or closed dialog
+denies the request. Concurrent GUI unlock requests are displayed as separate
+dialogs.
 
 Clicking the explicit **Deny** button records a denial for the requesting
 process-lineage and access-scope pair. Until `user.denialTtlSeconds` expires,

@@ -66,7 +66,9 @@ Fail closed. Deny requests when peer credentials are missing, peer PID is
 unavailable, required same-user process identity cannot be resolved, or the
 cached process-lineage authorization is absent or expired. Lineage traversal
 continues across process session boundaries and stops successfully before a
-different-user ancestor.
+different-user ancestor. On macOS, traversal may skip exactly one verified
+root-owned `/usr/bin/login` boundary and resume from its same-user terminal host;
+incomplete or inconsistent boundary evidence must preserve the narrower lineage.
 
 Authorization must stay local to the Unix socket. Do not add network listeners,
 bearer-only fallbacks, or route exceptions that bypass peer credential and
