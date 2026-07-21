@@ -60,7 +60,6 @@ struct ProcessInfo {
     instance: ProcessInstanceIdentity,
     parent_pid: i32,
     uid: u32,
-    session_id: i32,
     executable: Option<ExecutableIdentity>,
     executable_path: Option<PathBuf>,
 }
@@ -76,7 +75,6 @@ impl ProcessInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthorizationScope {
     uid: u32,
-    session_id: i32,
     anchor: ProcessInstanceIdentity,
     chain: Vec<StableProcessIdentity>,
 }
@@ -155,6 +153,11 @@ pub(crate) struct ProcessDisplay {
 }
 
 impl ProcessDisplay {
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     pub(crate) fn presentation_name(&self) -> String {
         match &self.gui_application {
             Some(application) if application.same_as_primary => application.name.clone(),
@@ -163,6 +166,11 @@ impl ProcessDisplay {
         }
     }
 
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     pub(crate) fn preferred_icon(&self) -> Option<&ProcessIconSource> {
         self.gui_application
             .as_ref()
@@ -233,12 +241,11 @@ fn resolve_authorization_scope_with_resolver_and_gui(
         return None;
     }
 
-    let session_id = current.session_id;
     let mut chain = Vec::new();
     let mut presentation_parent = None;
 
     for _ in 0..MAX_PROCESS_CHAIN_DEPTH {
-        if current.uid != peer_uid || current.session_id != session_id {
+        if current.uid != peer_uid {
             break;
         }
         if chain
@@ -265,10 +272,6 @@ fn resolve_authorization_scope_with_resolver_and_gui(
         if parent.uid != peer_uid {
             break;
         }
-        if parent.session_id != session_id {
-            presentation_parent = Some(parent);
-            break;
-        }
         current = parent;
     }
 
@@ -285,20 +288,24 @@ fn resolve_authorization_scope_with_resolver_and_gui(
     let anchor = chain.first()?.instance;
     let scope = AuthorizationScope {
         uid: peer_uid,
-        session_id,
         anchor,
         chain: chain.iter().map(ProcessInfo::stable_identity).collect(),
     };
 
     let ultimate = ultimate_process_from_chain(&chain)?;
-    let display_chain = presentation_chain(&chain, presentation_parent, peer_uid, resolver);
-    Some(ResolvedAuthorizationScope {
-        hash: hash_authorization_scope(&scope),
-        display: process_display_from_chain_with_agent_and_gui(
+    let display = if presentation_parent.is_some() {
+        let display_chain = presentation_chain(&chain, presentation_parent, peer_uid, resolver);
+        process_display_from_chain_with_agent_and_gui(
             &display_chain,
             agent_executable,
             gui_resolver,
-        ),
+        )
+    } else {
+        process_display_from_chain_with_agent_and_gui(&chain, agent_executable, gui_resolver)
+    };
+    Some(ResolvedAuthorizationScope {
+        hash: hash_authorization_scope(&scope),
+        display,
         ultimate,
     })
 }
@@ -515,7 +522,6 @@ fn hash_authorization_scope(scope: &AuthorizationScope) -> ScopeHash {
     let mut hasher = Sha256::new();
     hasher.update(b"monopass-authorization-scope-v1\0");
     hasher.update(scope.uid.to_le_bytes());
-    hasher.update(scope.session_id.to_le_bytes());
     hash_instance(&mut hasher, scope.anchor);
     hasher.update((scope.chain.len() as u64).to_le_bytes());
 
@@ -623,7 +629,6 @@ impl ProcessResolver for PlatformProcessResolver {
             },
             parent_pid: stat.parent_pid,
             uid: process_dir.uid(),
-            session_id: stat.session_id,
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
         })
@@ -640,7 +645,6 @@ impl ProcessResolver for PlatformProcessResolver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinuxProcessStat {
     parent_pid: i32,
-    session_id: i32,
     start_time: u64,
 }
 
@@ -652,7 +656,7 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
     let _state = fields.next()?;
     let parent_pid = fields.next()?.parse().ok()?;
     let _process_group = fields.next()?;
-    let session_id = fields.next()?.parse().ok()?;
+    fields.next()?; // Session ID is intentionally excluded from authorization.
     for _ in 7..=21 {
         fields.next()?;
     }
@@ -660,7 +664,6 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
 
     Some(LinuxProcessStat {
         parent_pid,
-        session_id,
         start_time,
     })
 }
@@ -669,10 +672,6 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
 impl ProcessResolver for PlatformProcessResolver {
     fn process_info(&self, pid: i32) -> Option<ProcessInfo> {
         let info = macos_bsd_info(pid)?;
-        let session_id = unsafe { libc::getsid(pid) };
-        if session_id < 0 {
-            return None;
-        }
 
         let executable_path = macos_executable_path(pid);
         let executable_metadata = executable_path
@@ -689,7 +688,6 @@ impl ProcessResolver for PlatformProcessResolver {
             },
             parent_pid: i32::try_from(info.pbi_ppid).ok()?,
             uid: info.pbi_uid,
-            session_id,
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
         })
@@ -848,8 +846,6 @@ mod tests {
     };
 
     const UID: u32 = 501;
-    const SID: i32 = 9;
-
     #[derive(Default)]
     struct FakeResolver {
         processes: HashMap<i32, ProcessInfo>,
@@ -858,31 +854,23 @@ mod tests {
     }
 
     impl FakeResolver {
-        fn with(mut self, pid: i32, parent: i32, uid: u32, sid: i32, exe: u64) -> Self {
-            let process = process(pid, parent, uid, sid, Some(exe));
+        fn with(mut self, pid: i32, parent: i32, uid: u32, exe: u64) -> Self {
+            let process = process(pid, parent, uid, Some(exe));
             self.visible_uids.insert(pid, uid);
             self.processes.insert(pid, process);
             self
         }
 
-        fn with_path(
-            mut self,
-            pid: i32,
-            parent: i32,
-            uid: u32,
-            sid: i32,
-            exe: u64,
-            path: &str,
-        ) -> Self {
-            let mut process = process(pid, parent, uid, sid, Some(exe));
+        fn with_path(mut self, pid: i32, parent: i32, uid: u32, exe: u64, path: &str) -> Self {
+            let mut process = process(pid, parent, uid, Some(exe));
             process.executable_path = Some(PathBuf::from(path));
             self.visible_uids.insert(pid, uid);
             self.processes.insert(pid, process);
             self
         }
 
-        fn with_missing_executable(mut self, pid: i32, parent: i32, uid: u32, sid: i32) -> Self {
-            let process = process(pid, parent, uid, sid, None);
+        fn with_missing_executable(mut self, pid: i32, parent: i32, uid: u32) -> Self {
+            let process = process(pid, parent, uid, None);
             self.visible_uids.insert(pid, uid);
             self.processes.insert(pid, process);
             self
@@ -931,17 +919,17 @@ mod tests {
     #[test]
     fn transient_process_pids_are_ignored_when_executables_match() {
         let first = FakeResolver::default()
-            .with(12, 11, UID, SID, 3)
-            .with(11, 10, UID, SID, 2)
-            .with(10, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
-            .with(1, 0, 0, 1, 8);
+            .with(12, 11, UID, 3)
+            .with(11, 10, UID, 2)
+            .with(10, 9, UID, 1)
+            .with(9, 1, UID, 9)
+            .with(1, 0, 0, 8);
         let second = FakeResolver::default()
-            .with(22, 21, UID, SID, 3)
-            .with(21, 20, UID, SID, 2)
-            .with(20, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
-            .with(1, 0, 0, 1, 8);
+            .with(22, 21, UID, 3)
+            .with(21, 20, UID, 2)
+            .with(20, 9, UID, 1)
+            .with(9, 1, UID, 9)
+            .with(1, 0, 0, 8);
 
         let first = super::resolve_authorization_scope_hash_with_resolver(12, UID, &first);
         let second = super::resolve_authorization_scope_hash_with_resolver(22, UID, &second);
@@ -952,12 +940,12 @@ mod tests {
     #[test]
     fn direct_client_executable_is_included() {
         let first = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
+            .with(10, 9, UID, 1)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with(11, 9, UID, SID, 2)
-            .with(9, 1, UID, SID, 9)
+            .with(11, 9, UID, 2)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
 
         assert_ne!(
@@ -969,12 +957,12 @@ mod tests {
     #[test]
     fn different_anchor_instances_are_distinct() {
         let first = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
+            .with(10, 9, UID, 1)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with(10, 8, UID, SID, 1)
-            .with(8, 1, UID, SID, 9)
+            .with(10, 8, UID, 1)
+            .with(8, 1, UID, 9)
             .with_uid_only(1, 0);
 
         assert_ne!(
@@ -984,31 +972,33 @@ mod tests {
     }
 
     #[test]
-    fn different_sessions_are_distinct() {
+    fn sibling_terminal_processes_with_common_ancestry_share_scope() {
         let first = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
+            .with(12, 11, UID, 3)
+            .with(11, 9, UID, 2)
+            .with(9, 1, UID, 1)
             .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with(10, 9, UID, 8, 1)
-            .with(9, 1, UID, 8, 9)
+            .with(22, 21, UID, 3)
+            .with(21, 9, UID, 2)
+            .with(9, 1, UID, 1)
             .with_uid_only(1, 0);
 
-        assert_ne!(
-            super::resolve_authorization_scope_hash_with_resolver(10, UID, &first),
-            super::resolve_authorization_scope_hash_with_resolver(10, UID, &second)
+        assert_eq!(
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(22, UID, &second)
         );
     }
 
     #[test]
     fn missing_executable_falls_back_to_process_instance() {
         let first = FakeResolver::default()
-            .with_missing_executable(10, 9, UID, SID)
-            .with(9, 1, UID, SID, 9)
+            .with_missing_executable(10, 9, UID)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with_missing_executable(11, 9, UID, SID)
-            .with(9, 1, UID, SID, 9)
+            .with_missing_executable(11, 9, UID)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
 
         assert_ne!(
@@ -1020,12 +1010,12 @@ mod tests {
     #[test]
     fn changed_executable_metadata_changes_scope() {
         let first = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
+            .with(10, 9, UID, 1)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with(10, 9, UID, SID, 2)
-            .with(9, 1, UID, SID, 9)
+            .with(10, 9, UID, 2)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
 
         assert_ne!(
@@ -1037,8 +1027,8 @@ mod tests {
     #[test]
     fn different_user_parent_is_a_successful_boundary() {
         let resolver = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 1, UID, SID, 9)
+            .with(10, 9, UID, 1)
+            .with(9, 1, UID, 9)
             .with_uid_only(1, 0);
 
         assert!(
@@ -1047,41 +1037,27 @@ mod tests {
     }
 
     #[test]
-    fn different_session_parent_is_a_successful_boundary() {
-        let resolver = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 8, UID, SID, 9)
-            .with(8, 1, UID, 8, 8);
-
-        assert!(
-            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_some()
-        );
-    }
-
-    #[test]
-    fn gui_presentation_crosses_session_boundary_without_changing_scope_hash() {
+    fn same_user_gui_ancestry_affects_authorization_and_presentation() {
         let first = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
-            .with_path(10, 9, UID, 8, 2, "/Applications/Helper")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 9, UID, 2, "/Applications/Helper")
             .with_path(
                 9,
                 1,
                 UID,
-                8,
                 1,
                 "/Applications/Visual Studio Code.app/Contents/MacOS/Code",
             )
             .with_uid_only(1, 0);
         let second = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
-            .with_path(10, 9, UID, 7, 22, "/Applications/Other Helper")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 9, UID, 22, "/Applications/Other Helper")
             .with_path(
                 9,
                 1,
                 UID,
-                7,
                 11,
                 "/Applications/Other.app/Contents/MacOS/Other",
             )
@@ -1101,7 +1077,7 @@ mod tests {
             "bash (via Visual Studio Code)",
             scope.display.unwrap().presentation_name()
         );
-        assert_eq!(
+        assert_ne!(
             super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
             super::resolve_authorization_scope_hash_with_resolver(12, UID, &second)
         );
@@ -1110,30 +1086,28 @@ mod tests {
     #[test]
     fn gui_presentation_crosses_credential_boundary_without_changing_authorization() {
         let first = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
             .with_uid_only(10, 0)
-            .with_path(9, 8, UID, 8, 2, "/Applications/iTermServer")
+            .with_path(9, 8, UID, 2, "/Applications/iTermServer")
             .with_path(
                 8,
                 1,
                 UID,
-                8,
                 1,
                 "/Applications/iTerm.app/Contents/MacOS/iTerm2",
             )
             .with_uid_only(1, 0)
             .with_presentation_bridge(11, 10, 9);
         let second = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
             .with_uid_only(10, 0)
-            .with_path(19, 18, UID, 7, 22, "/Applications/Other Helper")
+            .with_path(19, 18, UID, 22, "/Applications/Other Helper")
             .with_path(
                 18,
                 1,
                 UID,
-                7,
                 11,
                 "/Applications/Other.app/Contents/MacOS/Other",
             )
@@ -1167,14 +1141,13 @@ mod tests {
     #[test]
     fn credential_boundary_finds_direct_terminal_parent() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
             .with_uid_only(10, 0)
             .with_path(
                 9,
                 1,
                 UID,
-                8,
                 2,
                 "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
             )
@@ -1199,8 +1172,8 @@ mod tests {
     #[test]
     fn unrecognized_privileged_boundary_preserves_plain_display() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
             .with_uid_only(10, 0);
         let gui = FakeGuiResolver::default().with(10, "Untrusted");
 
@@ -1251,7 +1224,7 @@ mod tests {
     #[test]
     fn inaccessible_same_user_parent_is_rejected() {
         let resolver = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
+            .with(10, 9, UID, 1)
             .with_uid_only(9, UID);
 
         assert!(
@@ -1261,7 +1234,7 @@ mod tests {
 
     #[test]
     fn missing_parent_uid_is_rejected() {
-        let resolver = FakeResolver::default().with(10, 9, UID, SID, 1);
+        let resolver = FakeResolver::default().with(10, 9, UID, 1);
 
         assert!(
             super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_none()
@@ -1271,8 +1244,8 @@ mod tests {
     #[test]
     fn parent_loop_is_rejected() {
         let resolver = FakeResolver::default()
-            .with(10, 9, UID, SID, 1)
-            .with(9, 10, UID, SID, 9);
+            .with(10, 9, UID, 1)
+            .with(9, 10, UID, 9);
 
         assert!(
             super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_none()
@@ -1283,7 +1256,7 @@ mod tests {
     fn chain_deeper_than_traversal_limit_is_rejected() {
         let mut resolver = FakeResolver::default();
         for pid in 1..=257 {
-            resolver = resolver.with(pid, pid - 1, UID, SID, pid as u64);
+            resolver = resolver.with(pid, pid - 1, UID, pid as u64);
         }
 
         assert!(
@@ -1298,7 +1271,6 @@ mod tests {
         assert_eq!(
             Some(super::LinuxProcessStat {
                 parent_pid: 456,
-                session_id: 333,
                 start_time: 999,
             }),
             super::parse_linux_process_stat(stat)
@@ -1322,12 +1294,11 @@ mod tests {
                 12,
                 11,
                 UID,
-                SID,
                 3,
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             )
-            .with_path(11, 10, UID, SID, 2, "/usr/local/bin/monopass")
-            .with_path(10, 1, UID, SID, 1, "/bin/bash")
+            .with_path(11, 10, UID, 2, "/usr/local/bin/monopass")
+            .with_path(10, 1, UID, 1, "/bin/bash")
             .with_uid_only(1, 0);
 
         let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
@@ -1349,16 +1320,15 @@ mod tests {
     #[test]
     fn display_filters_process_matching_agent_executable_identity() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/monopass")
+            .with_path(12, 11, UID, 3, "/usr/local/bin/monopass")
             .with_path(
                 11,
                 10,
                 UID,
-                SID,
                 2,
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             )
-            .with_path(10, 1, UID, SID, 1, "/bin/bash")
+            .with_path(10, 1, UID, 1, "/bin/bash")
             .with_uid_only(1, 0);
         let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
         let display = super::process_display_from_chain_with_agent(
@@ -1379,9 +1349,9 @@ mod tests {
     #[test]
     fn shell_display_is_attributed_to_nearest_gui_application() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
-            .with_path(10, 1, UID, SID, 2, "/usr/bin/gnome-terminal-server")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 1, UID, 2, "/usr/bin/gnome-terminal-server")
             .with_uid_only(1, 0);
         let gui = FakeGuiResolver::default().with(10, "Terminal");
 
@@ -1403,9 +1373,9 @@ mod tests {
     #[test]
     fn missing_gui_metadata_is_retried_after_catalog_refresh() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
-            .with_path(10, 1, UID, SID, 2, "/usr/bin/lxterminal")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 1, UID, 2, "/usr/bin/lxterminal")
             .with_uid_only(1, 0);
         let gui = RefreshingFakeGuiResolver {
             application_pid: 10,
@@ -1427,10 +1397,10 @@ mod tests {
     #[test]
     fn nested_gui_ancestors_choose_nearest_application() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 4, "/usr/local/bin/monopass")
-            .with_path(11, 10, UID, SID, 3, "/bin/bash")
-            .with_path(10, 9, UID, SID, 2, "/usr/bin/inner-terminal")
-            .with_path(9, 1, UID, SID, 1, "/usr/bin/outer-terminal")
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 9, UID, 2, "/usr/bin/inner-terminal")
+            .with_path(9, 1, UID, 1, "/usr/bin/outer-terminal")
             .with_uid_only(1, 0);
         let gui = FakeGuiResolver::default()
             .with(9, "Outer")
@@ -1449,8 +1419,8 @@ mod tests {
     #[test]
     fn direct_gui_caller_uses_localized_name_without_via() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/monopass")
-            .with_path(11, 1, UID, SID, 2, "/usr/bin/code")
+            .with_path(12, 11, UID, 3, "/usr/local/bin/monopass")
+            .with_path(11, 1, UID, 2, "/usr/bin/code")
             .with_uid_only(1, 0);
         let gui = FakeGuiResolver::default().with(11, "Visual Studio Code");
 
@@ -1468,8 +1438,8 @@ mod tests {
     #[test]
     fn missing_gui_metadata_preserves_plain_display() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/monopass")
-            .with_path(11, 1, UID, SID, 2, "/bin/bash")
+            .with_path(12, 11, UID, 3, "/usr/local/bin/monopass")
+            .with_path(11, 1, UID, 2, "/bin/bash")
             .with_uid_only(1, 0);
 
         let display = super::process_display_from_chain_with_agent_and_gui(
@@ -1531,7 +1501,7 @@ mod tests {
     #[test]
     fn display_falls_back_to_plain_executable() {
         let resolver = FakeResolver::default()
-            .with_path(12, 11, UID, SID, 3, "/usr/local/bin/example-tool")
+            .with_path(12, 11, UID, 3, "/usr/local/bin/example-tool")
             .with_uid_only(11, 0);
 
         let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
@@ -1542,13 +1512,7 @@ mod tests {
         assert_eq!(None, display.icon);
     }
 
-    fn process(
-        pid: i32,
-        parent_pid: i32,
-        uid: u32,
-        session_id: i32,
-        executable: Option<u64>,
-    ) -> ProcessInfo {
+    fn process(pid: i32, parent_pid: i32, uid: u32, executable: Option<u64>) -> ProcessInfo {
         ProcessInfo {
             instance: ProcessInstanceIdentity {
                 pid,
@@ -1559,7 +1523,6 @@ mod tests {
             },
             parent_pid,
             uid,
-            session_id,
             executable: executable.map(test_executable),
             executable_path: executable.map(|inode| PathBuf::from(format!("/bin/test-{inode}"))),
         }

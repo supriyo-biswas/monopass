@@ -85,14 +85,15 @@ for the master password in a dialog owned by the agent. The dialog identifies
 the requesting application from the authorized process chain, selecting the
 nearest caller after filtering out processes whose executable identity matches
 the running agent binary. It then looks for the nearest confidently recognized
-GUI application in parent ancestry. This presentation-only lookup may continue
-beyond the session boundary where verified authorization traversal stops. On
-macOS, when that traversal reaches a process whose effective UID differs from
-its real UID, and the real UID and parent both match the requesting user,
-presentation lookup resumes from the process above that credential boundary.
-This covers the root-owned `login` process used by Terminal and iTerm2 without
-changing the verified authorization chain. The resumed ancestry still uses the
-normal GUI-application recognition described below. Different identities are
+GUI application in parent ancestry. Same-user ancestry remains verified across
+process session boundaries, so terminal hosts such as Visual Studio Code and
+GNOME Terminal are available directly to presentation lookup. On macOS, when
+traversal reaches a process whose effective UID differs from its real UID, and
+the real UID and parent both match the requesting user, presentation lookup
+resumes from the process above that credential boundary. This covers the
+root-owned `login` process used by Terminal and iTerm2 without changing the
+verified authorization chain. The resumed ancestry still uses the normal
+GUI-application recognition described below. Different identities are
 shown as a composite such as `bash (via Terminal)`; a direct GUI caller uses its
 localized application name without redundant attribution. The executable path
 remains that of the direct executable selected for display. All prompt scopes

@@ -12,18 +12,20 @@ Timestamps are stored as Unix seconds and returned as RFC3339 UTC strings.
 ## Auth
 
 The agent derives an authorization scope from the Unix peer credentials and the
-peer's process lineage. A scope contains the caller UID and session ID, the PID
-and start time of the oldest accessible same-user process in that session, and
-the ordered identity of every process from that anchor through the direct
-client. The direct `monopass` process is included.
+peer's process lineage. A scope contains the caller UID, the PID and start time
+of the oldest accessible same-user process, and the ordered identity of every
+process from that anchor through the direct client. The direct `monopass`
+process is included. POSIX session IDs do not limit traversal or contribute to
+the scope, so matching lineages remain stable when a terminal creates a new
+session.
 
 Each lineage element uses executable file identity (device, inode, available
 generation, size, modification time, and change time) when available. If the
 executable cannot be inspected, the element falls back to PID plus process
 start time. A different scope, changed executable, changed ordered lineage, or
 PID/start-time fallback from a new process requires reauthorization. Traversal
-stops before a different-user or different-session ancestor and otherwise
-fails closed when required process identity cannot be resolved.
+stops before a different-user ancestor and otherwise fails closed when required
+same-user process identity cannot be resolved.
 
 Authorization is recorded independently for the `items` and `settings` access
 scopes. Auth endpoints that accept `scope` default to `items` when it is omitted.
@@ -99,15 +101,17 @@ HTTP/1.1 200 OK
 The agent displays a scope-specific password dialog for the requesting
 application and accepts one submitted password for the request. The nearest
 confidently recognized GUI application in the parent ancestry is used as
-presentation context. Presentation lookup may continue beyond the verified
-lineage's session boundary so terminal-hosting applications can be found. On
-macOS it may also cross exactly one root-owned local `/usr/bin/login` process
-when the login process name, real and saved UIDs, controlling terminal, and
-same-user parent all corroborate the boundary. Other different-user boundaries
-remain excluded. For example, a shell request can be shown as
-`bash (via Terminal)`. A direct GUI caller uses its localized application name
-without redundant `via` text. The executable path always describes the direct
-executable selected for display, not its GUI host. All prompt scopes use the
+presentation context. Same-user terminal hosts such as Visual Studio Code and
+GNOME Terminal are part of the verified lineage even when a child terminal
+creates a new process session. On macOS, presentation lookup may also cross
+exactly one root-owned local `/usr/bin/login` process when the login process
+name, real and saved UIDs, controlling terminal, and same-user parent all
+corroborate the boundary. This credential-boundary extension is
+presentation-only and does not change the authorization scope. Other
+different-user boundaries remain excluded. For example, a shell request can be
+shown as `bash (via Terminal)`. A direct GUI caller uses its localized
+application name without redundant `via` text. The executable path always
+describes the direct executable selected for display, not its GUI host. All prompt scopes use the
 same application icon resolution: they prefer the GUI application's icon, then
 use the existing generic icon fallback if GUI application or icon discovery is
 missing or ambiguous. Linux resolves exact unique desktop-entry executables and

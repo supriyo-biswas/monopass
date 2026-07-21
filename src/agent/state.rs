@@ -138,6 +138,11 @@ impl AgentState {
             .await
     }
 
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     pub async fn unlock_for_scope(
         &self,
         password: Zeroizing<String>,

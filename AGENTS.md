@@ -63,9 +63,10 @@ file or reference flows.
 ## Agent Security Invariants
 
 Fail closed. Deny requests when peer credentials are missing, peer PID is
-unavailable, required same-user/session process identity cannot be resolved, or
-the cached process-lineage authorization is absent or expired. Lineage traversal
-stops successfully before a different-user or different-session ancestor.
+unavailable, required same-user process identity cannot be resolved, or the
+cached process-lineage authorization is absent or expired. Lineage traversal
+continues across process session boundaries and stops successfully before a
+different-user ancestor.
 
 Authorization must stay local to the Unix socket. Do not add network listeners,
 bearer-only fallbacks, or route exceptions that bypass peer credential and
