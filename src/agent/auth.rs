@@ -123,6 +123,10 @@ async fn require_authorized_database(
         return Err(ApiError::access_denied());
     };
 
+    if state.is_migration_needed().await {
+        return Err(ApiError::migration_needed());
+    }
+
     if let Some(database) = state
         .authorize_database_access_for_scope(scope_hash, access_scope)
         .await

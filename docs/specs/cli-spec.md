@@ -1,8 +1,11 @@
 # Ground rules
 
-- You must not touch the agent code. You must do everything using the APIs. If something cannot be implemented, do not implement it, and make a note of it at the end.
+- Password-manager command behavior must use the agent APIs; agent API changes
+  belong in the API spec and maintenance commands are limited to the explicit
+  direct-database exceptions below.
 - Short/long handed options are always optional.
-- The CLI implementation is agent-only. No command opens the SQLCipher database directly or calls helpers that decrypt database contents outside the agent.
+- Password-manager commands are agent-only. Only the `init`, `passwd`, and
+  `migrate` maintenance commands open the SQLCipher database directly.
 
 # Shared implementation
 
@@ -37,7 +40,9 @@ bytes, call the selected unlock method with that bearer value, then zeroize the
 password buffer. When the selected method has `accepts_master_password: false`,
 call it without prompting locally or sending a bearer password. Retry the
 original request once after a successful unlock method call. Treat
-`403 unlock_failed` and a second `403 access_denied` as command failure.
+`403 unlock_failed`, `502 migration_needed`, and a second `403 access_denied`
+as command failure. A `migration_needed` response is passed through unchanged
+so the user sees the instruction to run `monopass migrate`.
 If the user explicitly denies GUI access, or that denial is already cached for
 the caller's process lineage, the GUI unlock method returns
 `403 temporary_lockout` with message `temporarily locked out after denial`.
@@ -99,6 +104,37 @@ Use `POST /api/v1/auth/lock` to clear cached process-lineage authorizations and
 schedule the unlocked database for unload on the agent's next authorization
 expiry sweep. The command does not prompt for the master password when the
 agent returns `403 access_denied`.
+
+## passwd command
+
+```text
+monopass passwd
+```
+
+This maintenance command acquires the same exclusive lock as the agent and
+refuses to run while the agent or another maintenance command holds it. It
+opens the SQLCipher database directly, verifies the current master password,
+and rekeys it after validating and confirming a new password.
+
+## migrate command
+
+```text
+monopass migrate
+```
+
+This maintenance command acquires the same exclusive lock as the agent and
+refuses to run while the agent or another maintenance command holds it. It
+prompts for the master password, opens the SQLCipher database directly, and
+applies all pending schema migrations in transactions. It reports success
+without rewriting an already-current database. Afterward it prints the
+platform-specific instruction for restarting the agent.
+
+Breaking migrations are never applied by agent startup or unlock. An older
+database at a known breaking boundary remains locked, and database operations
+fail with `502 migration_needed` until the user stops the agent and runs this
+command. Schema 3 is the first such transition: it expands each schema-2
+`item_versions.fields` JSON object into rows in `item_version_fields` and drops
+the old JSON column.
 
 ## settings commands
 

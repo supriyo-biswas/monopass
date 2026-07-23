@@ -21,6 +21,7 @@ pub enum ApiErrorCode {
     BadRequest,
     Conflict,
     InternalError,
+    MigrationNeeded,
     NotFound,
     // Keep this condition in sync with the GUI unlock route.
     #[cfg(any(
@@ -99,6 +100,14 @@ impl ApiError {
         )
     }
 
+    pub fn migration_needed() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            ApiErrorCode::MigrationNeeded,
+            "database migration required; run `monopass migrate`",
+        )
+    }
+
     fn new(status: StatusCode, code: ApiErrorCode, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -158,6 +167,21 @@ mod tests {
             ApiError::unlock_failed(),
             StatusCode::FORBIDDEN,
             json!({"error":{"code":"unlock_failed","message":"failed to unlock database"}}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serializes_migration_needed() {
+        assert_error_response(
+            ApiError::migration_needed(),
+            StatusCode::BAD_GATEWAY,
+            json!({
+                "error": {
+                    "code": "migration_needed",
+                    "message": "database migration required; run `monopass migrate`"
+                }
+            }),
         )
         .await;
     }

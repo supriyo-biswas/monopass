@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::ExposeSecret;
 use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
 use zeroize::Zeroizing;
 
 #[cfg(debug_assertions)]
@@ -50,9 +53,19 @@ CREATE TABLE items (
 CREATE TABLE item_versions (
     version_id INTEGER NOT NULL,
     item_id INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE,
-    fields TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (item_id, version_id)
+) WITHOUT ROWID;
+
+CREATE TABLE item_version_fields (
+    item_id INTEGER NOT NULL,
+    version_id INTEGER NOT NULL,
+    field_name TEXT NOT NULL,
+    field_type TEXT NOT NULL CHECK (field_type IN ('string', 'file', 'totp')),
+    concealed INTEGER NOT NULL CHECK (concealed IN (0, 1)),
+    data TEXT NOT NULL,
+    PRIMARY KEY (item_id, version_id, field_name),
+    FOREIGN KEY (item_id, version_id) REFERENCES item_versions (item_id, version_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
 CREATE TABLE files (
@@ -102,7 +115,47 @@ const DIR_SYSTEM: i64 = 1 << 1;
 const DIR_DENY_OVERWRITE: i64 = 1 << 2;
 const ITEM_HIDDEN: i64 = 1 << 0;
 const ITEM_READ_MUSTAUTH: i64 = 1 << 1;
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+pub(crate) const DATABASE_SCHEMA_VERSION: i64 = 3;
+const BREAKING_SCHEMA_VERSION: i64 = 3;
+
+#[derive(Debug)]
+pub enum DatabaseOpenError {
+    MigrationNeeded { current: i64, target: i64 },
+    Sqlite(rusqlite::Error),
+}
+
+impl DatabaseOpenError {
+    pub fn is_migration_needed(&self) -> bool {
+        matches!(self, Self::MigrationNeeded { .. })
+    }
+}
+
+impl fmt::Display for DatabaseOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MigrationNeeded { current, target } => write!(
+                formatter,
+                "database schema {current} must be migrated to schema {target} with `monopass migrate`"
+            ),
+            Self::Sqlite(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MigrationNeeded { .. } => None,
+            Self::Sqlite(error) => Some(error),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for DatabaseOpenError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
 
 #[cfg(debug_assertions)]
 pub fn open_encrypted_database(config: &Config) -> AppResult<Connection> {
@@ -115,13 +168,14 @@ pub fn open_encrypted_database(config: &Config) -> AppResult<Connection> {
 pub fn open_encrypted_database_with_password(
     database_path: impl AsRef<std::path::Path>,
     password: &str,
-) -> rusqlite::Result<Connection> {
+) -> Result<Connection, DatabaseOpenError> {
     let conn = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
 
     conn.pragma_update(None, "key", password)?;
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
     configure_open_connection(&conn)?;
-    migrate_database(&conn)?;
+    migrate_compatible_database(&conn)?;
+    require_current_schema(&conn)?;
     insert_missing_user_setting_defaults(&conn)?;
 
     Ok(conn)
@@ -233,11 +287,14 @@ fn insert_internal_key_item(
     let item_id = conn.last_insert_rowid();
     conn.execute(
         r#"
-        INSERT INTO item_versions (item_id, version_id, fields, created_at)
-        VALUES (?1, 1, ?2, ?3)
+        INSERT INTO item_versions (item_id, version_id, created_at)
+        VALUES (?1, 1, ?2)
         "#,
-        (item_id, fields, now),
+        (item_id, now),
     )?;
+    let fields: HashMap<String, StoredField> = serde_json::from_str(fields)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    insert_stored_fields(conn, item_id, 1, fields)?;
     conn.execute(
         r#"
         UPDATE items
@@ -273,7 +330,7 @@ fn insert_missing_user_setting_defaults(conn: &Connection) -> rusqlite::Result<(
     Ok(())
 }
 
-fn migrate_database(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_compatible_database(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > DATABASE_SCHEMA_VERSION {
         return Err(rusqlite::Error::InvalidQuery);
@@ -291,8 +348,152 @@ fn migrate_database(conn: &Connection) -> rusqlite::Result<()> {
         "#,
         (DIR_DENY_OVERWRITE, TRASH_DIR_NAME),
     )?;
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.commit()
+}
+
+fn require_current_schema(conn: &Connection) -> Result<(), DatabaseOpenError> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < BREAKING_SCHEMA_VERSION {
+        return Err(DatabaseOpenError::MigrationNeeded {
+            current: version,
+            target: DATABASE_SCHEMA_VERSION,
+        });
+    }
+    if version > DATABASE_SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidQuery.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn migrate_encrypted_database_with_password(
+    database_path: impl AsRef<std::path::Path>,
+    password: &str,
+) -> Result<bool, DatabaseOpenError> {
+    let conn = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.pragma_update(None, "key", password)?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+    configure_open_connection(&conn)?;
+    migrate_compatible_database(&conn)?;
+
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > DATABASE_SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidQuery.into());
+    }
+    if version == DATABASE_SCHEMA_VERSION {
+        insert_missing_user_setting_defaults(&conn)?;
+        return Ok(false);
+    }
+
+    migrate_fields_to_rows(&conn)?;
+    insert_missing_user_setting_defaults(&conn)?;
+    Ok(true)
+}
+
+#[derive(Deserialize)]
+struct StoredField {
+    #[serde(rename = "type")]
+    field_type: StoredFieldType,
+    concealed: bool,
+    data: crate::secret::SecretString,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StoredFieldType {
+    String,
+    File,
+    Totp,
+}
+
+impl StoredFieldType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::File => "file",
+            Self::Totp => "totp",
+        }
+    }
+}
+
+fn migrate_fields_to_rows(conn: &Connection) -> rusqlite::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE item_version_fields (
+            item_id INTEGER NOT NULL,
+            version_id INTEGER NOT NULL,
+            field_name TEXT NOT NULL,
+            field_type TEXT NOT NULL CHECK (field_type IN ('string', 'file', 'totp')),
+            concealed INTEGER NOT NULL CHECK (concealed IN (0, 1)),
+            data TEXT NOT NULL,
+            PRIMARY KEY (item_id, version_id, field_name),
+            FOREIGN KEY (item_id, version_id) REFERENCES item_versions (item_id, version_id) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+
+    {
+        let mut select = transaction.prepare(
+            "SELECT item_id, version_id, fields FROM item_versions ORDER BY item_id, version_id",
+        )?;
+        let mut insert = transaction.prepare(
+            r#"
+            INSERT INTO item_version_fields
+                (item_id, version_id, field_name, field_type, concealed, data)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let item_id: i64 = row.get(0)?;
+            let version_id: i64 = row.get(1)?;
+            let fields_json = Zeroizing::new(row.get::<_, String>(2)?);
+            let fields: HashMap<String, StoredField> =
+                serde_json::from_str(fields_json.as_str())
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            for (name, field) in fields {
+                insert.execute((
+                    item_id,
+                    version_id,
+                    name,
+                    field.field_type.as_str(),
+                    field.concealed,
+                    field.data.as_str(),
+                ))?;
+            }
+        }
+    }
+
+    transaction.execute("ALTER TABLE item_versions DROP COLUMN fields", [])?;
     transaction.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
     transaction.commit()
+}
+
+fn insert_stored_fields(
+    conn: &Connection,
+    item_id: i64,
+    version_id: i64,
+    fields: HashMap<String, StoredField>,
+) -> rusqlite::Result<()> {
+    let mut insert = conn.prepare(
+        r#"
+        INSERT INTO item_version_fields
+            (item_id, version_id, field_name, field_type, concealed, data)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )?;
+    for (name, field) in fields {
+        insert.execute((
+            item_id,
+            version_id,
+            name,
+            field.field_type.as_str(),
+            field.concealed,
+            field.data.as_str(),
+        ))?;
+    }
+    Ok(())
 }
 
 fn create_default_dirs(conn: &Connection) -> rusqlite::Result<()> {
@@ -361,6 +562,34 @@ pub(crate) fn prompt_password(prompt: &str) -> io::Result<Zeroizing<String>> {
 }
 
 #[cfg(test)]
+pub(crate) fn downgrade_to_schema_two(conn: &Connection) {
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    conn.execute_batch(
+        r#"
+        ALTER TABLE item_versions ADD COLUMN fields TEXT NOT NULL DEFAULT '{}';
+        UPDATE item_versions
+        SET fields = COALESCE((
+            SELECT json_group_object(
+                field_name,
+                json_object(
+                    'type', field_type,
+                    'concealed', CASE concealed WHEN 1 THEN json('true') ELSE json('false') END,
+                    'data', data
+                )
+            )
+            FROM item_version_fields f
+            WHERE f.item_id = item_versions.item_id
+              AND f.version_id = item_versions.version_id
+        ), '{}');
+        DROP TABLE item_version_fields;
+        PRAGMA user_version = 2;
+        "#,
+    )
+    .unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
@@ -377,17 +606,20 @@ mod tests {
         assert_table_exists(&conn, "dirs");
         assert_table_exists(&conn, "items");
         assert_table_exists(&conn, "item_versions");
+        assert_table_exists(&conn, "item_version_fields");
         assert_table_exists(&conn, "files");
         assert_table_exists(&conn, "item_version_file_mapping");
         assert_table_exists(&conn, "system_settings");
         assert_table_exists(&conn, "contacts");
         assert_table_without_rowid(&conn, "contacts");
         assert_table_without_rowid(&conn, "item_versions");
+        assert_table_without_rowid(&conn, "item_version_fields");
         assert_table_without_rowid(&conn, "files");
         assert_table_without_rowid(&conn, "item_version_file_mapping");
         assert_primary_key(&conn, "contacts", &["email"]);
         assert_column_exists(&conn, "contacts", "name");
         assert_no_column(&conn, "items", "fields");
+        assert_no_column(&conn, "item_versions", "fields");
         assert_no_column(&conn, "files", "item_id");
         assert_no_column(&conn, "files", "name");
         assert_unique_index(&conn, "files", &["sha256"]);
@@ -396,6 +628,11 @@ mod tests {
         assert_no_column(&conn, "items", "trashed_at");
         assert_column_exists(&conn, "contacts", "created_at");
         assert_primary_key(&conn, "item_versions", &["item_id", "version_id"]);
+        assert_primary_key(
+            &conn,
+            "item_version_fields",
+            &["item_id", "version_id", "field_name"],
+        );
         assert_primary_key(
             &conn,
             "item_version_file_mapping",
@@ -409,7 +646,7 @@ mod tests {
         assert_eq!(1, pragma_i64(&conn, "foreign_keys"));
         assert_eq!(2, pragma_i64(&conn, "auto_vacuum"));
         assert_eq!("wal", pragma_string(&conn, "journal_mode"));
-        assert_eq!(2, pragma_i64(&conn, "user_version"));
+        assert_eq!(3, pragma_i64(&conn, "user_version"));
         assert_eq!(1, dir_count(&conn, "Personal"));
         assert_dir_bitmask(&conn, "Personal", 0);
         assert_dir_bitmask(
@@ -457,6 +694,8 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "key", "correct").unwrap();
         conn.execute_batch(super::SCHEMA).unwrap();
+        conn.pragma_update(None, "user_version", super::DATABASE_SCHEMA_VERSION)
+            .unwrap();
         drop(conn);
 
         let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
@@ -466,32 +705,34 @@ mod tests {
     }
 
     #[test]
-    fn opening_existing_database_migrates_schema_and_inserts_only_missing_user_settings() {
+    fn opening_schema_two_database_requires_explicit_migration() {
         let file = NamedTempFile::new().unwrap();
-        let conn = Connection::open_with_flags(
-            file.path(),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )
-        .unwrap();
+        super::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+        let conn = Connection::open(file.path()).unwrap();
         conn.pragma_update(None, "key", "correct").unwrap();
-        conn.execute_batch(super::SCHEMA).unwrap();
-        super::create_default_dirs(&conn).unwrap();
+        super::downgrade_to_schema_two(&conn);
         conn.execute(
             "UPDATE dirs SET bitmask = ?1 WHERE name = 'Trash'",
-            [super::DIR_HIDDEN | (1_i64 << 8)],
+            [super::DIR_HIDDEN | super::DIR_DENY_OVERWRITE | (1_i64 << 8)],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO system_settings (name, value) VALUES ('user.autoDeleteTrashItemsAfterSeconds', '0')",
+            "UPDATE system_settings SET value = '0' WHERE name = 'user.autoDeleteTrashItemsAfterSeconds'",
             [],
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
         drop(conn);
 
+        let error =
+            super::open_encrypted_database_with_password(file.path(), "correct").unwrap_err();
+        assert!(error.is_migration_needed());
+
+        assert!(super::migrate_encrypted_database_with_password(file.path(), "correct").unwrap());
         let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
 
-        assert_eq!(2, pragma_i64(&conn, "user_version"));
+        assert_eq!(3, pragma_i64(&conn, "user_version"));
+        assert_no_column(&conn, "item_versions", "fields");
+        assert_table_exists(&conn, "item_version_fields");
         assert_no_column(&conn, "items", "trashed_at");
         assert_dir_bitmask(
             &conn,
@@ -505,6 +746,36 @@ mod tests {
         assert_setting_value(&conn, "user.autoDeleteTrashItemsAfterSeconds", "0");
         assert_setting_value(&conn, "user.autoDeleteOldVersionsAfterSeconds", "15552000");
         assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
+    }
+
+    #[test]
+    fn explicit_migration_is_idempotent_for_current_schema() {
+        let file = NamedTempFile::new().unwrap();
+        super::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+
+        assert!(!super::migrate_encrypted_database_with_password(file.path(), "correct").unwrap());
+        let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
+        assert_eq!(3, pragma_i64(&conn, "user_version"));
+    }
+
+    #[test]
+    fn malformed_legacy_fields_roll_back_breaking_migration() {
+        let file = NamedTempFile::new().unwrap();
+        super::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        conn.pragma_update(None, "key", "correct").unwrap();
+        super::downgrade_to_schema_two(&conn);
+        conn.execute("UPDATE item_versions SET fields = 'not-json'", [])
+            .unwrap();
+        drop(conn);
+
+        assert!(super::migrate_encrypted_database_with_password(file.path(), "correct").is_err());
+
+        let conn = Connection::open(file.path()).unwrap();
+        conn.pragma_update(None, "key", "correct").unwrap();
+        assert_eq!(2, pragma_i64(&conn, "user_version"));
+        assert_column_exists(&conn, "item_versions", "fields");
+        assert_table_missing(&conn, "item_version_fields");
     }
 
     #[test]
@@ -574,6 +845,17 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
+    }
+
+    fn assert_table_missing(conn: &Connection, table: &str) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(0, count);
     }
 
     fn assert_table_without_rowid(conn: &Connection, table: &str) {
@@ -678,51 +960,48 @@ mod tests {
     }
 
     fn assert_internal_file_encryption_key_exists(conn: &Connection) {
-        let (bitmask, fields) = internal_item(conn, "FileEncryptionKey");
+        let (bitmask, concealed, key) = internal_item(conn, "FileEncryptionKey");
         assert_eq!(super::ITEM_HIDDEN | super::ITEM_READ_MUSTAUTH, bitmask);
-        let value: serde_json::Value = serde_json::from_str(&fields).unwrap();
-        let key = value["key"]["data"].as_str().unwrap();
-        assert!(value["key"]["concealed"].as_bool().unwrap());
+        assert!(concealed);
         assert_eq!(64, key.len());
         assert!(key.chars().all(|character| character.is_ascii_hexdigit()));
     }
 
     fn assert_internal_age_keypair_exists(conn: &Connection) {
-        let (public_bitmask, public_fields) = internal_item(conn, "AgePublicKey");
+        let (public_bitmask, public_concealed, public_key) = internal_item(conn, "AgePublicKey");
         assert_eq!(0, public_bitmask);
-        let public_fields: serde_json::Value = serde_json::from_str(&public_fields).unwrap();
-        assert!(!public_fields["key"]["concealed"].as_bool().unwrap());
-        let public_key = public_fields["key"]["data"].as_str().unwrap();
+        assert!(!public_concealed);
         assert!(public_key.starts_with("age1"), "{public_key}");
 
-        let (private_bitmask, private_fields) = internal_item(conn, "AgePrivateKey");
+        let (private_bitmask, private_concealed, private_key) =
+            internal_item(conn, "AgePrivateKey");
         assert_eq!(
             super::ITEM_HIDDEN | super::ITEM_READ_MUSTAUTH,
             private_bitmask
         );
-        let private_fields: serde_json::Value = serde_json::from_str(&private_fields).unwrap();
-        assert!(private_fields["key"]["concealed"].as_bool().unwrap());
-        let private_key = private_fields["key"]["data"].as_str().unwrap();
+        assert!(private_concealed);
         assert!(private_key.starts_with("AGE-SECRET-KEY-"), "{private_key}");
 
-        let identity = age::x25519::Identity::from_str(private_key).unwrap();
+        let identity = age::x25519::Identity::from_str(&private_key).unwrap();
         assert_eq!(public_key, identity.to_public().to_string());
     }
 
-    fn internal_item(conn: &Connection, name: &str) -> (i64, String) {
+    fn internal_item(conn: &Connection, name: &str) -> (i64, bool, String) {
         conn.query_row(
             r#"
-            SELECT i.bitmask, v.fields
+            SELECT i.bitmask, f.concealed, f.data
             FROM dirs d
             JOIN items i ON i.dir_id = d.id
             JOIN item_versions v ON v.item_id = i.id AND v.version_id = i.latest_version_id
+            JOIN item_version_fields f
+              ON f.item_id = v.item_id AND f.version_id = v.version_id AND f.field_name = 'key'
             WHERE d.name = '_Internal'
               AND i.name = ?1
               AND i.oldest_version_id = 1
               AND i.latest_version_id = 1
             "#,
             [name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap()
     }

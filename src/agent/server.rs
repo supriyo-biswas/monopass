@@ -159,6 +159,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_outdated_database_rejects_database_routes_with_migration_needed() {
+        let state = AgentState::from_database_path("missing.db");
+        state.mark_migration_needed().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+
+        let response = router
+            .oneshot(request_with_hash("/api/v1/dirs", ScopeHash::test(1)))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::BAD_GATEWAY, response.status());
+        assert_eq!(
+            json!({
+                "error": {
+                    "code": "migration_needed",
+                    "message": "database migration required; run `monopass migrate`"
+                }
+            }),
+            json_body(response).await
+        );
+    }
+
+    #[tokio::test]
     async fn unlocked_database_route_with_missing_hash_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         state.store_database_handle(DbHandle::test()).await;

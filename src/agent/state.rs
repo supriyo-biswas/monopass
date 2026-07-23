@@ -242,7 +242,14 @@ impl AgentState {
         })
         .await
         .map_err(|_| UnlockError::UnlockFailed)?
-        .map_err(|_| UnlockError::UnlockFailed)?;
+        .map_err(|error| {
+            if error.is_migration_needed() {
+                inner.migration_needed = true;
+                UnlockError::MigrationNeeded
+            } else {
+                UnlockError::UnlockFailed
+            }
+        })?;
         if !direct_unlock_caller_is_trusted(&handle, enforce_direct_trust, direct_program).await {
             return Err(UnlockError::AccessDenied);
         }
@@ -280,6 +287,15 @@ impl AgentState {
     #[cfg(test)]
     pub async fn is_unlocked(&self) -> bool {
         self.inner.lock().await.database.is_some()
+    }
+
+    pub async fn is_migration_needed(&self) -> bool {
+        self.inner.lock().await.migration_needed
+    }
+
+    #[cfg(test)]
+    pub async fn mark_migration_needed(&self) {
+        self.inner.lock().await.migration_needed = true;
     }
 
     #[cfg(test)]
@@ -679,6 +695,7 @@ impl Drop for ActiveDatabaseRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockError {
     AccessDenied,
+    MigrationNeeded,
     UnlockFailed,
 }
 
@@ -696,6 +713,7 @@ struct InnerState {
     last_cleanup_at: Option<Instant>,
     active_jobs: HashSet<String>,
     auth_epoch: u64,
+    migration_needed: bool,
 }
 
 impl Default for InnerState {
@@ -718,6 +736,7 @@ impl Default for InnerState {
             last_cleanup_at: None,
             active_jobs: HashSet::new(),
             auth_epoch: 0,
+            migration_needed: false,
         }
     }
 }
@@ -901,7 +920,7 @@ impl DbHandle {
         file_store_path: impl AsRef<Path>,
         password: &str,
         reader_workers: usize,
-    ) -> rusqlite::Result<Self> {
+    ) -> Result<Self, db::DatabaseOpenError> {
         let database_path = database_path.as_ref();
         let writer = db::open_encrypted_database_with_password(database_path, password)?;
         let mut readers = Vec::with_capacity(reader_workers);
@@ -1418,9 +1437,18 @@ impl DbHandle {
                 CREATE TABLE item_versions (
                     version_id INTEGER NOT NULL,
                     item_id INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE,
-                    fields TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     PRIMARY KEY (item_id, version_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE item_version_fields (
+                    item_id INTEGER NOT NULL,
+                    version_id INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    field_type TEXT NOT NULL CHECK (field_type IN ('string', 'file', 'totp')),
+                    concealed INTEGER NOT NULL CHECK (concealed IN (0, 1)),
+                    data TEXT NOT NULL,
+                    PRIMARY KEY (item_id, version_id, field_name),
+                    FOREIGN KEY (item_id, version_id) REFERENCES item_versions (item_id, version_id) ON DELETE CASCADE
                 ) WITHOUT ROWID;
                 CREATE TABLE files (
                     id BLOB PRIMARY KEY,
@@ -3072,8 +3100,7 @@ impl DatabaseWorker {
         }
         let row = item_version_row(&self.connection, dir_id, item_name, version)?;
 
-        let mut fields: std::collections::HashMap<String, Field> =
-            serde_json::from_str(row.fields_json.as_str()).map_err(|_| DbError::Internal)?;
+        let mut fields = item_fields_for_version(&self.connection, row.item_id, row.version_id)?;
         if raw {
             // Raw mode intentionally leaves stored field data unchanged.
         } else if reveal {
@@ -3394,8 +3421,7 @@ impl DatabaseWorker {
         }
         let row = item_version_row(&self.connection, dir_id, item_name, version)?;
 
-        let fields: std::collections::HashMap<String, Field> =
-            serde_json::from_str(row.fields_json.as_str()).map_err(|_| DbError::Internal)?;
+        let fields = item_fields_for_version(&self.connection, row.item_id, row.version_id)?;
         if let Some(field) = fields.get(field_name) {
             if matches!(field.field_type, FieldType::Totp) {
                 let bytes = if raw {
@@ -4211,7 +4237,6 @@ struct ItemVersionRow {
     item_id: i64,
     item_name: String,
     version_id: i64,
-    fields_json: Zeroizing<String>,
     item_created_at: i64,
     item_updated_at: i64,
 }
@@ -4225,7 +4250,7 @@ fn item_version_row(
     connection
         .query_row(
             r#"
-            SELECT i.id, i.name, v.version_id, v.fields, i.created_at, i.updated_at
+            SELECT i.id, i.name, v.version_id, i.created_at, i.updated_at
             FROM items i
             JOIN item_versions v
               ON v.item_id = i.id
@@ -4238,9 +4263,8 @@ fn item_version_row(
                     item_id: row.get(0)?,
                     item_name: row.get(1)?,
                     version_id: row.get(2)?,
-                    fields_json: Zeroizing::new(row.get(3)?),
-                    item_created_at: row.get(4)?,
-                    item_updated_at: row.get(5)?,
+                    item_created_at: row.get(3)?,
+                    item_updated_at: row.get(4)?,
                 })
             },
         )
@@ -4253,21 +4277,14 @@ fn source_fields(
     connection: &Connection,
     item_id: i64,
 ) -> Result<std::collections::HashMap<String, Field>, DbError> {
-    let fields_json: Zeroizing<String> = Zeroizing::new(
-        connection
-            .query_row(
-                r#"
-            SELECT v.fields
-            FROM items i
-            JOIN item_versions v ON v.item_id = i.id AND v.version_id = i.latest_version_id
-            WHERE i.id = ?1
-            "#,
-                [item_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|_| DbError::Internal)?,
-    );
-    serde_json::from_str(fields_json.as_str()).map_err(|_| DbError::Internal)
+    let version_id = connection
+        .query_row(
+            "SELECT latest_version_id FROM items WHERE id = ?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| DbError::Internal)?;
+    item_fields_for_version(connection, item_id, version_id)
 }
 
 fn item_fields_for_version(
@@ -4275,18 +4292,50 @@ fn item_fields_for_version(
     item_id: i64,
     version_id: i64,
 ) -> Result<std::collections::HashMap<String, Field>, DbError> {
-    let fields_json: Zeroizing<String> = Zeroizing::new(
-        connection
-            .query_row(
-                "SELECT fields FROM item_versions WHERE item_id = ?1 AND version_id = ?2",
-                (item_id, version_id),
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|_| DbError::Internal)?
-            .ok_or(DbError::NotFound)?,
-    );
-    serde_json::from_str(fields_json.as_str()).map_err(|_| DbError::Internal)
+    let version_exists = connection
+        .query_row(
+            "SELECT 1 FROM item_versions WHERE item_id = ?1 AND version_id = ?2",
+            (item_id, version_id),
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| DbError::Internal)?
+        .is_some();
+    if !version_exists {
+        return Err(DbError::NotFound);
+    }
+
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT field_name, field_type, concealed, data
+            FROM item_version_fields
+            WHERE item_id = ?1 AND version_id = ?2
+            ORDER BY field_name
+            "#,
+        )
+        .map_err(|_| DbError::Internal)?;
+    let rows = statement
+        .query_map((item_id, version_id), |row| {
+            let field_type = match row.get::<_, String>(1)?.as_str() {
+                "string" => FieldType::String,
+                "file" => FieldType::File,
+                "totp" => FieldType::Totp,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            let data = Zeroizing::new(row.get::<_, String>(3)?);
+            Ok((
+                row.get::<_, String>(0)?,
+                Field {
+                    field_type,
+                    concealed: row.get(2)?,
+                    data: data.into(),
+                },
+            ))
+        })
+        .map_err(|_| DbError::Internal)?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(|_| DbError::Internal)
 }
 
 fn item_total_versions(connection: &Connection, item_id: i64) -> Result<u64, DbError> {
@@ -4537,16 +4586,41 @@ fn create_item_version(
             |row| row.get(0),
         )
         .map_err(|_| DbError::Internal)?;
-    let fields_json = Zeroizing::new(serde_json::to_string(fields).map_err(|_| DbError::Internal)?);
     transaction
         .execute(
             r#"
-            INSERT INTO item_versions (version_id, item_id, fields, created_at)
-            VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO item_versions (version_id, item_id, created_at)
+            VALUES (?1, ?2, ?3)
             "#,
-            (version_id, item_id, fields_json.as_str(), created_at),
+            (version_id, item_id, created_at),
         )
         .map_err(map_insert_error)?;
+    let mut statement = transaction
+        .prepare(
+            r#"
+            INSERT INTO item_version_fields
+                (item_id, version_id, field_name, field_type, concealed, data)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .map_err(|_| DbError::Internal)?;
+    for (name, field) in fields {
+        let field_type = match field.field_type {
+            FieldType::String => "string",
+            FieldType::File => "file",
+            FieldType::Totp => "totp",
+        };
+        statement
+            .execute((
+                item_id,
+                version_id,
+                name,
+                field_type,
+                field.concealed,
+                field.data.as_str(),
+            ))
+            .map_err(map_insert_error)?;
+    }
     Ok(version_id)
 }
 
@@ -4673,10 +4747,27 @@ fn insert_test_internal_key_item(
     connection
         .execute(
             r#"
-            INSERT INTO item_versions (item_id, version_id, fields, created_at)
-            VALUES (?1, 1, ?2, 1)
+            INSERT INTO item_versions (item_id, version_id, created_at)
+            VALUES (?1, 1, 1)
             "#,
-            (item_id, fields),
+            [item_id],
+        )
+        .unwrap();
+    let fields: serde_json::Value = serde_json::from_str(fields).unwrap();
+    let field = &fields["key"];
+    connection
+        .execute(
+            r#"
+            INSERT INTO item_version_fields
+                (item_id, version_id, field_name, field_type, concealed, data)
+            VALUES (?1, 1, 'key', ?2, ?3, ?4)
+            "#,
+            (
+                item_id,
+                field["type"].as_str().unwrap(),
+                field["concealed"].as_bool().unwrap(),
+                field["data"].as_str().unwrap(),
+            ),
         )
         .unwrap();
     connection
@@ -5462,9 +5553,18 @@ mod tests {
                 CREATE TABLE item_versions (
                     version_id INTEGER NOT NULL,
                     item_id INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE,
-                    fields TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     PRIMARY KEY (item_id, version_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE item_version_fields (
+                    item_id INTEGER NOT NULL,
+                    version_id INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    field_type TEXT NOT NULL CHECK (field_type IN ('string', 'file', 'totp')),
+                    concealed INTEGER NOT NULL CHECK (concealed IN (0, 1)),
+                    data TEXT NOT NULL,
+                    PRIMARY KEY (item_id, version_id, field_name),
+                    FOREIGN KEY (item_id, version_id) REFERENCES item_versions (item_id, version_id) ON DELETE CASCADE
                 ) WITHOUT ROWID;
                 CREATE TABLE files (
                     id BLOB PRIMARY KEY,
@@ -5491,14 +5591,6 @@ mod tests {
         reader.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         let file_id = vec![1u8; 32];
-        let fields = serde_json::json!({
-            "password": {
-                "name": "password",
-                "type": "string",
-                "concealed": true,
-                "data": "field-bytes"
-            }
-        });
         let transaction = writer.transaction().unwrap();
         transaction
             .execute(
@@ -5514,8 +5606,14 @@ mod tests {
             .unwrap();
         transaction
             .execute(
-                "INSERT INTO item_versions (version_id, item_id, fields, created_at) VALUES (1, 1, ?1, 1)",
-                [fields.to_string()],
+                "INSERT INTO item_versions (version_id, item_id, created_at) VALUES (1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO item_version_fields (item_id, version_id, field_name, field_type, concealed, data) VALUES (1, 1, 'password', 'string', 1, 'field-bytes')",
+                [],
             )
             .unwrap();
         transaction
@@ -5583,6 +5681,26 @@ mod tests {
                 .is_err()
         );
         assert!(!state.is_unlocked().await);
+        assert!(!state.is_migration_needed().await);
+    }
+
+    #[tokio::test]
+    async fn schema_two_unlock_requires_explicit_migration() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let conn = Connection::open(file.path()).unwrap();
+        conn.pragma_update(None, "key", "correct").unwrap();
+        crate::db::downgrade_to_schema_two(&conn);
+        drop(conn);
+
+        let state = AgentState::from_database_path(file.path());
+
+        assert_eq!(
+            Err(UnlockError::MigrationNeeded),
+            state.unlock(password("correct"), ScopeHash::test(1)).await
+        );
+        assert!(!state.is_unlocked().await);
+        assert!(state.is_migration_needed().await);
     }
 
     #[tokio::test]

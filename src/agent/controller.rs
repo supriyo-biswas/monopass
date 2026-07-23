@@ -144,6 +144,7 @@ pub async fn unlock_direct(
         .map(|()| StatusCode::OK)
         .map_err(|error| match error {
             super::state::UnlockError::AccessDenied => ApiError::access_denied(),
+            super::state::UnlockError::MigrationNeeded => ApiError::migration_needed(),
             super::state::UnlockError::UnlockFailed => ApiError::unlock_failed(),
         })
 }
@@ -214,7 +215,12 @@ where
         .unlock_for_scope(password, scope_hash, access_scope)
         .await
         .map(|()| StatusCode::OK)
-        .map_err(|_| ApiError::access_denied())
+        .map_err(|error| match error {
+            super::state::UnlockError::MigrationNeeded => ApiError::migration_needed(),
+            super::state::UnlockError::AccessDenied | super::state::UnlockError::UnlockFailed => {
+                ApiError::access_denied()
+            }
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -1241,6 +1247,29 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(StatusCode::FORBIDDEN, error.status);
+    }
+
+    #[tokio::test]
+    async fn unlock_schema_two_database_returns_migration_needed() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        conn.pragma_update(None, "key", "correct").unwrap();
+        crate::db::downgrade_to_schema_two(&conn);
+        drop(conn);
+
+        let state = AgentState::from_database_path(file.path());
+        let error = super::unlock_direct(
+            axum::extract::State(state),
+            Some(axum::Extension(ScopeHash::test(1))),
+            Some(axum::Extension(DirectUnlockCaller::Agent)),
+            authorization_headers("correct"),
+            default_scope_query(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(StatusCode::BAD_GATEWAY, error.status);
     }
 
     #[tokio::test]

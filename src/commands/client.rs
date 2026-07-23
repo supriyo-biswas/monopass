@@ -576,7 +576,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        AccessScope, AuthMode, AuthUnlockMethodsResponse, Client, Response, unlock_method_api_path,
+        AccessScope, ApiError, AuthMode, AuthUnlockMethodsResponse, Client, Response,
+        unlock_method_api_path,
     };
     use crate::config::Config;
 
@@ -694,6 +695,59 @@ mod tests {
         let response = request_with_test_prompt(&config, AuthMode::ProcessOnly);
 
         assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn request_with_unlock_preserves_migration_needed_from_unlock() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer("correct")),
+                client_capabilities: None,
+                response: http_response(
+                    502,
+                    r#"{"error":{"code":"migration_needed","message":"database migration required; run `monopass migrate`"}}"#,
+                ),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        let error = Client::with_capabilities(&config, None)
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/dirs",
+                Zeroizing::new(Vec::new()),
+                None,
+                AuthMode::ProcessOnly,
+                || Ok(Zeroizing::new("correct".to_owned())),
+            )
+            .unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+
+        assert_eq!(502, error.status);
+        assert_eq!("migration_needed", error.code);
+        assert_eq!(
+            "database migration required; run `monopass migrate`",
+            error.message
+        );
         server.join();
     }
 

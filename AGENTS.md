@@ -38,6 +38,33 @@ blocking database work directly in Tokio request handlers.
 - Do not add tests that only verify CLI parser help text or argument parsing.
   Test behavior behind parsed arguments.
 
+## Linux GUI Builds And Tests
+
+Build and test GTK and Qt separately. Release artifacts disable the default
+`direct` feature and select exactly one GUI feature. On Ubuntu, install the
+build dependencies with either `sudo apt install libgtk-4-dev` for GTK or
+`sudo apt install qtbase5-dev qtdeclarative5-dev qt5-qmake` for Qt 5. Use the
+same feature selection as the release workflow:
+
+```sh
+cargo build --locked --release --no-default-features --features gtk
+cargo test --locked --no-default-features --features gtk
+
+QMAKE=qmake QT_SELECT=qt5 cargo build --locked --release --no-default-features --features qt
+QMAKE=qmake QT_SELECT=qt5 cargo test --locked --no-default-features --features qt
+```
+
+The ignored `gui_unlock_linux` integration tests drive real prompt windows and
+additionally require an X11 display and `xdotool`. They can run headlessly with
+`xvfb-run`; install `xvfb xdotool`, and for Qt runtime tests also install
+`qml-module-qtquick2 qml-module-qtquick-controls2 qml-module-qtquick-layouts
+qml-module-qtquick-window2`:
+
+```sh
+xvfb-run -a cargo test --locked --no-default-features --features gtk --test gui_unlock_linux -- --ignored --test-threads=1
+QMAKE=qmake QT_SELECT=qt5 xvfb-run -a cargo test --locked --no-default-features --features qt --test gui_unlock_linux -- --ignored --test-threads=1
+```
+
 ## Client And Agent Flow
 
 Client commands talk to the agent over the local Unix socket. On `403

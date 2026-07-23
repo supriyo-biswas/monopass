@@ -160,6 +160,12 @@ for GUI display. An executable with the same file identity as the running agent
 is always allowed. Every other caller's executable path is canonicalized and
 must match at least one glob in `user.trustedProgramPaths`.
 
+The agent does not perform breaking schema migrations. When the supplied
+password opens a database whose schema is behind a known breaking boundary,
+the database remains locked and unlock returns `502 migration_needed` with the
+message `database migration required; run \`monopass migrate\``. No
+database-backed operation is allowed until the offline migration completes.
+
 Missing ultimate-process identity or path metadata, canonicalization failures,
 malformed persisted patterns, and unmatched paths fail closed with
 `403 access_denied`. Password verification, database opening, trust evaluation,
@@ -168,6 +174,7 @@ and authorization commitment do not expose an intermediate authorized state.
 Failures:
 - `403 access_denied`
 - `403 unlock_failed`
+- `502 migration_needed`
 
 ### Lock
 
@@ -950,6 +957,7 @@ Codes:
 - `not_found` -> 404
 - `conflict` -> 409
 - `internal_error` -> 500
+- `migration_needed` -> 502
 
 ## Database Schema Requirements
 
@@ -1017,9 +1025,19 @@ CREATE TABLE items (
 CREATE TABLE item_versions (
     version_id INTEGER NOT NULL,
     item_id INTEGER NOT NULL REFERENCES items (id) ON DELETE CASCADE,
-    fields TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (item_id, version_id)
+) WITHOUT ROWID;
+
+CREATE TABLE item_version_fields (
+    item_id INTEGER NOT NULL,
+    version_id INTEGER NOT NULL,
+    field_name TEXT NOT NULL,
+    field_type TEXT NOT NULL CHECK (field_type IN ('string', 'file', 'totp')),
+    concealed INTEGER NOT NULL CHECK (concealed IN (0, 1)),
+    data TEXT NOT NULL,
+    PRIMARY KEY (item_id, version_id, field_name),
+    FOREIGN KEY (item_id, version_id) REFERENCES item_versions (item_id, version_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
 CREATE TABLE files (
@@ -1056,12 +1074,17 @@ CREATE TABLE jobs (
     error_message TEXT
 ) WITHOUT ROWID;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 ```
 
 The schema-v2 migration leaves the table schema unchanged and adds
 `DIR_DENY_OVERWRITE` to the reserved Trash directory bitmask while preserving
 all existing directory flags and setting values.
+
+Schema 3 is a breaking migration. It moves each entry from the schema-2
+`item_versions.fields` JSON object into one `item_version_fields` row and then
+removes the JSON column. The migration is transactional and is performed only
+by `monopass migrate`, never while the agent is running.
 
 Fresh databases store encrypted file blobs outside the SQLCipher database under
 `files/` in the app data directory. This is the app XDG data directory, except

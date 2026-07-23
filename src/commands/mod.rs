@@ -13,6 +13,7 @@ mod import;
 mod init;
 mod item;
 mod lock;
+mod migrate;
 mod models;
 mod passwd;
 mod password_policy;
@@ -47,6 +48,8 @@ pub enum Command {
     Agent,
     #[command(about = "Change the database master password")]
     Passwd,
+    #[command(about = "Migrate the database to the current schema")]
+    Migrate,
     #[command(about = "Clear cached process authorizations")]
     Lock,
     #[command(about = "Read a field or file reference")]
@@ -105,6 +108,7 @@ pub fn run(config: &Config, command: Command) -> AppResult {
         Command::Init(args) => init::run(config, args),
         Command::Agent => agent::run(config),
         Command::Passwd => passwd::run(config),
+        Command::Migrate => migrate::run(config),
         Command::Lock => lock::run(config),
         Command::Read(args) => read::run(config, args),
         Command::Run(args) => run::run(config, args),
