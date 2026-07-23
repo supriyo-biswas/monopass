@@ -3720,13 +3720,10 @@ impl DatabaseWorker {
             .map_err(|_| DbError::Internal)?
             .ok_or_else(|| reference_not_found(dir_name, item_name, field_name))?;
         let key = self.file_encryption_key()?;
-        let mut key_bytes = [0u8; FILE_KEY_BYTES];
-        key_bytes.copy_from_slice(&*key);
         let file_store_path = self.file_store_path.clone();
         let etag = file.sha256.clone();
         let (sender, receiver) = mpsc::channel(8);
         std::thread::spawn(move || {
-            let key = Zeroizing::new(key_bytes);
             stream_decrypt_stored_file(&file_store_path, &key, &file, sender);
         });
         Ok(ReferenceResponse {
@@ -4959,10 +4956,9 @@ fn create_private_blob_file(path: &Path) -> Result<fs::File, DbError> {
 }
 
 fn decode_file_key(key_hex: &str) -> Result<Zeroizing<[u8; FILE_KEY_BYTES]>, DbError> {
-    let key = Zeroizing::new(hex_decode_exact(key_hex, FILE_KEY_BYTES).ok_or(DbError::Internal)?);
-    let mut bytes = [0u8; FILE_KEY_BYTES];
-    bytes.copy_from_slice(&key);
-    Ok(Zeroizing::new(bytes))
+    let mut key = Zeroizing::new([0u8; FILE_KEY_BYTES]);
+    hex_decode_into_exact(key_hex, &mut *key).ok_or(DbError::Internal)?;
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -5194,14 +5190,19 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode_exact(value: &str, bytes: usize) -> Option<Vec<u8>> {
-    if value.len() != bytes * 2 {
+    let mut decoded = vec![0u8; bytes];
+    hex_decode_into_exact(value, &mut decoded)?;
+    Some(decoded)
+}
+
+fn hex_decode_into_exact(value: &str, decoded: &mut [u8]) -> Option<()> {
+    if value.len() != decoded.len() * 2 {
         return None;
     }
-    let mut decoded = Vec::with_capacity(bytes);
-    for pair in value.as_bytes().chunks_exact(2) {
-        decoded.push((hex_value(pair[0])? << 4) | hex_value(pair[1])?);
+    for (byte, pair) in decoded.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *byte = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
-    Some(decoded)
+    Some(())
 }
 
 fn hex_value(value: u8) -> Option<u8> {
@@ -9785,6 +9786,26 @@ mod tests {
             super::DbError::Internal,
             super::decrypt_chunk_record(&mut input, &key, &[0; 12], 0).unwrap_err()
         );
+    }
+
+    #[test]
+    fn file_key_decoding_requires_exact_hex() {
+        let key = super::decode_file_key(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap();
+        assert_eq!(*key, std::array::from_fn(|index| index as u8));
+
+        assert!(matches!(
+            super::decode_file_key("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d"),
+            Err(DbError::Internal)
+        ));
+        assert!(matches!(
+            super::decode_file_key(
+                "g00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            ),
+            Err(DbError::Internal)
+        ));
     }
 
     #[tokio::test]
