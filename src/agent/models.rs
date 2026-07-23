@@ -48,6 +48,34 @@ pub struct AuthUnlockMethod {
     pub accepts_master_password: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellCompletionKind {
+    Dir,
+    Item,
+    Field,
+    File,
+    Contact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCompletionEntry {
+    pub value: String,
+    pub kind: ShellCompletionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCompletionsResponse {
+    pub entries: Vec<ShellCompletionEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ShellCompletionsQuery {
+    pub prefix: String,
+    pub kinds: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobAcceptedResponse {
     #[serde(rename = "job_id")]

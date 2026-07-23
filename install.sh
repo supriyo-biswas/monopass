@@ -62,7 +62,29 @@ append_path_line() {
   fi
 }
 
-need_cmd curl/wget uname tar mktemp chmod mv mkdir grep dirname rm id
+append_completion_line() {
+  profile=$1
+  completion_line=$2
+
+  mkdir -p "$(dirname "$profile")"
+
+  if [ -f "$profile" ] && grep -F "$completion_line" "$profile" >/dev/null 2>&1; then
+    return
+  fi
+
+  if [ -f "$profile" ]; then
+    printf '\n%s\n' "$completion_line" >> "$profile"
+  else
+    printf '%s\n' "$completion_line" >> "$profile"
+  fi
+}
+
+shell_quote() {
+  escaped=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "$escaped"
+}
+
+need_cmd uname mktemp chmod mv mkdir grep dirname rm id sed cp
 
 platform="$(uname -sm | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
 selected_variant=cli
@@ -134,13 +156,31 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 archive_path="$tmp_dir/$artifact_name"
-download_url="$RELEASE_BASE_URL/$artifact_name"
+case "$RELEASE_BASE_URL" in
+  local/debug|local/release)
+    build_profile=${RELEASE_BASE_URL#local/}
+    script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+    local_binary="$script_dir/target/$build_profile/$BINARY_NAME"
 
-printf 'Selected %s variant for %s.\n' "$selected_variant" "$platform" >&2
-printf 'Downloading %s\n' "$download_url" >&2
-download "$download_url" "$archive_path" || die "failed to download $artifact_name"
+    [ -f "$local_binary" ] || die "local $build_profile binary not found: $local_binary"
 
-tar -xzf "$archive_path" -C "$tmp_dir" || die "failed to unpack $artifact_name"
+    printf 'Installing local %s build from %s\n' "$build_profile" "$local_binary" >&2
+    cp "$local_binary" "$tmp_dir/$BINARY_NAME" || die "failed to copy local $build_profile binary"
+    ;;
+  local/*)
+    die "invalid local build profile: ${RELEASE_BASE_URL#local/} (expected debug or release)"
+    ;;
+  *)
+    need_cmd curl/wget tar
+    download_url="$RELEASE_BASE_URL/$artifact_name"
+
+    printf 'Selected %s variant for %s.\n' "$selected_variant" "$platform" >&2
+    printf 'Downloading %s\n' "$download_url" >&2
+    download "$download_url" "$archive_path" || die "failed to download $artifact_name"
+
+    tar -xzf "$archive_path" -C "$tmp_dir" || die "failed to unpack $artifact_name"
+    ;;
+esac
 
 if [ ! -f "$tmp_dir/$BINARY_NAME" ]; then
   die "archive did not contain $BINARY_NAME"
@@ -165,6 +205,22 @@ esac
 for profile in $profiles; do
   append_path_line "$HOME/$profile"
 done
+
+completion_binary="$INSTALL_DIR/$BINARY_NAME"
+completion_binary_quoted="$(shell_quote "$completion_binary")"
+case "${SHELL:-}" in
+  */bash)
+    append_completion_line "$HOME/.bashrc" "source <(COMPLETE=bash $completion_binary_quoted)"
+    ;;
+  */zsh)
+    append_completion_line "$HOME/.zshrc" "source <(COMPLETE=zsh $completion_binary_quoted)"
+    ;;
+  */fish)
+    append_completion_line \
+      "$HOME/.config/fish/completions/monopass.fish" \
+      "COMPLETE=fish $completion_binary_quoted | source"
+    ;;
+esac
 
 restart_existing_agent() {
   case "$platform" in

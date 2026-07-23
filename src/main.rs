@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+use clap::CommandFactory;
 use clap::Parser;
 
 fn main() -> ExitCode {
@@ -13,6 +14,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> monopass::AppResult {
+    clap_complete::CompleteEnv::with_factory(monopass::commands::Cli::command)
+        .bin("monopass")
+        .complete();
     let cli = monopass::commands::Cli::parse();
     let config = monopass::config::Config::load()?;
     monopass::commands::run(&config, cli.command)

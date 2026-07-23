@@ -1,4 +1,5 @@
 use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::AppResult;
 use crate::config::Config;
@@ -17,7 +18,7 @@ pub struct MkdirArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct RmdirArgs {
-    #[arg(help = "Directory path")]
+    #[arg(add = ArgValueCompleter::new(super::completion::existing_dir), help = "Directory path")]
     dir: String,
 }
 
@@ -29,7 +30,7 @@ pub struct ListArgs {
         help = "Treat an item name literally instead of as a glob pattern"
     )]
     globoff: bool,
-    #[arg(help = "Optional directory or <dir>/<glob> path")]
+    #[arg(add = ArgValueCompleter::new(super::completion::dir_or_item), help = "Optional directory or <dir>/<glob> path")]
     path: Option<String>,
 }
 

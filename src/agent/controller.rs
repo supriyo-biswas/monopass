@@ -30,7 +30,8 @@ use super::models::{
     AccessScope, AuthScopeQuery, AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse,
     ContactResponse, CreateContactRequest, CreateFileResponse, CreateItemRequest,
     JobAcceptedResponse, JobResponse, JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse,
-    UpdateContactRequest, UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
+    ShellCompletionKind, ShellCompletionsQuery, ShellCompletionsResponse, UpdateContactRequest,
+    UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
 #[cfg(any(not(target_os = "macos"), test))]
 use super::process::DirectUnlockCaller;
@@ -51,6 +52,64 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 
 #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
 const CLIENT_CAPABILITIES_HEADER: &str = "x-client-capabilities";
+
+pub async fn shell_completions(
+    Extension(database): Extension<DbHandle>,
+    query: Result<Query<ShellCompletionsQuery>, QueryRejection>,
+) -> Result<Json<ShellCompletionsResponse>, ApiError> {
+    let Query(query) = query.map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let kinds = parse_completion_kinds(&query.kinds)?;
+    validate_completion_prefix(&query.prefix, &kinds)?;
+    database
+        .shell_completions(query.prefix, kinds)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+fn parse_completion_kinds(
+    value: &str,
+) -> Result<std::collections::HashSet<ShellCompletionKind>, ApiError> {
+    let mut kinds = std::collections::HashSet::new();
+    if value.is_empty() {
+        return Err(ApiError::bad_request("kinds must not be empty"));
+    }
+    for value in value.split(',') {
+        let kind = match value {
+            "dir" => ShellCompletionKind::Dir,
+            "item" => ShellCompletionKind::Item,
+            "field" => ShellCompletionKind::Field,
+            "file" => ShellCompletionKind::File,
+            "contact" => ShellCompletionKind::Contact,
+            _ => return Err(ApiError::bad_request("unsupported completion kind")),
+        };
+        if !kinds.insert(kind) {
+            return Err(ApiError::bad_request(
+                "completion kinds must not contain duplicates",
+            ));
+        }
+    }
+    Ok(kinds)
+}
+
+fn validate_completion_prefix(
+    prefix: &str,
+    kinds: &std::collections::HashSet<ShellCompletionKind>,
+) -> Result<(), ApiError> {
+    if kinds.len() == 1 && kinds.contains(&ShellCompletionKind::Contact) {
+        return Ok(());
+    }
+    let parts = prefix.split('/').collect::<Vec<_>>();
+    if parts.len() > 3
+        || parts
+            .iter()
+            .take(parts.len().saturating_sub(1))
+            .any(|part| part.is_empty())
+    {
+        return Err(ApiError::bad_request("invalid completion path prefix"));
+    }
+    Ok(())
+}
 
 pub async fn unlock_methods(
     headers: HeaderMap,
@@ -1025,8 +1084,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        bearer_password, export_item, import_item, lock, send_upload_body_bytes, status,
-        unlock_methods,
+        bearer_password, export_item, import_item, lock, parse_completion_kinds,
+        send_upload_body_bytes, status, unlock_methods, validate_completion_prefix,
     };
     #[cfg(any(
         target_os = "macos",
@@ -1034,7 +1093,7 @@ mod tests {
     ))]
     use crate::agent::gui_auth::PromptOutcome;
     use crate::agent::models::{
-        AccessScope, AuthScopeQuery, CreateContactRequest, CreateItemRequest,
+        AccessScope, AuthScopeQuery, CreateContactRequest, CreateItemRequest, ShellCompletionKind,
     };
     #[cfg(any(
         target_os = "macos",
@@ -1052,6 +1111,25 @@ mod tests {
         scope: AccessScope,
     ) -> Result<axum::extract::Query<AuthScopeQuery>, QueryRejection> {
         Ok(axum::extract::Query(AuthScopeQuery { scope: Some(scope) }))
+    }
+
+    #[test]
+    fn shell_completion_query_validation_is_strict_and_contact_prefixes_are_opaque() {
+        let kinds = parse_completion_kinds("dir,item,field,file,contact").unwrap();
+        assert_eq!(5, kinds.len());
+        assert!(parse_completion_kinds("").is_err());
+        assert!(parse_completion_kinds("dir,dir").is_err());
+        assert!(parse_completion_kinds("dir,unknown").is_err());
+
+        assert!(validate_completion_prefix("", &kinds).is_ok());
+        assert!(validate_completion_prefix("Personal/", &kinds).is_ok());
+        assert!(validate_completion_prefix("Personal/GitHub/", &kinds).is_ok());
+        assert!(validate_completion_prefix("/Personal", &kinds).is_err());
+        assert!(validate_completion_prefix("Personal//pass", &kinds).is_err());
+        assert!(validate_completion_prefix("Personal/GitHub/pass/more", &kinds).is_err());
+
+        let contact = std::collections::HashSet::from([ShellCompletionKind::Contact]);
+        assert!(validate_completion_prefix("opaque//contact/value", &contact).is_ok());
     }
 
     #[tokio::test]

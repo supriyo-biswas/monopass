@@ -80,6 +80,46 @@ directory, item, field, and file names when inserting them into API routes.
 Paginated commands request pages with `count=200` and follow `next_marker` until
 it is null.
 
+## Shell completion
+
+The binary uses Clap dynamic completion for subcommands, flags, and static
+values. Database-backed argument completers call
+`GET /api/v1/shell/completions` with only the kinds meaningful at the current
+position:
+
+| Position | Requested kinds |
+| --- | --- |
+| `show`, `edit`, `ls-versions`, or `restore` first component | `dir,item` |
+| Those commands after the first slash | `item` |
+| `read` first component | `dir,item` |
+| `read` second component | `item,field,file` |
+| `read` third component | `field,file` |
+| Existing contact arguments | `contact` |
+| New item target | `dir` |
+| `rm`, `ls`, `cp`, or `mv` path positions | valid directory/item union |
+| Ambiguous variadic `share` positions | `dir,item,contact` |
+
+The helper adds `/` only when the returned value is a continuation and is not
+valid as a terminal value in that command position. A typed `pass://` or
+`op://` prefix is stripped for the API request and reattached to every rendered
+candidate. Empty or malformed responses, agent connection failures,
+authorization denials, unlock dismissal or lockout, and retry failures produce
+no dynamic candidates and no diagnostics.
+
+Already-authorized completion requests return normally. If method discovery
+selects an unlock method that accepts a master password, completion stops
+silently instead of displaying a terminal prompt. A GUI unlock method may show
+the normal unlock window; after it succeeds, the helper retries the completion
+request once.
+
+`install.sh` enables the dynamic Bash, Zsh, or Fish adapter for the user's
+current shell. Startup hooks regenerate the adapter from the installed binary
+on each shell start, use the actual `INSTALL_DIR` path, and are appended
+idempotently. For development installs, setting `RELEASE_BASE_URL` to
+`local/debug` or `local/release` copies the corresponding
+`target/{debug,release}/monopass` binary next to the installer instead of
+downloading and unpacking a release archive.
+
 # Commands
 
 ## agent command

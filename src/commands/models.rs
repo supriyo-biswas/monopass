@@ -2,6 +2,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::secret::SecretString;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellCompletionKind {
+    Dir,
+    Item,
+    Field,
+    File,
+    Contact,
+}
+
+impl ShellCompletionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dir => "dir",
+            Self::Item => "item",
+            Self::Field => "field",
+            Self::File => "file",
+            Self::Contact => "contact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCompletionEntry {
+    pub value: String,
+    pub kind: ShellCompletionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCompletionsResponse {
+    pub entries: Vec<ShellCompletionEntry>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirResponse {
     pub name: String,

@@ -4,6 +4,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -15,7 +16,7 @@ use super::path::parse_reference_path;
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct Args {
-    #[arg(help = "Reference path in <dir>/<item>/<fieldOrFile> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::reference), help = "Reference path in <dir>/<item>/<fieldOrFile> form")]
     reference: String,
     #[arg(
         short,

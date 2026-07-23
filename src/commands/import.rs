@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 use zeroize::Zeroizing;
 
 use crate::AppResult;
@@ -15,7 +16,7 @@ use super::path::parse_item_path;
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct Args {
-    #[arg(help = "Item path in <dir>/<item> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::new_item), help = "Item path in <dir>/<item> form")]
     path: String,
     #[arg(help = "Encrypted export file")]
     file: PathBuf,

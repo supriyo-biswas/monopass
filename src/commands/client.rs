@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+use super::models::{ShellCompletionKind, ShellCompletionsResponse};
 use crate::AppResult;
 use crate::config::Config;
 
@@ -121,6 +122,35 @@ impl<'a> Client<'a> {
             AuthMode::ProcessOnly,
         )?;
         Ok(serde_json::from_slice(&response.body)?)
+    }
+
+    pub fn shell_completions(
+        &self,
+        prefix: &str,
+        kinds: &[ShellCompletionKind],
+    ) -> Option<ShellCompletionsResponse> {
+        let kinds = kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let path = format!(
+            "/api/v1/shell/completions?prefix={}&kinds={}",
+            query_value(prefix),
+            query_value(&kinds)
+        );
+        let mut response = self.request("GET", &path, &[], None, None).ok()?;
+        if is_access_denied(&response) {
+            let method = self.first_unlock_method(AccessScope::Items).ok()?;
+            if method.accepts_master_password || self.unlock(&method, None).is_err() {
+                return None;
+            }
+            response = self.request("GET", &path, &[], None, None).ok()?;
+        }
+        if !(200..300).contains(&response.status) {
+            return None;
+        }
+        serde_json::from_slice(&response.body).ok()
     }
 
     pub fn get_json_with_password<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
@@ -579,6 +609,7 @@ mod tests {
         AccessScope, ApiError, AuthMode, AuthUnlockMethodsResponse, Client, Response,
         unlock_method_api_path,
     };
+    use crate::commands::models::ShellCompletionKind;
     use crate::config::Config;
 
     #[test]
@@ -901,6 +932,122 @@ mod tests {
             .unwrap();
 
         assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn shell_completions_return_authorized_candidates() {
+        let server = TestServer::new(vec![ExpectedRequest {
+            method: "GET",
+            path: "/api/v1/shell/completions?prefix=Per&kinds=dir%2Citem",
+            authorization: None,
+            client_capabilities: None,
+            response: ok_json_response(
+                r#"{"entries":[{"value":"Personal","kind":"dir"}],"truncated":false}"#,
+            ),
+        }]);
+        let config = test_config(server.listen_path());
+
+        let response = Client::with_capabilities(&config, None)
+            .shell_completions(
+                "Per",
+                &[ShellCompletionKind::Dir, ShellCompletionKind::Item],
+            )
+            .unwrap();
+        assert_eq!("Personal", response.entries[0].value);
+        server.join();
+    }
+
+    #[test]
+    fn shell_completions_quietly_refuse_direct_password_unlock() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+                ),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        assert!(
+            Client::with_capabilities(&config, None)
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_none()
+        );
+        server.join();
+    }
+
+    #[test]
+    fn shell_completions_allow_one_gui_unlock_and_retry() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: Some("x-session=:1".to_owned()),
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/gui","accepts_master_password":false}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/gui",
+                authorization: None,
+                client_capabilities: Some("x-session=:1".to_owned()),
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(r#"{"entries":[],"truncated":false}"#),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        assert!(
+            Client::with_capabilities(&config, Some("x-session=:1".to_owned()))
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_some()
+        );
+        server.join();
+    }
+
+    #[test]
+    fn shell_completions_silently_drop_malformed_responses() {
+        let server = TestServer::new(vec![ExpectedRequest {
+            method: "GET",
+            path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+            authorization: None,
+            client_capabilities: None,
+            response: ok_json_response(""),
+        }]);
+        let config = test_config(server.listen_path());
+
+        assert!(
+            Client::with_capabilities(&config, None)
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_none()
+        );
         server.join();
     }
 

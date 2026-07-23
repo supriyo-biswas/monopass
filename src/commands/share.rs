@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::AppResult;
 use crate::config::Config;
@@ -25,13 +26,14 @@ pub struct Args {
     )]
     globoff: bool,
     #[arg(
+        add = ArgValueCompleter::new(super::completion::share),
         value_name = "ITEM",
         required = true,
         num_args = 1..,
         help = "Source item, glob, or directory path"
     )]
     items: Vec<String>,
-    #[arg(value_name = "CONTACT", help = "Contact email address")]
+    #[arg(add = ArgValueCompleter::new(super::completion::share), value_name = "CONTACT", help = "Contact email address")]
     contact: String,
     #[arg(
         short,

@@ -27,8 +27,9 @@ use super::models::{
     AccessScope, ContactResponse, CreateContactRequest, CreateField, CreateItemRequest,
     DirResponse, Field, FieldEntry, FieldType, FileInput, FileMetadata, FileMetadataEntry,
     ItemResponse, ItemSummaryResponse, ItemVersionSummaryResponse, JobErrorResponse, JobResponse,
-    JobStatus, JobTarget, JobType, ListDirection, PaginatedResponse, UpdateContactRequest,
-    UpdateDirRequest, UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
+    JobStatus, JobTarget, JobType, ListDirection, PaginatedResponse, ShellCompletionEntry,
+    ShellCompletionKind, ShellCompletionsResponse, UpdateContactRequest, UpdateDirRequest,
+    UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
 };
 #[cfg(any(not(target_os = "macos"), test))]
 use super::process::DirectUnlockCaller;
@@ -991,6 +992,19 @@ impl DbHandle {
             .await
     }
 
+    pub async fn shell_completions(
+        &self,
+        prefix: String,
+        kinds: HashSet<ShellCompletionKind>,
+    ) -> Result<ShellCompletionsResponse, DbError> {
+        self.request_reader(|reply| DbCommand::ShellCompletions {
+            prefix,
+            kinds,
+            reply,
+        })
+        .await
+    }
+
     pub async fn create_contact(
         &self,
         email: String,
@@ -1799,6 +1813,11 @@ impl PageMarkerScope {
 }
 
 enum DbCommand {
+    ShellCompletions {
+        prefix: String,
+        kinds: HashSet<ShellCompletionKind>,
+        reply: oneshot::Sender<Result<ShellCompletionsResponse, DbError>>,
+    },
     CreateDir {
         name: String,
         reply: oneshot::Sender<Result<(), DbError>>,
@@ -2036,6 +2055,13 @@ impl DatabaseWorker {
 
     fn handle(&mut self, command: DbCommand) {
         match command {
+            DbCommand::ShellCompletions {
+                prefix,
+                kinds,
+                reply,
+            } => {
+                let _ = reply.send(self.shell_completions(&prefix, &kinds));
+            }
             DbCommand::CreateDir { name, reply } => {
                 let _ = reply.send(self.create_dir(&name));
             }
@@ -2375,6 +2401,237 @@ impl DatabaseWorker {
                 let _ = reply.send(self.test_oldest_version_is_earliest(&dir_name, &item_name));
             }
         }
+    }
+
+    fn shell_completions(
+        &self,
+        prefix: &str,
+        kinds: &HashSet<ShellCompletionKind>,
+    ) -> Result<ShellCompletionsResponse, DbError> {
+        const QUERY_LIMIT: i64 = 201;
+
+        let mut ranked = Vec::<(u8, ShellCompletionEntry)>::new();
+        let mut push = |rank, value: String, kind| {
+            ranked.push((rank, ShellCompletionEntry { value, kind }));
+        };
+
+        if kinds.contains(&ShellCompletionKind::Contact) {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT email FROM contacts \
+                     WHERE substr(email, 1, length(?1)) = ?1 \
+                     ORDER BY email LIMIT ?2",
+                )
+                .map_err(|_| DbError::Internal)?;
+            let rows = statement
+                .query_map((prefix, QUERY_LIMIT), |row| row.get::<_, String>(0))
+                .map_err(|_| DbError::Internal)?;
+            for value in rows {
+                let value = value.map_err(|_| DbError::Internal)?;
+                push(
+                    if value == prefix { 0 } else { 2 },
+                    value,
+                    ShellCompletionKind::Contact,
+                );
+            }
+        }
+
+        let parts = prefix.split('/').collect::<Vec<_>>();
+        match parts.as_slice() {
+            [dir_prefix] => {
+                if kinds.contains(&ShellCompletionKind::Dir) {
+                    let mut statement = self
+                        .connection
+                        .prepare(
+                            "SELECT name FROM dirs \
+                             WHERE (bitmask & ?1) = 0 \
+                               AND substr(name, 1, length(?2)) = ?2 \
+                             ORDER BY name LIMIT ?3",
+                        )
+                        .map_err(|_| DbError::Internal)?;
+                    let rows = statement
+                        .query_map((DIR_HIDDEN, dir_prefix, QUERY_LIMIT), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|_| DbError::Internal)?;
+                    for value in rows {
+                        let value = value.map_err(|_| DbError::Internal)?;
+                        push(
+                            if value == *dir_prefix { 0 } else { 2 },
+                            value,
+                            ShellCompletionKind::Dir,
+                        );
+                    }
+                }
+
+                if kinds.contains(&ShellCompletionKind::Item)
+                    && let Some(dir_id) = public_dir_id_in(&self.connection, dir_prefix)?
+                {
+                    let mut statement = self
+                        .connection
+                        .prepare(
+                            "SELECT name FROM items \
+                             WHERE dir_id = ?1 AND (bitmask & ?2) = 0 \
+                             ORDER BY name LIMIT ?3",
+                        )
+                        .map_err(|_| DbError::Internal)?;
+                    let rows = statement
+                        .query_map((dir_id, ITEM_HIDDEN, QUERY_LIMIT), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|_| DbError::Internal)?;
+                    for item_name in rows {
+                        push(
+                            1,
+                            format!("{dir_prefix}/{}", item_name.map_err(|_| DbError::Internal)?),
+                            ShellCompletionKind::Item,
+                        );
+                    }
+                }
+            }
+            [dir_name, item_prefix] => {
+                let Some(dir_id) = public_dir_id_in(&self.connection, dir_name)? else {
+                    let (entries, truncated) = finish_shell_completions(ranked);
+                    return Ok(ShellCompletionsResponse { entries, truncated });
+                };
+
+                if kinds.contains(&ShellCompletionKind::Item) {
+                    let mut statement = self
+                        .connection
+                        .prepare(
+                            "SELECT name FROM items \
+                             WHERE dir_id = ?1 AND (bitmask & ?2) = 0 \
+                               AND substr(name, 1, length(?3)) = ?3 \
+                             ORDER BY name LIMIT ?4",
+                        )
+                        .map_err(|_| DbError::Internal)?;
+                    let rows = statement
+                        .query_map((dir_id, ITEM_HIDDEN, item_prefix, QUERY_LIMIT), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|_| DbError::Internal)?;
+                    for item_name in rows {
+                        let item_name = item_name.map_err(|_| DbError::Internal)?;
+                        push(
+                            if item_name == *item_prefix { 0 } else { 2 },
+                            format!("{dir_name}/{item_name}"),
+                            ShellCompletionKind::Item,
+                        );
+                    }
+                }
+
+                if (kinds.contains(&ShellCompletionKind::Field)
+                    || kinds.contains(&ShellCompletionKind::File))
+                    && let Some(item_id) = public_item_id_in(&self.connection, dir_id, item_prefix)?
+                {
+                    self.push_reference_completions(
+                        &mut push,
+                        dir_name,
+                        item_prefix,
+                        item_id,
+                        "",
+                        1,
+                        kinds,
+                    )?;
+                }
+            }
+            [dir_name, item_name, reference_prefix] => {
+                if let Some(dir_id) = public_dir_id_in(&self.connection, dir_name)?
+                    && let Some(item_id) = public_item_id_in(&self.connection, dir_id, item_name)?
+                {
+                    self.push_reference_completions(
+                        &mut push,
+                        dir_name,
+                        item_name,
+                        item_id,
+                        reference_prefix,
+                        2,
+                        kinds,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+
+        let (entries, truncated) = finish_shell_completions(ranked);
+        Ok(ShellCompletionsResponse { entries, truncated })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_reference_completions(
+        &self,
+        push: &mut impl FnMut(u8, String, ShellCompletionKind),
+        dir_name: &str,
+        item_name: &str,
+        item_id: i64,
+        prefix: &str,
+        child_rank: u8,
+        kinds: &HashSet<ShellCompletionKind>,
+    ) -> Result<(), DbError> {
+        const QUERY_LIMIT: i64 = 201;
+        let rank = |name: &str| {
+            if child_rank == 1 {
+                1
+            } else if name == prefix {
+                0
+            } else {
+                2
+            }
+        };
+
+        if kinds.contains(&ShellCompletionKind::Field) {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT field_name FROM item_version_fields \
+                     WHERE item_id = ?1 \
+                       AND version_id = (SELECT latest_version_id FROM items WHERE id = ?1) \
+                       AND substr(field_name, 1, length(?2)) = ?2 \
+                     ORDER BY field_name LIMIT ?3",
+                )
+                .map_err(|_| DbError::Internal)?;
+            let rows = statement
+                .query_map((item_id, prefix, QUERY_LIMIT), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|_| DbError::Internal)?;
+            for name in rows {
+                let name = name.map_err(|_| DbError::Internal)?;
+                push(
+                    rank(&name),
+                    format!("{dir_name}/{item_name}/{name}"),
+                    ShellCompletionKind::Field,
+                );
+            }
+        }
+
+        if kinds.contains(&ShellCompletionKind::File) {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT file_name FROM item_version_file_mapping \
+                     WHERE item_id = ?1 \
+                       AND version_id = (SELECT latest_version_id FROM items WHERE id = ?1) \
+                       AND substr(file_name, 1, length(?2)) = ?2 \
+                     ORDER BY file_name LIMIT ?3",
+                )
+                .map_err(|_| DbError::Internal)?;
+            let rows = statement
+                .query_map((item_id, prefix, QUERY_LIMIT), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|_| DbError::Internal)?;
+            for name in rows {
+                let name = name.map_err(|_| DbError::Internal)?;
+                push(
+                    rank(&name),
+                    format!("{dir_name}/{item_name}/{name}"),
+                    ShellCompletionKind::File,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn create_dir(&self, name: &str) -> Result<(), DbError> {
@@ -3897,6 +4154,24 @@ fn item_marker_scope(dir_id: i64, glob: Option<&str>, direction: ListDirection) 
         Some(hasher.finalize().into())
     };
     PageMarkerScope::Items { dir_id, query_hash }
+}
+
+fn finish_shell_completions(
+    mut ranked: Vec<(u8, ShellCompletionEntry)>,
+) -> (Vec<ShellCompletionEntry>, bool) {
+    ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left.value.cmp(&right.value))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    ranked.dedup_by(|(_, left), (_, right)| left == right);
+    let truncated = ranked.len() > 200;
+    ranked.truncate(200);
+    (
+        ranked.into_iter().map(|(_, entry)| entry).collect(),
+        truncated,
+    )
 }
 
 fn bitmask_has(bitmask: i64, flag: i64) -> bool {
@@ -5452,6 +5727,7 @@ fn sqlite_error_code(error: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -5465,7 +5741,8 @@ mod tests {
         AccessScope, AgentState, AuthCache, CreateContactRequest, CreateItemRequest,
         DATABASE_READER_WORKERS, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
         ListDirection, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
-        PRIVATE_FILE_MODE, PageRequest, UnlockError, UpdateContactRequest, UpdateItemRequest,
+        PRIVATE_FILE_MODE, PageRequest, ShellCompletionKind, UnlockError, UpdateContactRequest,
+        UpdateItemRequest,
     };
     use crate::agent::process::{DirectUnlockCaller, ScopeHash};
 
@@ -5520,6 +5797,233 @@ mod tests {
             })
             .collect();
         *entries = serde_json::Value::Array(named);
+    }
+
+    #[tokio::test]
+    async fn shell_completions_expand_the_public_prefix_tree_without_secret_data() {
+        let database = DbHandle::test();
+        for dir in ["Personal", "Personal2", "hidden"] {
+            database.create_dir(dir.to_owned()).await.unwrap();
+        }
+        let old_file = database
+            .create_file(b"old file secret".to_vec())
+            .await
+            .unwrap();
+        let new_file = database
+            .create_file(b"new file secret".to_vec())
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "Personal".to_owned(),
+                "GitHub".to_owned(),
+                item_request(serde_json::json!({
+                    "fields": {
+                        "old": {"type": "string", "data": "old field secret"},
+                        "password": {"type": "string", "concealed": true, "data": "SUPERSECRET"}
+                    },
+                    "files": {"old-notes": {"id": old_file}}
+                }))
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .update_item(
+                "Personal".to_owned(),
+                "GitHub".to_owned(),
+                item_request(serde_json::json!({
+                    "fields": {
+                        "old": {"remove": true},
+                        "username": {"type": "string", "data": "octocat"}
+                    },
+                    "files": {
+                        "old-notes": {"remove": true},
+                        "notes": {"id": new_file}
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "Personal".to_owned(),
+                "GitLab".to_owned(),
+                item_request(serde_json::json!({})).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .create_item(
+                "Personal".to_owned(),
+                "HiddenItem".to_owned(),
+                item_request(serde_json::json!({})).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        database
+            .test_set_item_bitmask("Personal", "HiddenItem", super::ITEM_HIDDEN)
+            .await
+            .unwrap();
+        database
+            .test_set_dir_bitmask("hidden", super::DIR_HIDDEN)
+            .await
+            .unwrap();
+        database
+            .create_contact(
+                "Personal@example.com".to_owned(),
+                CreateContactRequest {
+                    name: None,
+                    age_public_key: age::x25519::Identity::generate().to_public().to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let broad = database
+            .shell_completions(
+                "Per".to_owned(),
+                HashSet::from([
+                    ShellCompletionKind::Dir,
+                    ShellCompletionKind::Item,
+                    ShellCompletionKind::Contact,
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["Personal", "Personal2", "Personal@example.com"],
+            broad
+                .entries
+                .iter()
+                .map(|entry| entry.value.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let response = database
+            .shell_completions(
+                "Personal".to_owned(),
+                HashSet::from([
+                    ShellCompletionKind::Dir,
+                    ShellCompletionKind::Item,
+                    ShellCompletionKind::Contact,
+                ]),
+            )
+            .await
+            .unwrap();
+        let values = response
+            .entries
+            .iter()
+            .map(|entry| (entry.value.as_str(), entry.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![
+                ("Personal", ShellCompletionKind::Dir),
+                ("Personal/GitHub", ShellCompletionKind::Item),
+                ("Personal/GitLab", ShellCompletionKind::Item),
+                ("Personal2", ShellCompletionKind::Dir),
+                ("Personal@example.com", ShellCompletionKind::Contact),
+            ],
+            values
+        );
+        assert!(!response.truncated);
+
+        let items = database
+            .shell_completions(
+                "Personal/Git".to_owned(),
+                HashSet::from([ShellCompletionKind::Item]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["Personal/GitHub", "Personal/GitLab"],
+            items
+                .entries
+                .iter()
+                .map(|entry| entry.value.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let response = database
+            .shell_completions(
+                "Personal/GitHub".to_owned(),
+                HashSet::from([
+                    ShellCompletionKind::Item,
+                    ShellCompletionKind::Field,
+                    ShellCompletionKind::File,
+                ]),
+            )
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            vec![
+                ("Personal/GitHub", ShellCompletionKind::Item),
+                ("Personal/GitHub/notes", ShellCompletionKind::File),
+                ("Personal/GitHub/password", ShellCompletionKind::Field),
+                ("Personal/GitHub/username", ShellCompletionKind::Field),
+            ],
+            response
+                .entries
+                .iter()
+                .map(|entry| (entry.value.as_str(), entry.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(!json.contains("SUPERSECRET"));
+        assert!(!json.contains("old field secret"));
+        assert!(!json.contains("old-notes"));
+
+        let fields_only = database
+            .shell_completions(
+                "Personal/GitHub/pa".to_owned(),
+                HashSet::from([ShellCompletionKind::Field]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(1, fields_only.entries.len());
+        assert_eq!("Personal/GitHub/password", fields_only.entries[0].value);
+
+        let lowercase = database
+            .shell_completions(
+                "personal".to_owned(),
+                HashSet::from([ShellCompletionKind::Dir]),
+            )
+            .await
+            .unwrap();
+        assert!(lowercase.entries.is_empty());
+
+        let hidden = database
+            .shell_completions(
+                "h".to_owned(),
+                HashSet::from([ShellCompletionKind::Dir, ShellCompletionKind::Item]),
+            )
+            .await
+            .unwrap();
+        assert!(hidden.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_completions_are_limited_and_report_truncation() {
+        let database = DbHandle::test();
+        for index in 0..205 {
+            database
+                .create_dir(format!("dir-{index:03}"))
+                .await
+                .unwrap();
+        }
+        let response = database
+            .shell_completions("dir-".to_owned(), HashSet::from([ShellCompletionKind::Dir]))
+            .await
+            .unwrap();
+        assert_eq!(200, response.entries.len());
+        assert!(response.truncated);
+        assert_eq!("dir-000", response.entries[0].value);
+        assert_eq!("dir-199", response.entries[199].value);
     }
 
     fn legacy_overlap_database() -> (TempDir, DbHandle) {

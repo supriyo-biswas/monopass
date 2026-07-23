@@ -9,6 +9,54 @@ Unauthorized or locked access returns `403 access_denied`.
 
 Timestamps are stored as Unix seconds and returned as RFC3339 UTC strings.
 
+## Shell completions
+
+```http
+GET /api/v1/shell/completions?prefix={value}&kinds={comma-separated-kinds}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+```
+
+`kinds` is a nonempty, duplicate-free set drawn from `dir`, `item`, `field`,
+`file`, and `contact`. Unsupported, empty, or duplicate kinds return `400
+bad_request`. Path prefixes are case-sensitive, contain at most three
+components, and may not contain an empty interior component. A final empty
+component is allowed while completing beneath a directory or item. When only
+`contact` is requested, `prefix` is an opaque string and is not path-validated.
+
+The response contains canonical values without `pass://`, `op://`, or
+synthetic trailing slashes:
+
+```json
+{
+  "entries": [
+    { "value": "Personal/GitHub", "kind": "item" },
+    { "value": "Personal/GitHub/password", "kind": "field" }
+  ],
+  "truncated": false
+}
+```
+
+Matching follows the directory/item/reference tree. A partial first component
+matches directories; an exact directory additionally expands to its immediate
+items when `item` was requested. A partial second component matches items in
+the named public directory; an exact item additionally expands to its
+immediate latest-version fields and files when those kinds were requested. A
+partial third component matches latest-version references. Contacts match the
+entire opaque prefix independently. Results rank an exact requested value
+first, immediate children of an exact parent second, and all other prefix
+matches last; each rank is sorted lexically by value and kind.
+
+At most 200 entries are returned. `truncated` is `true` when more matches exist.
+Only non-hidden directories and items participate. Item names come from
+`items`; reference names come from the latest version's
+`item_version_fields.field_name` and `item_version_file_mapping.file_name`.
+The query never reads field data, file contents, or other secret values.
+
+This is a normal `items` database route: process-lineage authorization and idle
+access accounting are identical to other database-backed operations.
+
 ## Auth
 
 The agent derives an authorization scope from the Unix peer credentials and the

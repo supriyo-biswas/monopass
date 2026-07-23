@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PASSWORD: &str = "MonopassTestPassword1!";
-const WINDOW_TITLE: &str = "monopass access requested";
+const WINDOW_TITLE: &str = "monopass items access requested";
 
 #[test]
 #[ignore = "requires an X11 DISPLAY and xdotool"]
@@ -519,9 +519,17 @@ fn submit_prompt(password: &str, action: PromptAction) {
             }
         }
         PromptAction::Deny => {
-            run_xdotool(&["windowfocus", "--sync", &window]);
-            run_xdotool(&["key", "Tab"]);
-            run_xdotool(&["key", "Return"]);
+            #[cfg(feature = "gtk")]
+            {
+                run_xdotool(&["windowfocus", "--sync", &window]);
+                run_xdotool(&["key", "Tab"]);
+                run_xdotool(&["key", "Return"]);
+            }
+            #[cfg(feature = "qt")]
+            {
+                run_xdotool(&["mousemove", "--window", &window, "330", "165"]);
+                run_xdotool(&["click", "--window", &window, "1"]);
+            }
         }
     }
 }

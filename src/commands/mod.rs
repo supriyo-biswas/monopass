@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod agent;
 mod client;
+mod completion;
 mod contact;
 #[cfg(debug_assertions)]
 mod dbg;

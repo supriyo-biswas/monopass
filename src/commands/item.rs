@@ -4,6 +4,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, ValueEnum};
+use clap_complete::engine::ArgValueCompleter;
 use zeroize::Zeroizing;
 
 use crate::AppResult;
@@ -21,7 +22,7 @@ use super::path::{ItemPath, parse_dir_or_item_path, parse_item_path};
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct AddArgs {
-    #[arg(help = "Item path in <dir>/<item> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::new_item), help = "Item path in <dir>/<item> form")]
     path: String,
     #[arg(long, help = "Add or update the username field")]
     username: Option<String>,
@@ -59,7 +60,7 @@ pub struct AddArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct EditArgs {
-    #[arg(help = "Item path in <dir>/<item> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::existing_item), help = "Item path in <dir>/<item> form")]
     path: String,
     #[arg(long, help = "Add or update the username field")]
     username: Option<String>,
@@ -111,7 +112,7 @@ pub struct EditArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct RemoveArgs {
-    #[arg(help = "Directory or item path in <dir>[/<item>] form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::dir_or_item), help = "Directory or item path in <dir>[/<item>] form")]
     path: String,
     #[arg(
         short = 'g',
@@ -135,13 +136,13 @@ pub struct RemoveArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct ListVersionsArgs {
-    #[arg(help = "Item path in <dir>/<item> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::existing_item), help = "Item path in <dir>/<item> form")]
     path: String,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct RestoreArgs {
-    #[arg(help = "Item path in <dir>/<item> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::existing_item), help = "Item path in <dir>/<item> form")]
     path: String,
     #[arg(help = "Version number to restore")]
     version: i64,
@@ -149,7 +150,7 @@ pub struct RestoreArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct ShowArgs {
-    #[arg(help = "Item path in <dir>/<item> form")]
+    #[arg(add = ArgValueCompleter::new(super::completion::existing_item), help = "Item path in <dir>/<item> form")]
     path: String,
     #[arg(long, help = "Reveal secret fields and file metadata")]
     reveal: bool,

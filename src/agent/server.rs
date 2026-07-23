@@ -61,6 +61,10 @@ fn auth_routes() -> Router<AgentState> {
 
 fn database_routes(state: AgentState) -> Router<AgentState> {
     Router::new()
+        .route(
+            "/api/v1/shell/completions",
+            get(controller::shell_completions),
+        )
         .route("/api/v1/dirs", get(controller::list_dirs))
         .route("/api/v1/contacts", get(controller::list_contacts))
         .route(
@@ -208,6 +212,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(StatusCode::OK, response.status());
+    }
+
+    #[tokio::test]
+    async fn shell_completion_route_uses_database_authorization_and_validates_queries() {
+        let state = AgentState::from_database_path("missing.db");
+        state.store_database_handle(DbHandle::test()).await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
+        let router = super::database_routes(state.clone()).with_state(state);
+
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
+                "/api/v1/shell/completions?prefix=&kinds=dir",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/shell/completions?prefix=Personal%2F%2Fitem&kinds=item,item",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::AppResult;
 use crate::config::Config;
@@ -20,7 +21,7 @@ pub struct AddArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct EditArgs {
-    #[arg(help = "Existing contact email address")]
+    #[arg(add = ArgValueCompleter::new(super::completion::contact), help = "Existing contact email address")]
     email: String,
     #[arg(long = "email", help = "Change the contact email address")]
     new_email: Option<String>,
@@ -32,7 +33,7 @@ pub struct EditArgs {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct RemoveArgs {
-    #[arg(help = "Contact email address")]
+    #[arg(add = ArgValueCompleter::new(super::completion::contact), help = "Contact email address")]
     email: String,
 }
 

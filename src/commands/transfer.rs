@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io;
 
 use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::AppResult;
 use crate::config::Config;
@@ -25,6 +26,7 @@ pub struct Args {
     )]
     globoff: bool,
     #[arg(
+        add = ArgValueCompleter::new(super::completion::dir_or_item),
         required = true,
         num_args = 1..,
         value_name = "SOURCE",
@@ -32,6 +34,7 @@ pub struct Args {
     )]
     sources: Vec<String>,
     #[arg(
+        add = ArgValueCompleter::new(super::completion::dir_or_item),
         value_name = "DESTINATION",
         help = "Destination item or directory path"
     )]
