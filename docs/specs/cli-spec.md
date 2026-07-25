@@ -276,6 +276,22 @@ compute plaintext SHA-256 incrementally while streaming and verify it matches
 the lowercase hex ETag before renaming. When writing to stdout, append a
 newline only when stdout is a TTY.
 
+## clip command
+
+```
+monopass clip <dir>/<item>/<fieldOrFile>
+```
+
+Copy a field or file value to the system clipboard. The reference syntax,
+field/file precedence, TOTP behavior, checksum verification, and unlock retry
+behavior are the same as for `read`.
+
+This command is present only in macOS builds and Linux builds using the `gtk`
+or `qt` feature. On macOS it writes the reference bytes to `/usr/bin/pbcopy`.
+On Linux it writes them to `xclip -selection clipboard`, resolving `xclip` only
+at `/usr/local/bin/xclip` or `/usr/bin/xclip`, in that order. Fail if no
+supported clipboard command exists or if the command exits unsuccessfully.
+
 ## run command
 
 ```

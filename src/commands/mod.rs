@@ -5,6 +5,11 @@ use clap::{Parser, Subcommand};
 
 mod agent;
 mod client;
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
+mod clip;
 mod completion;
 mod contact;
 #[cfg(debug_assertions)]
@@ -55,6 +60,12 @@ pub enum Command {
     Lock,
     #[command(about = "Read a field or file reference")]
     Read(read::Args),
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    #[command(about = "Copy a field or file reference to the clipboard")]
+    Clip(clip::Args),
     #[command(about = "Run a command with monopass references resolved in the environment")]
     Run(run::Args),
     #[command(about = "Create a directory")]
@@ -112,6 +123,11 @@ pub fn run(config: &Config, command: Command) -> AppResult {
         Command::Migrate => migrate::run(config),
         Command::Lock => lock::run(config),
         Command::Read(args) => read::run(config, args),
+        #[cfg(any(
+            target_os = "macos",
+            all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+        ))]
+        Command::Clip(args) => clip::run(config, args),
         Command::Run(args) => run::run(config, args),
         Command::Mkdir(args) => dir::mkdir(config, args),
         Command::Rmdir(args) => dir::rmdir(config, args),
