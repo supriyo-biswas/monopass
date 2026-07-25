@@ -24,7 +24,7 @@ monopass init
 And then, add your first password and retrieve it:
 
 ```sh
-monopass add Personal/GitHub --username my-username --password-prompt
+monopass add Personal/GitHub --username my-username --password
 monopass ls
 monopass ls Personal
 monopass show Personal/GitHub --reveal

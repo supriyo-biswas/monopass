@@ -26,12 +26,16 @@ pub struct AddArgs {
     path: String,
     #[arg(long, help = "Add or update the username field")]
     username: Option<String>,
+    #[arg(long, help = "Add or update the email field")]
+    email: Option<String>,
+    #[arg(long, help = "Add or update the website field")]
+    website: Option<String>,
     #[arg(
         long,
         conflicts_with = "generate_password",
         help = "Prompt for a password"
     )]
-    password_prompt: bool,
+    password: bool,
     #[arg(
         long,
         num_args = 0..=1,
@@ -64,12 +68,16 @@ pub struct EditArgs {
     path: String,
     #[arg(long, help = "Add or update the username field")]
     username: Option<String>,
+    #[arg(long, help = "Add or update the email field")]
+    email: Option<String>,
+    #[arg(long, help = "Add or update the website field")]
+    website: Option<String>,
     #[arg(
         long,
         conflicts_with = "generate_password",
         help = "Prompt for a password"
     )]
-    password_prompt: bool,
+    password: bool,
     #[arg(
         long,
         num_args = 0..=1,
@@ -171,7 +179,9 @@ pub fn add(config: &Config, args: AddArgs) -> AppResult {
         &client,
         ItemInput {
             username: args.username,
-            password_prompt: args.password_prompt,
+            email: args.email,
+            website: args.website,
+            password: args.password,
             generate_password: args.generate_password,
             totp: args.totp,
             fields: args.fields,
@@ -196,7 +206,9 @@ pub fn edit(config: &Config, args: EditArgs) -> AppResult {
         &client,
         ItemInput {
             username: args.username,
-            password_prompt: args.password_prompt,
+            email: args.email,
+            website: args.website,
+            password: args.password,
             generate_password: args.generate_password,
             totp: args.totp,
             fields: args.fields,
@@ -558,7 +570,9 @@ fn trash_suffix_limit_error() -> io::Error {
 
 struct ItemInput {
     username: Option<String>,
-    password_prompt: bool,
+    email: Option<String>,
+    website: Option<String>,
+    password: bool,
     generate_password: Option<String>,
     totp: Option<String>,
     fields: Vec<String>,
@@ -569,7 +583,9 @@ struct ItemInput {
 fn build_create_request(client: &Client<'_>, input: ItemInput) -> AppResult<CreateItemRequest> {
     let ItemInput {
         username,
-        password_prompt,
+        email,
+        website,
+        password,
         generate_password,
         totp,
         fields,
@@ -579,7 +595,9 @@ fn build_create_request(client: &Client<'_>, input: ItemInput) -> AppResult<Crea
     let file_inputs = parse_file_inputs(files)?;
     let fields = build_fields(
         username,
-        password_prompt,
+        email,
+        website,
+        password,
         generate_password.as_deref(),
         totp.as_deref(),
         fields,
@@ -602,7 +620,9 @@ fn build_create_request(client: &Client<'_>, input: ItemInput) -> AppResult<Crea
 fn build_update_request(client: &Client<'_>, input: ItemInput) -> AppResult<UpdateItemRequest> {
     let ItemInput {
         username,
-        password_prompt,
+        email,
+        website,
+        password,
         generate_password,
         totp,
         fields,
@@ -613,7 +633,9 @@ fn build_update_request(client: &Client<'_>, input: ItemInput) -> AppResult<Upda
     let mut request = UpdateItemRequest::default();
     for field in build_fields(
         username,
-        password_prompt,
+        email,
+        website,
+        password,
         generate_password.as_deref(),
         totp.as_deref(),
         fields,
@@ -643,7 +665,9 @@ fn build_update_request(client: &Client<'_>, input: ItemInput) -> AppResult<Upda
 
 fn build_fields(
     username: Option<String>,
-    password_prompt: bool,
+    email: Option<String>,
+    website: Option<String>,
+    password: bool,
     generate_password: Option<&str>,
     totp: Option<&str>,
     fields: Vec<String>,
@@ -661,7 +685,17 @@ fn build_fields(
             string_field(username, Some(false)),
         )?;
     }
-    if password_prompt {
+    for (name, value) in [("email", email), ("website", website)] {
+        if let Some(value) = value {
+            push_field(
+                &mut output,
+                &mut names,
+                name.to_owned(),
+                string_field(value, Some(false)),
+            )?;
+        }
+    }
+    if password {
         let password = prompt_confirmed_password()?;
         push_field(
             &mut output,
@@ -1136,6 +1170,8 @@ mod tests {
     fn build_fields_infers_concealment_without_explicit_list() {
         let fields = build_fields(
             None,
+            None,
+            None,
             false,
             None,
             None,
@@ -1152,6 +1188,8 @@ mod tests {
     fn build_fields_uses_explicit_list_for_custom_fields() {
         let fields = build_fields(
             None,
+            None,
+            None,
             false,
             None,
             None,
@@ -1162,6 +1200,29 @@ mod tests {
 
         assert_eq!(1, fields.len());
         assert_eq!(Some(false), fields[0].concealed);
+    }
+
+    #[test]
+    fn build_fields_adds_unconcealed_email_and_website_shortcuts() {
+        let fields = build_fields(
+            None,
+            Some("alice@example.com".to_owned()),
+            Some("https://example.com".to_owned()),
+            false,
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(2, fields.len());
+        assert_eq!("email", fields[0].name);
+        assert_eq!("alice@example.com", fields[0].data.as_str());
+        assert_eq!(Some(false), fields[0].concealed);
+        assert_eq!("website", fields[1].name);
+        assert_eq!("https://example.com", fields[1].data.as_str());
+        assert_eq!(Some(false), fields[1].concealed);
     }
 
     #[test]

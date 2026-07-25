@@ -323,7 +323,9 @@ contains items.
 ```
 monopass add <dir>/<item>
     --username hello
-    --password-prompt
+    --email hello@example.com
+    --website https://example.com
+    --password
     --generate-password [pwgenspec]
     --totp otpauth_url_or_qr_code_image_path
     --field fieldname=value
@@ -338,7 +340,9 @@ Build a `CreateItemRequest` and send
 `PUT /api/v1/dir/{dirName}/item/{itemName}` to create the item.
 
 - `--username` creates a string field named `username`.
-- `--password-prompt` and `--generate-password` are mutually exclusive. Both
+- `--email` creates a string field named `email`.
+- `--website` creates a string field named `website`.
+- `--password` and `--generate-password` are mutually exclusive. Both
   create a concealed string field named `password`; prompting asks for entry
   and confirmation.
 - `--totp` creates a concealed `totp` field named `totp`. If the value starts
@@ -368,7 +372,9 @@ Build a `CreateItemRequest` and send
 ```
 monopass edit <dir>/<item>
     --username hello
-    --password-prompt
+    --email hello@example.com
+    --website https://example.com
+    --password
     --generate-password [pwgenspec]
     --totp otpauth_url_or_qr_code_image_path
     --field fieldname=value
