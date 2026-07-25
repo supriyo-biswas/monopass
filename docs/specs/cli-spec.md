@@ -350,6 +350,7 @@ monopass add <dir>/<item>
     --concealed-fields fieldname2,fieldname3
     --file id_rsa.pub=/absolute/path/to/other/file
     --file id_rsa=relative/path
+    --file relative/path/to/notes.txt
 ```
 
 Build a `CreateItemRequest` and send
@@ -376,8 +377,11 @@ Build a `CreateItemRequest` and send
   `password`/`secret`/`private`/`key` heuristic as
   the agent. If `--concealed-fields` is provided, fields listed there are sent
   with `concealed: true`; other fields are sent with `concealed: false`.
-- `--file name=path` uploads each path with `PUT /api/v1/file/upload`, then
-  attaches returned IDs in the item request.
+- `--file` accepts either `name=path` or a path by itself. Path-only arguments
+  use the path's basename as the file name. Prefix a path containing `=` with
+  `./`, `../`, or `/` to disambiguate it from `name=path`. Explicit file names
+  cannot contain `/`. Each path is uploaded with `PUT /api/v1/file/upload`,
+  then its returned ID is attached in the item request.
 - Duplicate field names, duplicate file names, or a field and file with the
   same name in one command fail locally.
 - `pwgenspec` is a comma-separated password generation specification described
@@ -396,6 +400,7 @@ monopass edit <dir>/<item>
     --field fieldname=value
     --concealed-fields fieldname2,fieldname3
     --file id_rsa=relative/path
+    --file relative/path/to/notes.txt
 ```
 
 Build the same partial request shape as `add` and send

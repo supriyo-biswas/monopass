@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args as ClapArgs, ValueEnum};
 use clap_complete::engine::ArgValueCompleter;
@@ -58,7 +58,11 @@ pub struct AddArgs {
         help = "Mark comma-separated fields as secret"
     )]
     concealed_fields: Option<Vec<String>>,
-    #[arg(long = "file", help = "Attach a file using the key=value format")]
+    #[arg(
+        long = "file",
+        value_name = "name=path|path",
+        help = "Attach a file, optionally naming it with name=path"
+    )]
     files: Vec<String>,
 }
 
@@ -100,7 +104,11 @@ pub struct EditArgs {
         help = "Mark comma-separated fields as secret"
     )]
     concealed_fields: Option<Vec<String>>,
-    #[arg(long = "file", help = "Attach a file using the key=value format")]
+    #[arg(
+        long = "file",
+        value_name = "name=path|path",
+        help = "Attach a file, optionally naming it with name=path"
+    )]
     files: Vec<String>,
     #[arg(
         long = "remove-fields",
@@ -821,30 +829,51 @@ fn parse_file_inputs(files: Vec<String>) -> AppResult<Vec<PendingFileInput>> {
     let mut output = Vec::new();
     let mut names = HashSet::new();
     for raw in files {
-        let (name, path) = raw.split_once('=').ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file arguments must be name=path",
-            )
-        })?;
+        let (name, path) = if explicitly_path_shaped(&raw) || !raw.contains('=') {
+            let path = PathBuf::from(&raw);
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("file path must have a basename: {raw}"),
+                    )
+                })?
+                .to_owned();
+            (name, path)
+        } else {
+            let (name, path) = raw
+                .split_once('=')
+                .expect("file argument containing '=' must split");
+            if name.contains('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("file name must not contain '/': {name}"),
+                )
+                .into());
+            }
+            (name.to_owned(), PathBuf::from(path))
+        };
         if name.is_empty() {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "file name must not be empty").into(),
             );
         }
-        if !names.insert(name.to_owned()) {
+        if !names.insert(name.clone()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("duplicate file name: {name}"),
             )
             .into());
         }
-        output.push(PendingFileInput {
-            name: name.to_owned(),
-            path: PathBuf::from(path),
-        });
+        output.push(PendingFileInput { name, path });
     }
     Ok(output)
+}
+
+fn explicitly_path_shaped(value: &str) -> bool {
+    Path::new(value).is_absolute() || value.starts_with("./") || value.starts_with("../")
 }
 
 fn upload_files(
@@ -893,12 +922,14 @@ fn remove_dir_after_recursive_delete(dir: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use crate::commands::client::ApiError;
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
         FieldType, RemovalPlan, build_fields, human_size, is_item_exists_conflict,
-        next_trash_number, plan_removal, read_prompted_field_value,
+        next_trash_number, parse_file_inputs, plan_removal, read_prompted_field_value,
         remove_item_is_permanent_delete, trash_fallback_name, trash_number, trash_numbered_glob,
         validate_field_and_file_name_overlap, write_human_item,
     };
@@ -1237,6 +1268,85 @@ mod tests {
             "field and file names must be unique: password",
             error.to_string()
         );
+    }
+
+    #[test]
+    fn file_paths_default_to_their_basename() {
+        let files = parse_file_inputs(vec![
+            "relative/path/report.pdf".to_owned(),
+            "/tmp/archive.tar.gz".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(2, files.len());
+        assert_eq!("report.pdf", files[0].name);
+        assert_eq!(PathBuf::from("relative/path/report.pdf"), files[0].path);
+        assert_eq!("archive.tar.gz", files[1].name);
+        assert_eq!(PathBuf::from("/tmp/archive.tar.gz"), files[1].path);
+    }
+
+    #[test]
+    fn explicitly_named_files_keep_their_names() {
+        let files = parse_file_inputs(vec!["ssh-key=relative/path/id_rsa".to_owned()]).unwrap();
+
+        assert_eq!(1, files.len());
+        assert_eq!("ssh-key", files[0].name);
+        assert_eq!(PathBuf::from("relative/path/id_rsa"), files[0].path);
+    }
+
+    #[test]
+    fn explicit_paths_can_have_equals_in_their_basename() {
+        let files = parse_file_inputs(vec!["./token=prod.txt".to_owned()]).unwrap();
+
+        assert_eq!(1, files.len());
+        assert_eq!("token=prod.txt", files[0].name);
+        assert_eq!(PathBuf::from("./token=prod.txt"), files[0].path);
+    }
+
+    #[test]
+    fn bare_equals_syntax_remains_an_explicit_name() {
+        let files = parse_file_inputs(vec!["token=prod.txt".to_owned()]).unwrap();
+
+        assert_eq!(1, files.len());
+        assert_eq!("token", files[0].name);
+        assert_eq!(PathBuf::from("prod.txt"), files[0].path);
+    }
+
+    #[test]
+    fn explicitly_named_files_reject_path_separators_in_the_name() {
+        let error = parse_file_inputs(vec!["token/foo.txt=prod.txt".to_owned()])
+            .err()
+            .expect("file name containing a path separator should fail");
+
+        assert_eq!(
+            "file name must not contain '/': token/foo.txt",
+            error.to_string()
+        );
+    }
+
+    #[test]
+    fn file_paths_require_a_basename() {
+        for path in ["/", "./", "../"] {
+            let error = parse_file_inputs(vec![path.to_owned()])
+                .err()
+                .expect("file path without a basename should fail");
+            assert_eq!(
+                format!("file path must have a basename: {path}"),
+                error.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_and_explicit_file_names_must_be_unique() {
+        let error = parse_file_inputs(vec![
+            "documents/notes.txt".to_owned(),
+            "notes.txt=other.txt".to_owned(),
+        ])
+        .err()
+        .expect("duplicate inferred and explicit names should fail");
+
+        assert_eq!("duplicate file name: notes.txt", error.to_string());
     }
 
     #[test]
