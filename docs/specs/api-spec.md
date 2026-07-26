@@ -161,23 +161,26 @@ GNOME Terminal are part of the verified lineage even when a child terminal
 creates a new process session. On macOS, the verified `/usr/bin/login` bridge
 described above lets Terminal and iTerm2 participate in both authorization and
 presentation. Other different-user boundaries remain excluded. For example, a
-shell request can be shown as `bash (via Terminal)`. A direct GUI caller uses
-its localized application name without redundant `via` text. The executable
-path always describes the direct executable selected for display, not its GUI
-host. All prompt scopes use the same application icon resolution: they prefer
-the GUI application's icon, then use the existing generic icon fallback if GUI
-application or icon discovery is missing or ambiguous. Linux resolves exact
-unique desktop-entry executables and systemd desktop IDs from both randomized
-application scopes and stable application slices. Its cached XDG desktop-entry
-catalog is refreshed and the ancestry retried once after a complete miss, with
-repeated miss-triggered refreshes briefly throttled. Dialogs do not display
-executable modification timestamps. This GUI metadata is presentation-only and
-is not part of process authorization or direct-unlock trust evaluation. Linux
-GUI unlock requires an accepted GUI session capability (`x-session` or
-`wayland-session`) and uses in-process GTK4 or Qt Quick/QML SDK dialogs with
-forced X11 backend usage. A wrong password, cancelled dialog, or closed dialog
-denies the request. Concurrent GUI unlock requests are displayed as separate
-dialogs.
+shell request can be shown as `bash (via Terminal)`. A caller confidently
+identified as the GUI application uses its localized application name without
+redundant `via` text. The executable path always describes the direct executable
+selected for display, not its GUI host. All prompt scopes use the same
+application icon resolution: they prefer the GUI application's icon, then use
+the existing generic icon fallback if GUI application or icon discovery is
+missing or ambiguous. Linux first searches the complete ancestry for the
+nearest exact unique desktop-entry executable. Only when none exists does it
+fall back to a systemd desktop ID from a randomized application scope or stable
+application slice. Inherited cgroup matches are presentation context only, so
+they always retain the direct executable name and add the GUI application with
+`via`. The cached XDG desktop-entry catalog is refreshed and the ancestry
+retried once after a complete miss, with repeated miss-triggered refreshes
+briefly throttled. Dialogs do not display executable modification timestamps.
+This GUI metadata is presentation-only and is not part of process authorization
+or direct-unlock trust evaluation. Linux GUI unlock requires an accepted GUI
+session capability (`x-session` or `wayland-session`) and uses in-process GTK4
+or Qt Quick/QML SDK dialogs with forced X11 backend usage. A wrong password,
+cancelled dialog, or closed dialog denies the request. Concurrent GUI unlock
+requests are displayed as separate dialogs.
 
 Clicking the explicit **Deny** button records a denial for the requesting
 process-lineage and access-scope pair. Until `agent.denialTtlSeconds` expires,

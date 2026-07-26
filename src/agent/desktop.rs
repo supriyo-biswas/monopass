@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use freedesktop_desktop_entry::{DesktopEntry, Iter, get_languages_from_env};
 
-use super::process::{GuiApplication, ProcessIconSource};
+use super::process::{
+    GuiApplication, GuiApplicationMatch, GuiApplicationMatchKind, ProcessIconSource,
+};
 
 const MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 
@@ -17,7 +19,7 @@ pub(crate) fn initialize_gui_application_catalog() {
     let _ = CATALOG.set(DesktopCatalogCache::new(DesktopCatalog::load()));
 }
 
-pub(crate) fn application_for_process(pid: i32, executable: &Path) -> Option<GuiApplication> {
+pub(crate) fn application_for_process(pid: i32, executable: &Path) -> Option<GuiApplicationMatch> {
     CATALOG
         .get_or_init(|| DesktopCatalogCache::new(DesktopCatalog::load()))
         .application_for_process(pid, executable)
@@ -48,7 +50,7 @@ impl DesktopCatalogCache {
         }
     }
 
-    fn application_for_process(&self, pid: i32, executable: &Path) -> Option<GuiApplication> {
+    fn application_for_process(&self, pid: i32, executable: &Path) -> Option<GuiApplicationMatch> {
         self.catalog
             .read()
             .ok()?
@@ -112,19 +114,19 @@ impl DesktopCatalog {
         Self { entries }
     }
 
-    fn application_for_process(&self, pid: i32, executable: &Path) -> Option<GuiApplication> {
+    fn application_for_process(&self, pid: i32, executable: &Path) -> Option<GuiApplicationMatch> {
         let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
         self.application(executable, cgroup.as_deref())
     }
 
-    fn application(&self, executable: &Path, cgroup: Option<&str>) -> Option<GuiApplication> {
+    fn application(&self, executable: &Path, cgroup: Option<&str>) -> Option<GuiApplicationMatch> {
         let executable_matches = self
             .entries
             .iter()
             .filter(|entry| entry.matches_executable(executable))
             .collect::<Vec<_>>();
         if executable_matches.len() == 1 {
-            return Some(executable_matches[0].application());
+            return Some(executable_matches[0].application(GuiApplicationMatchKind::Process));
         }
         if executable_matches.len() > 1 {
             return None;
@@ -136,7 +138,7 @@ impl DesktopCatalog {
             .iter()
             .filter(|entry| ids.iter().any(|id| id == &entry.id))
             .collect::<Vec<_>>();
-        (id_matches.len() == 1).then(|| id_matches[0].application())
+        (id_matches.len() == 1).then(|| id_matches[0].application(GuiApplicationMatchKind::Context))
     }
 }
 
@@ -179,11 +181,14 @@ impl CatalogEntry {
         })
     }
 
-    fn application(&self) -> GuiApplication {
-        GuiApplication {
-            name: self.name.clone(),
-            icon: self.icon.clone(),
-            same_as_primary: false,
+    fn application(&self, kind: GuiApplicationMatchKind) -> GuiApplicationMatch {
+        GuiApplicationMatch {
+            application: GuiApplication {
+                name: self.name.clone(),
+                icon: self.icon.clone(),
+                same_as_primary: false,
+            },
+            kind,
         }
     }
 }
@@ -327,7 +332,7 @@ mod tests {
     use freedesktop_desktop_entry::DesktopEntry;
     use tempfile::TempDir;
 
-    use super::{DesktopCatalog, DesktopCatalogCache, ProcessIconSource};
+    use super::{DesktopCatalog, DesktopCatalogCache, GuiApplicationMatchKind, ProcessIconSource};
 
     #[test]
     fn parses_gnome_kde_and_escaped_application_scopes() {
@@ -418,20 +423,17 @@ mod tests {
         ]);
         let catalog = DesktopCatalog::from_entries(entries, &[], &[]);
 
-        assert_eq!(
-            "Absolute",
-            catalog
-                .application_for_process(0, std::path::Path::new("/usr/bin/terminal"))
-                .unwrap()
-                .name
-        );
-        assert_eq!(
-            "Basename",
-            catalog
-                .application_for_process(0, std::path::Path::new("/opt/bin/other-terminal"))
-                .unwrap()
-                .name
-        );
+        let absolute = catalog
+            .application_for_process(0, std::path::Path::new("/usr/bin/terminal"))
+            .unwrap();
+        assert_eq!("Absolute", absolute.application.name);
+        assert_eq!(GuiApplicationMatchKind::Process, absolute.kind);
+
+        let basename = catalog
+            .application_for_process(0, std::path::Path::new("/opt/bin/other-terminal"))
+            .unwrap();
+        assert_eq!("Basename", basename.application.name);
+        assert_eq!(GuiApplicationMatchKind::Process, basename.kind);
         assert!(
             catalog
                 .application_for_process(0, std::path::Path::new("/usr/bin/terminal-extra"))
@@ -493,16 +495,14 @@ mod tests {
         );
         let cgroup = "0::/user.slice/app.slice/app-gnome-org.gnome.Terminal-abc.scope\n";
 
-        assert_eq!(
-            "Terminal",
-            catalog
-                .application(
-                    std::path::Path::new("/usr/libexec/gnome-terminal-server"),
-                    Some(cgroup)
-                )
-                .unwrap()
-                .name
-        );
+        let matched = catalog
+            .application(
+                std::path::Path::new("/usr/libexec/gnome-terminal-server"),
+                Some(cgroup),
+            )
+            .unwrap();
+        assert_eq!("Terminal", matched.application.name);
+        assert_eq!(GuiApplicationMatchKind::Context, matched.kind);
         assert!(
             catalog
                 .application(
@@ -528,16 +528,14 @@ mod tests {
             "app-org.gnome.Terminal.slice/gnome-terminal-server.service\n",
         );
 
-        assert_eq!(
-            "Terminal",
-            catalog
-                .application(
-                    std::path::Path::new("/usr/libexec/gnome-terminal-server"),
-                    Some(cgroup)
-                )
-                .unwrap()
-                .name
-        );
+        let matched = catalog
+            .application(
+                std::path::Path::new("/usr/libexec/gnome-terminal-server"),
+                Some(cgroup),
+            )
+            .unwrap();
+        assert_eq!("Terminal", matched.application.name);
+        assert_eq!(GuiApplicationMatchKind::Context, matched.kind);
     }
 
     #[test]
@@ -555,13 +553,11 @@ mod tests {
                 &[],
             ))
         );
-        assert_eq!(
-            "LXTerminal",
-            cache
-                .application_for_process(0, std::path::Path::new("/usr/bin/lxterminal"))
-                .unwrap()
-                .name
-        );
+        let matched = cache
+            .application_for_process(0, std::path::Path::new("/usr/bin/lxterminal"))
+            .unwrap();
+        assert_eq!("LXTerminal", matched.application.name);
+        assert_eq!(GuiApplicationMatchKind::Process, matched.kind);
 
         let loads = AtomicUsize::new(0);
         assert!(!cache.refresh_after_miss(now + Duration::from_secs(1), || {
