@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::time::Instant;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use zeroize::Zeroizing;
@@ -296,7 +295,7 @@ pub async fn lock(
     scope_hash: Option<Extension<ScopeHash>>,
 ) -> Result<StatusCode, ApiError> {
     let Extension(_) = scope_hash.ok_or_else(ApiError::access_denied)?;
-    state.lock(Instant::now()).await;
+    state.lock().await;
     Ok(StatusCode::OK)
 }
 
@@ -307,17 +306,16 @@ pub async fn status(
 ) -> Result<Json<AuthStatusResponse>, ApiError> {
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
     let access_scope = auth_scope_query(query)?.access_scope();
-    let expires_at = state
-        .authorization_expires_at_for_scope(&scope_hash, access_scope)
+    let remaining = state
+        .authorization_remaining_for_scope(&scope_hash, access_scope)
         .await
         .ok_or_else(ApiError::access_denied)?;
-    let reauth_timestamp = reauth_timestamp(expires_at).ok_or_else(ApiError::access_denied)?;
+    let reauth_timestamp = reauth_timestamp(remaining).ok_or_else(ApiError::access_denied)?;
 
     Ok(Json(AuthStatusResponse { reauth_timestamp }))
 }
 
-fn reauth_timestamp(expires_at: Instant) -> Option<String> {
-    let remaining = expires_at.checked_duration_since(Instant::now())?;
+fn reauth_timestamp(remaining: std::time::Duration) -> Option<String> {
     if remaining.is_zero() {
         return None;
     }
@@ -1072,7 +1070,7 @@ mod tests {
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant as StdInstant};
 
     use axum::body::Body;
     use axum::extract::rejection::QueryRejection;
@@ -1087,6 +1085,7 @@ mod tests {
         bearer_password, export_item, import_item, lock, parse_completion_kinds,
         send_upload_body_bytes, status, unlock_methods, validate_completion_prefix,
     };
+    use crate::agent::clock::SuspendAwareInstant as Instant;
     #[cfg(any(
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
@@ -1956,7 +1955,7 @@ mod tests {
 
         wait_for_active_jobs(&state, 1).await;
         let now = Instant::now();
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
 
         assert!(!state.unload_if_authorization_expired(now).await);
         assert_eq!(1, state.active_job_count().await);
@@ -2007,7 +2006,7 @@ mod tests {
 
         wait_for_active_jobs(&state, 1).await;
         let now = Instant::now();
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
 
         assert!(!state.unload_if_authorization_expired(now).await);
         assert_eq!(1, state.active_job_count().await);
@@ -2080,13 +2079,13 @@ mod tests {
     }
 
     async fn wait_for_writer_dispatches(database: &DbHandle, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = StdInstant::now() + Duration::from_secs(2);
         loop {
             if database.dispatch_counts().0 >= expected {
                 return;
             }
             assert!(
-                Instant::now() < deadline,
+                StdInstant::now() < deadline,
                 "timed out waiting for writer dispatches"
             );
             tokio::task::yield_now().await;
@@ -2094,13 +2093,13 @@ mod tests {
     }
 
     async fn wait_for_active_jobs(state: &AgentState, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = StdInstant::now() + Duration::from_secs(2);
         loop {
             if state.active_job_count().await >= expected {
                 return;
             }
             assert!(
-                Instant::now() < deadline,
+                StdInstant::now() < deadline,
                 "timed out waiting for active jobs"
             );
             tokio::task::yield_now().await;

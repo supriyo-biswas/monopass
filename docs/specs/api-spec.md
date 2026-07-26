@@ -300,14 +300,18 @@ Opening a database inserts any missing registered user settings with their
 defaults and leaves existing rows unchanged.
 
 `user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
-effect immediately for new and existing cached item authorizations.
+effect immediately for new and existing cached item authorizations. The TTL uses
+a monotonic clock that advances during system suspend, so sleep time counts
+toward expiry while wall-clock adjustments do not extend authorization.
 `user.settingsAuthTtlSeconds` independently controls settings authorization TTL
-and likewise applies immediately to new and existing entries.
+and likewise applies immediately to new and existing entries with the same
+suspend-aware clock behavior.
 `user.denialTtlSeconds` controls explicit GUI denial TTL. The agent uses 60
 seconds until the encrypted setting is first loaded by a successful unlock,
 then keeps the loaded value in memory through later database unloads. Changes
-take effect immediately for new and existing cached denials. `user.gcSeconds`
-controls the best-effort idle cleanup cadence.
+take effect immediately for new and existing cached denials, and suspend time
+counts toward their expiry. `user.gcSeconds` controls the best-effort idle
+cleanup cadence.
 `user.autoDeleteTrashItemsAfterSeconds` controls how long items remain in
 `Trash`, measured from its current `updated_at` timestamp. Moving or renaming
 an item within `Trash` refreshes `updated_at` and postpones deletion.

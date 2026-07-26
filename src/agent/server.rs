@@ -131,7 +131,7 @@ fn database_routes(state: AgentState) -> Router<AgentState> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -143,6 +143,7 @@ mod tests {
     use tempfile::NamedTempFile;
     use tower::ServiceExt;
 
+    use crate::agent::clock::SuspendAwareInstant as Instant;
     use crate::agent::models::AccessScope;
     use crate::agent::process::{ScopeHash, UltimateProcess};
     use crate::agent::state::{
@@ -494,7 +495,7 @@ mod tests {
         assert_eq!(1, state.active_database_request_count());
         let now = Instant::now();
 
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
 
         assert!(!state.unload_if_authorization_expired(now).await);
         drop(response);
@@ -549,7 +550,7 @@ mod tests {
         assert_eq!(1, state.active_database_request_count());
         let now = Instant::now();
 
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
 
         assert!(!state.unload_if_authorization_expired(now).await);
         drop(response);

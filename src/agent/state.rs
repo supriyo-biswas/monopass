@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose;
@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::clock::{SuspendAwareClock, SuspendAwareInstant, SystemSuspendAwareClock};
 use super::models::{
     AccessScope, ContactResponse, CreateContactRequest, CreateField, CreateItemRequest,
     DirResponse, Field, FieldEntry, FieldType, FileInput, FileMetadata, FileMetadataEntry,
@@ -79,6 +80,7 @@ pub struct AgentState {
     job_store_path: PathBuf,
     inner: Arc<Mutex<InnerState>>,
     active_database_requests: Arc<AtomicUsize>,
+    clock: Arc<dyn SuspendAwareClock>,
 }
 
 impl AgentState {
@@ -105,13 +107,42 @@ impl AgentState {
         file_store_path: impl AsRef<Path>,
         job_store_path: impl AsRef<Path>,
     ) -> Self {
+        Self::from_paths_with_clock(
+            database_path,
+            file_store_path,
+            job_store_path,
+            Arc::new(SystemSuspendAwareClock),
+        )
+    }
+
+    fn from_paths_with_clock(
+        database_path: impl AsRef<Path>,
+        file_store_path: impl AsRef<Path>,
+        job_store_path: impl AsRef<Path>,
+        clock: Arc<dyn SuspendAwareClock>,
+    ) -> Self {
         Self {
             database_path: database_path.as_ref().to_owned(),
             file_store_path: file_store_path.as_ref().to_owned(),
             job_store_path: job_store_path.as_ref().to_owned(),
             inner: Arc::new(Mutex::new(InnerState::default())),
             active_database_requests: Arc::new(AtomicUsize::new(0)),
+            clock,
         }
+    }
+
+    #[cfg(test)]
+    pub fn from_database_path_with_clock(
+        database_path: impl AsRef<Path>,
+        clock: Arc<dyn SuspendAwareClock>,
+    ) -> Self {
+        let database_path = database_path.as_ref();
+        Self::from_paths_with_clock(
+            database_path,
+            database_path.with_extension("files"),
+            database_path.with_extension("jobs"),
+            clock,
+        )
     }
 
     pub fn job_store_path(&self) -> &Path {
@@ -124,7 +155,11 @@ impl AgentState {
             let mut interval = tokio::time::interval(AUTH_EXPIRY_SWEEP_INTERVAL);
             loop {
                 interval.tick().await;
-                state.unload_if_authorization_expired(Instant::now()).await;
+                if let Some(now) = state.clock.now() {
+                    state.unload_if_authorization_expired(now).await;
+                } else {
+                    state.invalidate_authorizations_after_clock_failure().await;
+                }
             }
         });
     }
@@ -220,7 +255,7 @@ impl AgentState {
             if inner.auth_epoch != auth_epoch || !database_is_current {
                 return Err(UnlockError::AccessDenied);
             }
-            let now = Instant::now();
+            let now = self.clock.now().ok_or(UnlockError::AccessDenied)?;
             inner.denial_ttl = denial_ttl;
             inner.denied_scopes_mut(access_scope).remove(&scope_hash);
             inner
@@ -262,11 +297,11 @@ impl AgentState {
             .user_setting_duration(DENIAL_TTL_SETTING)
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
+        let now = self.clock.now().ok_or(UnlockError::AccessDenied)?;
 
         inner.invalidate_auth_epoch();
         inner.database = Some(handle);
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
-        let now = Instant::now();
         inner.denial_ttl = denial_ttl;
         inner.denied_scopes_mut(access_scope).remove(&scope_hash);
         inner.last_authorized_database_access = Some(now);
@@ -277,12 +312,16 @@ impl AgentState {
         Ok(())
     }
 
-    pub async fn lock(&self, now: Instant) {
+    pub async fn lock(&self) {
+        self.lock_at(self.clock.now()).await;
+    }
+
+    pub(crate) async fn lock_at(&self, now: Option<SuspendAwareInstant>) {
         let mut inner = self.inner.lock().await;
         inner.invalidate_auth_epoch();
         inner.authorized_scopes.clear();
         inner.settings_authorized_scopes.clear();
-        inner.max_authorization_expires_at = Some(now);
+        inner.max_authorization_expires_at = now;
     }
 
     #[cfg(test)]
@@ -317,7 +356,10 @@ impl AgentState {
     }
 
     #[cfg(test)]
-    pub async fn authorization_expires_at(&self, scope_hash: &ScopeHash) -> Option<Instant> {
+    pub async fn authorization_expires_at(
+        &self,
+        scope_hash: &ScopeHash,
+    ) -> Option<SuspendAwareInstant> {
         self.authorization_expires_at_for_scope(scope_hash, AccessScope::Items)
             .await
     }
@@ -326,18 +368,30 @@ impl AgentState {
         &self,
         scope_hash: &ScopeHash,
         access_scope: AccessScope,
-    ) -> Option<Instant> {
+    ) -> Option<SuspendAwareInstant> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
             .user_setting_duration(auth_ttl_setting(access_scope))
             .await
             .ok()?;
+        let now = self.clock.now()?;
 
         self.inner
             .lock()
             .await
             .authorized_scopes(access_scope)
-            .expires_at(scope_hash, Instant::now(), auth_ttl)
+            .expires_at(scope_hash, now, auth_ttl)
+    }
+
+    pub async fn authorization_remaining_for_scope(
+        &self,
+        scope_hash: &ScopeHash,
+        access_scope: AccessScope,
+    ) -> Option<Duration> {
+        let expires_at = self
+            .authorization_expires_at_for_scope(scope_hash, access_scope)
+            .await?;
+        expires_at.checked_duration_since(self.clock.now()?)
     }
 
     #[cfg(test)]
@@ -357,11 +411,14 @@ impl AgentState {
         scope_hash: ScopeHash,
         access_scope: AccessScope,
     ) {
+        let Some(now) = self.clock.now() else {
+            return;
+        };
         self.inner
             .lock()
             .await
             .denied_scopes_mut(access_scope)
-            .insert(scope_hash, Instant::now());
+            .insert(scope_hash, now);
     }
 
     #[cfg(test)]
@@ -380,11 +437,14 @@ impl AgentState {
         scope_hash: &ScopeHash,
         access_scope: AccessScope,
     ) -> bool {
+        let Some(now) = self.clock.now() else {
+            return false;
+        };
         let mut inner = self.inner.lock().await;
         let denial_ttl = inner.denial_ttl;
         inner
             .denied_scopes_mut(access_scope)
-            .contains(scope_hash, Instant::now(), denial_ttl)
+            .contains(scope_hash, now, denial_ttl)
     }
 
     pub async fn upsert_user_setting(
@@ -436,8 +496,8 @@ impl AgentState {
             .await
             .ok()?;
 
+        let now = self.clock.now()?;
         let mut inner = self.inner.lock().await;
-        let now = Instant::now();
         let database = inner.database.clone();
         let authorized = database.is_some()
             && inner
@@ -452,7 +512,7 @@ impl AgentState {
         }
     }
 
-    pub async fn unload_if_authorization_expired(&self, now: Instant) -> bool {
+    pub async fn unload_if_authorization_expired(&self, now: SuspendAwareInstant) -> bool {
         let database = self.inner.lock().await.database.clone();
         let Some(database) = database else {
             return false;
@@ -503,9 +563,10 @@ impl AgentState {
 
             if should_unload {
                 gc_interval.is_some_and(|gc_interval| {
-                    inner
-                        .last_cleanup_at
-                        .is_none_or(|last_cleanup| now.duration_since(last_cleanup) >= gc_interval)
+                    inner.last_cleanup_at.is_none_or(|last_cleanup| {
+                        now.checked_duration_since(last_cleanup)
+                            .is_none_or(|elapsed| elapsed >= gc_interval)
+                    })
                 })
             } else {
                 false
@@ -513,11 +574,12 @@ impl AgentState {
         };
 
         if cleanup_due {
+            let wall_now = now_timestamp();
             let trash_cutoff =
-                trash_retention.map(|retention| now.checked_sub(retention).unwrap_or(now));
+                trash_retention.map(|retention| retention_cutoff(wall_now, retention));
             let version_cutoff =
-                version_retention.map(|retention| now.checked_sub(retention).unwrap_or(now));
-            let file_cutoff = now.checked_sub(FILE_ORPHAN_RETENTION).unwrap_or(now);
+                version_retention.map(|retention| retention_cutoff(wall_now, retention));
+            let file_cutoff = retention_cutoff(wall_now, FILE_ORPHAN_RETENTION);
             let _ = database
                 .cleanup_before_unload(trash_cutoff, version_cutoff, file_cutoff)
                 .await;
@@ -541,6 +603,17 @@ impl AgentState {
         should_unload
     }
 
+    async fn invalidate_authorizations_after_clock_failure(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.invalidate_auth_epoch();
+        inner.authorized_scopes.clear();
+        inner.settings_authorized_scopes.clear();
+        inner.max_authorization_expires_at = None;
+        if !self.has_active_database_work_locked(&inner) {
+            Self::unload_locked(&mut inner);
+        }
+    }
+
     fn unload_locked(inner: &mut InnerState) {
         inner.invalidate_auth_epoch();
         inner.database = None;
@@ -561,7 +634,7 @@ impl AgentState {
         let mut inner = self.inner.lock().await;
         inner.invalidate_auth_epoch();
         inner.database = Some(handle);
-        inner.last_authorized_database_access = Some(Instant::now());
+        inner.last_authorized_database_access = self.clock.now();
     }
 
     #[cfg(test)]
@@ -581,15 +654,16 @@ impl AgentState {
         scope_hash: ScopeHash,
         access_scope: AccessScope,
     ) {
+        let now = self.clock.now().expect("test clock must be available");
         self.inner
             .lock()
             .await
             .authorized_scopes_mut(access_scope)
-            .insert(scope_hash, Instant::now());
+            .insert(scope_hash, now);
     }
 
     #[cfg(test)]
-    pub async fn authorize_scope_hash_at(&self, scope_hash: ScopeHash, now: Instant) {
+    pub async fn authorize_scope_hash_at(&self, scope_hash: ScopeHash, now: SuspendAwareInstant) {
         self.authorize_scope_hash_at_for_scope(scope_hash, AccessScope::Items, now)
             .await;
     }
@@ -599,7 +673,7 @@ impl AgentState {
         &self,
         scope_hash: ScopeHash,
         access_scope: AccessScope,
-        now: Instant,
+        now: SuspendAwareInstant,
     ) {
         self.inner
             .lock()
@@ -609,7 +683,7 @@ impl AgentState {
     }
 
     #[cfg(test)]
-    pub async fn deny_scope_hash_at(&self, scope_hash: ScopeHash, now: Instant) {
+    pub async fn deny_scope_hash_at(&self, scope_hash: ScopeHash, now: SuspendAwareInstant) {
         self.inner
             .lock()
             .await
@@ -623,30 +697,30 @@ impl AgentState {
     }
 
     #[cfg(test)]
-    pub async fn last_authorized_database_access(&self) -> Option<Instant> {
+    pub async fn last_authorized_database_access(&self) -> Option<SuspendAwareInstant> {
         self.inner.lock().await.last_authorized_database_access
     }
 
     #[cfg(test)]
     pub async fn set_last_authorized_database_access(
         &self,
-        last_authorized_database_access: Option<Instant>,
+        last_authorized_database_access: Option<SuspendAwareInstant>,
     ) {
         self.inner.lock().await.last_authorized_database_access = last_authorized_database_access;
     }
 
     #[cfg(test)]
-    pub async fn max_authorization_expires_at(&self) -> Option<Instant> {
+    pub async fn max_authorization_expires_at(&self) -> Option<SuspendAwareInstant> {
         self.inner.lock().await.max_authorization_expires_at
     }
 
     #[cfg(test)]
-    pub async fn set_max_authorization_expires_at(&self, expires_at: Option<Instant>) {
+    pub async fn set_max_authorization_expires_at(&self, expires_at: Option<SuspendAwareInstant>) {
         self.inner.lock().await.max_authorization_expires_at = expires_at;
     }
 
     #[cfg(test)]
-    pub async fn set_last_cleanup_at(&self, last_cleanup_at: Option<Instant>) {
+    pub async fn set_last_cleanup_at(&self, last_cleanup_at: Option<SuspendAwareInstant>) {
         self.inner.lock().await.last_cleanup_at = last_cleanup_at;
     }
 
@@ -709,9 +783,9 @@ struct InnerState {
     denied_scopes: AuthCache,
     settings_denied_scopes: AuthCache,
     denial_ttl: Duration,
-    last_authorized_database_access: Option<Instant>,
-    max_authorization_expires_at: Option<Instant>,
-    last_cleanup_at: Option<Instant>,
+    last_authorized_database_access: Option<SuspendAwareInstant>,
+    max_authorization_expires_at: Option<SuspendAwareInstant>,
+    last_cleanup_at: Option<SuspendAwareInstant>,
     active_jobs: HashSet<String>,
     auth_epoch: u64,
     migration_needed: bool,
@@ -768,7 +842,7 @@ impl InnerState {
         self.auth_epoch = self.auth_epoch.wrapping_add(1);
     }
 
-    fn record_authorization_expiry(&mut self, expires_at: Instant) {
+    fn record_authorization_expiry(&mut self, expires_at: SuspendAwareInstant) {
         self.max_authorization_expires_at = Some(
             self.max_authorization_expires_at
                 .map_or(expires_at, |current| current.max(expires_at)),
@@ -845,7 +919,7 @@ struct AuthCache {
 }
 
 impl AuthCache {
-    fn insert(&mut self, scope_hash: ScopeHash, now: Instant) {
+    fn insert(&mut self, scope_hash: ScopeHash, now: SuspendAwareInstant) {
         self.entries.retain(|entry| entry.scope_hash != scope_hash);
         self.entries.push(AuthCacheEntry {
             scope_hash,
@@ -857,7 +931,12 @@ impl AuthCache {
         }
     }
 
-    fn contains(&mut self, scope_hash: &ScopeHash, now: Instant, ttl: Duration) -> bool {
+    fn contains(
+        &mut self,
+        scope_hash: &ScopeHash,
+        now: SuspendAwareInstant,
+        ttl: Duration,
+    ) -> bool {
         self.retain_unexpired(now, ttl);
 
         let Some(index) = self
@@ -873,25 +952,32 @@ impl AuthCache {
         true
     }
 
-    fn expires_at(&self, scope_hash: &ScopeHash, now: Instant, ttl: Duration) -> Option<Instant> {
+    fn expires_at(
+        &self,
+        scope_hash: &ScopeHash,
+        now: SuspendAwareInstant,
+        ttl: Duration,
+    ) -> Option<SuspendAwareInstant> {
         let entry = self
             .entries
             .iter()
             .find(|entry| &entry.scope_hash == scope_hash)?;
-        let expires_at = entry.inserted_at + ttl;
+        let expires_at = entry.inserted_at.checked_add(ttl)?;
 
         (expires_at > now).then_some(expires_at)
     }
 
-    fn retain_unexpired(&mut self, now: Instant, ttl: Duration) {
-        self.entries
-            .retain(|entry| now.duration_since(entry.inserted_at) < ttl);
+    fn retain_unexpired(&mut self, now: SuspendAwareInstant, ttl: Duration) {
+        self.entries.retain(|entry| {
+            now.checked_duration_since(entry.inserted_at)
+                .is_some_and(|age| age < ttl)
+        });
     }
 
-    fn max_expires_at(&self, ttl: Duration) -> Option<Instant> {
+    fn max_expires_at(&self, ttl: Duration) -> Option<SuspendAwareInstant> {
         self.entries
             .iter()
-            .map(|entry| entry.inserted_at + ttl)
+            .filter_map(|entry| entry.inserted_at.checked_add(ttl))
             .max()
     }
 
@@ -907,7 +993,7 @@ impl AuthCache {
 #[derive(Debug)]
 struct AuthCacheEntry {
     scope_hash: ScopeHash,
-    inserted_at: Instant,
+    inserted_at: SuspendAwareInstant,
 }
 
 #[derive(Debug, Clone)]
@@ -1325,9 +1411,9 @@ impl DbHandle {
 
     async fn cleanup_before_unload(
         &self,
-        trash_cutoff: Option<Instant>,
-        version_cutoff: Option<Instant>,
-        file_cutoff: Instant,
+        trash_cutoff: Option<i64>,
+        version_cutoff: Option<i64>,
+        file_cutoff: i64,
     ) -> Result<(), DbError> {
         #[cfg(test)]
         if self
@@ -1971,9 +2057,9 @@ enum DbCommand {
         reply: oneshot::Sender<Result<Duration, DbError>>,
     },
     CleanupBeforeUnload {
-        trash_cutoff: Option<Instant>,
-        version_cutoff: Option<Instant>,
-        file_cutoff: Instant,
+        trash_cutoff: Option<i64>,
+        version_cutoff: Option<i64>,
+        file_cutoff: i64,
         reply: oneshot::Sender<Result<(), DbError>>,
     },
     #[cfg(test)]
@@ -3734,9 +3820,9 @@ impl DatabaseWorker {
 
     fn cleanup_before_unload(
         &mut self,
-        trash_cutoff: Option<Instant>,
-        version_cutoff: Option<Instant>,
-        file_cutoff: Instant,
+        trash_cutoff: Option<i64>,
+        version_cutoff: Option<i64>,
+        file_cutoff: i64,
     ) -> Result<(), DbError> {
         self.cleanup_expired_items_and_versions(trash_cutoff, version_cutoff)?;
         self.cleanup_orphan_files(file_cutoff)
@@ -3744,8 +3830,8 @@ impl DatabaseWorker {
 
     fn cleanup_expired_items_and_versions(
         &mut self,
-        trash_cutoff: Option<Instant>,
-        version_cutoff: Option<Instant>,
+        trash_cutoff: Option<i64>,
+        version_cutoff: Option<i64>,
     ) -> Result<(), DbError> {
         let transaction = self
             .connection
@@ -3765,13 +3851,13 @@ impl DatabaseWorker {
                           AND d.name = ?2
                       )
                     "#,
-                    (instant_to_timestamp(cutoff), TRASH_DIR_NAME),
+                    (cutoff, TRASH_DIR_NAME),
                 )
                 .map_err(|_| DbError::Internal)?;
         }
 
         if let Some(cutoff) = version_cutoff {
-            let cutoff_timestamp = instant_to_timestamp(cutoff);
+            let cutoff_timestamp = cutoff;
             let affected_item_ids = {
                 let mut statement = transaction
                     .prepare(
@@ -3830,8 +3916,7 @@ impl DatabaseWorker {
         transaction.commit().map_err(|_| DbError::Internal)
     }
 
-    fn cleanup_orphan_files(&mut self, cutoff: Instant) -> Result<(), DbError> {
-        let cutoff_timestamp = instant_to_timestamp(cutoff);
+    fn cleanup_orphan_files(&mut self, cutoff_timestamp: i64) -> Result<(), DbError> {
         let mut statement = self
             .connection
             .prepare(
@@ -5213,13 +5298,8 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn instant_to_timestamp(instant: Instant) -> i64 {
-    let now = Instant::now();
-    if let Some(age) = now.checked_duration_since(instant) {
-        now_timestamp() - age.as_secs() as i64
-    } else {
-        now_timestamp()
-    }
+fn retention_cutoff(now: i64, retention: Duration) -> i64 {
+    now.saturating_sub(i64::try_from(retention.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn aes_256_gcm_encrypt(
@@ -5731,7 +5811,8 @@ mod tests {
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant as StdInstant};
 
     use data_encoding::BASE32_NOPAD;
     use rusqlite::Connection;
@@ -5745,6 +5826,7 @@ mod tests {
         PRIVATE_FILE_MODE, PageRequest, ShellCompletionKind, UnlockError, UpdateContactRequest,
         UpdateItemRequest,
     };
+    use crate::agent::clock::{SuspendAwareInstant as Instant, TestSuspendAwareClock};
     use crate::agent::process::{DirectUnlockCaller, ScopeHash};
 
     const AUTH_TTL: Duration = Duration::from_secs(900);
@@ -6159,13 +6241,13 @@ mod tests {
     }
 
     async fn wait_for_reader_dispatches(database: &DbHandle, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = StdInstant::now() + Duration::from_secs(2);
         loop {
             if database.dispatch_counts().1 >= expected {
                 return;
             }
             assert!(
-                Instant::now() < deadline,
+                StdInstant::now() < deadline,
                 "timed out waiting for reader dispatches"
             );
             tokio::task::yield_now().await;
@@ -6229,6 +6311,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorization_ttl_includes_time_spent_suspended() {
+        let clock = Arc::new(TestSuspendAwareClock::new(Duration::from_secs(10_000)));
+        let state = AgentState::from_database_path_with_clock("missing.db", clock.clone());
+        state.store_database_handle(DbHandle::test()).await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
+
+        clock.advance(Duration::from_secs(10 * 60));
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
+
+        // A suspend-aware clock advances while the process itself is asleep.
+        clock.advance(Duration::from_secs(5 * 60 * 60));
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(
+            state
+                .authorize_database_access(&ScopeHash::test(1))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_fails_closed_when_suspend_aware_clock_is_unavailable() {
+        let clock = Arc::new(TestSuspendAwareClock::new(Duration::from_secs(10_000)));
+        let state = AgentState::from_database_path_with_clock("missing.db", clock.clone());
+        state.store_database_handle(DbHandle::test()).await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
+        clock.fail();
+
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(
+            state
+                .authorize_database_access(&ScopeHash::test(1))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_unlock_does_not_commit_state_when_suspend_aware_clock_is_unavailable() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let clock = Arc::new(TestSuspendAwareClock::new(Duration::from_secs(10_000)));
+        clock.fail();
+        let state = AgentState::from_database_path_with_clock(file.path(), clock);
+
+        assert_eq!(
+            Err(UnlockError::AccessDenied),
+            state.unlock(password("correct"), ScopeHash::test(1)).await
+        );
+        assert!(!state.is_unlocked().await);
+        assert!(!state.has_password_verifier().await);
+    }
+
+    #[tokio::test]
     async fn denial_cache_uses_default_ttl_and_scope_hash() {
         let state = AgentState::from_database_path("missing.db");
         let now = Instant::now();
@@ -6265,7 +6401,7 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         state.deny_scope_hash(ScopeHash::test(1)).await;
 
-        state.lock(Instant::now()).await;
+        state.lock_at(Some(Instant::now())).await;
 
         assert!(state.is_scope_denied(&ScopeHash::test(1)).await);
     }
@@ -6616,7 +6752,7 @@ mod tests {
             .set_max_authorization_expires_at(Some(now + AUTH_TTL))
             .await;
 
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
 
         assert!(!state.is_authorized(&ScopeHash::test(1)).await);
         assert_eq!(Some(now), state.max_authorization_expires_at().await);
@@ -6694,7 +6830,7 @@ mod tests {
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
         state.authorize_scope_hash_at(ScopeHash::test(1), now).await;
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
 
         assert!(state.unload_if_authorization_expired(now).await);
 
@@ -6725,7 +6861,7 @@ mod tests {
         wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
         let lock_time = Instant::now();
 
-        state.lock(lock_time).await;
+        state.lock_at(Some(lock_time)).await;
 
         assert_eq!(Err(UnlockError::AccessDenied), unlock_task.await.unwrap());
         for blocker in blockers {
@@ -6756,7 +6892,7 @@ mod tests {
         });
         wait_for_reader_dispatches(&database, before_unlock_read + 1).await;
 
-        state.lock(now).await;
+        state.lock_at(Some(now)).await;
         assert!(state.unload_if_authorization_expired(now).await);
 
         assert_eq!(Err(UnlockError::AccessDenied), unlock_task.await.unwrap());
@@ -10373,15 +10509,9 @@ mod tests {
 
         let last_access = Instant::now();
         let cleanup_at = last_access + AUTH_TTL;
-        let boundary_cutoff = cleanup_at
-            .checked_sub(Duration::from_secs(180 * 24 * 60 * 60))
-            .unwrap();
+        let boundary_cutoff = super::now_timestamp() - 180 * 24 * 60 * 60;
         database
-            .test_set_item_updated_at(
-                "Trash",
-                "boundary",
-                super::instant_to_timestamp(boundary_cutoff),
-            )
+            .test_set_item_updated_at("Trash", "boundary", boundary_cutoff)
             .await
             .unwrap();
         database
@@ -10703,7 +10833,7 @@ mod tests {
     #[tokio::test]
     async fn simultaneous_reads_complete_through_multiple_reader_workers() {
         let database = DbHandle::test();
-        let started = Instant::now();
+        let started = StdInstant::now();
         let tasks = (0..super::DATABASE_READER_WORKERS)
             .map(|_| {
                 let database = database.clone();
@@ -10737,7 +10867,7 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let started = Instant::now();
+        let started = StdInstant::now();
         database.create_dir("dir".to_owned()).await.unwrap();
 
         assert!(started.elapsed() < Duration::from_millis(250));
@@ -10758,7 +10888,7 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        let started = Instant::now();
+        let started = StdInstant::now();
         database.create_dir("dir".to_owned()).await.unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(120));

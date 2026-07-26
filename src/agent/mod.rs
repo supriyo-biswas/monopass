@@ -1,4 +1,5 @@
 mod auth;
+mod clock;
 mod controller;
 #[cfg(any(test, all(target_os = "linux", any(feature = "gtk", feature = "qt"))))]
 mod desktop;
