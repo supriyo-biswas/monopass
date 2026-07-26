@@ -145,6 +145,10 @@ impl TestSuspendAwareClock {
         );
     }
 
+    pub(crate) fn instant(&self) -> SuspendAwareInstant {
+        <Self as SuspendAwareClock>::now(self).expect("test clock must be available")
+    }
+
     pub(crate) fn fail(&self) {
         self.available
             .store(false, std::sync::atomic::Ordering::Relaxed);

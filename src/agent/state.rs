@@ -5832,6 +5832,14 @@ mod tests {
     const AUTH_TTL: Duration = Duration::from_secs(900);
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
+    fn state_with_test_clock(
+        database_path: impl AsRef<std::path::Path>,
+    ) -> (AgentState, Arc<TestSuspendAwareClock>) {
+        let clock = Arc::new(TestSuspendAwareClock::new(Duration::from_secs(10_000)));
+        let state = AgentState::from_database_path_with_clock(database_path, clock.clone());
+        (state, clock)
+    }
+
     fn field<'a>(item: &'a super::ItemResponse, name: &str) -> &'a super::FieldEntry {
         item.fields
             .iter()
@@ -6366,8 +6374,8 @@ mod tests {
 
     #[tokio::test]
     async fn denial_cache_uses_default_ttl_and_scope_hash() {
-        let state = AgentState::from_database_path("missing.db");
-        let now = Instant::now();
+        let (state, clock) = state_with_test_clock("missing.db");
+        let now = clock.instant();
         state
             .deny_scope_hash_at(ScopeHash::test(1), now - Duration::from_secs(59))
             .await;
@@ -6431,13 +6439,13 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let state = AgentState::from_database_path(file.path());
+        let (state, clock) = state_with_test_clock(file.path());
         state
             .unlock(password("correct"), ScopeHash::test(1))
             .await
             .unwrap();
         state
-            .deny_scope_hash_at(ScopeHash::test(2), Instant::now() - Duration::from_secs(2))
+            .deny_scope_hash_at(ScopeHash::test(2), clock.instant() - Duration::from_secs(2))
             .await;
 
         assert!(!state.is_scope_denied(&ScopeHash::test(2)).await);
@@ -6445,11 +6453,11 @@ mod tests {
 
     #[tokio::test]
     async fn denial_ttl_update_applies_to_existing_entries() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         state.store_database_handle(database.clone()).await;
         state
-            .deny_scope_hash_at(ScopeHash::test(1), Instant::now() - Duration::from_secs(2))
+            .deny_scope_hash_at(ScopeHash::test(1), clock.instant() - Duration::from_secs(2))
             .await;
 
         state
@@ -6767,14 +6775,14 @@ mod tests {
 
     #[tokio::test]
     async fn settings_authorization_is_independent_and_uses_configured_ttl() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         state.store_database_handle(database.clone()).await;
         state
             .authorize_scope_hash_at_for_scope(
                 ScopeHash::test(1),
                 AccessScope::Settings,
-                Instant::now() - Duration::from_secs(2),
+                clock.instant() - Duration::from_secs(2),
             )
             .await;
 
@@ -6798,8 +6806,8 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_waits_for_settings_scope() {
-        let state = AgentState::from_database_path("missing.db");
-        let now = Instant::now();
+        let (state, clock) = state_with_test_clock("missing.db");
+        let now = clock.instant();
         state.store_database_handle(DbHandle::test()).await;
         state.store_password_verifier("correct").await;
         state
@@ -6928,8 +6936,8 @@ mod tests {
 
     #[tokio::test]
     async fn database_access_records_authorized_database_access() {
-        let state = AgentState::from_database_path("missing.db");
-        let old_access = Instant::now() - Duration::from_secs(60);
+        let (state, clock) = state_with_test_clock("missing.db");
+        let old_access = clock.instant() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
         state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
@@ -6948,8 +6956,8 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_check_does_not_record_authorized_database_access() {
-        let state = AgentState::from_database_path("missing.db");
-        let old_access = Instant::now() - Duration::from_secs(60);
+        let (state, clock) = state_with_test_clock("missing.db");
+        let old_access = clock.instant() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
         state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
@@ -6991,7 +6999,7 @@ mod tests {
 
     #[tokio::test]
     async fn lowered_auth_ttl_expires_existing_cached_authorization() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database
             .upsert_setting("user.authTtlSeconds".to_owned(), "1".to_owned())
@@ -6999,7 +7007,7 @@ mod tests {
             .unwrap();
         state.store_database_handle(database).await;
         state
-            .authorize_scope_hash_at(ScopeHash::test(1), Instant::now() - Duration::from_secs(2))
+            .authorize_scope_hash_at(ScopeHash::test(1), clock.instant() - Duration::from_secs(2))
             .await;
 
         assert_eq!(
@@ -7139,9 +7147,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_skips_cleanup_when_not_due() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
-        let now = Instant::now();
+        let now = clock.instant();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
         state.set_last_authorized_database_access(Some(now)).await;
@@ -7161,13 +7169,13 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_uses_configured_cleanup_interval() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database
             .upsert_setting("user.gcSeconds".to_owned(), "120".to_owned())
             .await
             .unwrap();
-        let now = Instant::now();
+        let now = clock.instant();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
         state.set_last_authorized_database_access(Some(now)).await;
@@ -7188,9 +7196,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_runs_cleanup_when_due() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
-        let now = Instant::now();
+        let now = clock.instant();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
         state.set_last_authorized_database_access(Some(now)).await;
@@ -7212,9 +7220,9 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_error_does_not_block_authorization_expiry_unload() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
-        let now = Instant::now();
+        let now = clock.instant();
         database.test_fail_next_cleanup_before_unload();
         state.store_database_handle(database).await;
         state.store_password_verifier("correct").await;
@@ -10300,7 +10308,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_removes_old_orphan_files_when_cleanup_due() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         let file_id = database.create_file(b"orphan".to_vec()).await.unwrap();
         let file_path = database.test_file_path(&file_id);
@@ -10308,7 +10316,7 @@ mod tests {
             .test_set_file_created_at(&file_id, super::now_timestamp() - 8 * 24 * 60 * 60)
             .await
             .unwrap();
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         state.store_database_handle(database).await;
         state.store_password_verifier("correct").await;
         state
@@ -10332,7 +10340,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_retains_recent_or_attached_files_when_cleanup_due() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database.create_dir("dir".to_owned()).await.unwrap();
         let recent_id = database.create_file(b"recent".to_vec()).await.unwrap();
@@ -10357,7 +10365,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         state.store_database_handle(database).await;
         state.store_password_verifier("correct").await;
         state
@@ -10383,7 +10391,7 @@ mod tests {
     #[tokio::test]
     async fn authorization_expiry_unload_removes_old_non_latest_versions_and_repairs_oldest_pointer_when_cleanup_due()
      {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database.create_dir("dir".to_owned()).await.unwrap();
         database
@@ -10422,7 +10430,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
         state
@@ -10470,7 +10478,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_removes_only_expired_trash_items_when_cleanup_due() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database.create_dir("Trash".to_owned()).await.unwrap();
         database.create_dir("Personal".to_owned()).await.unwrap();
@@ -10507,7 +10515,7 @@ mod tests {
             .await
             .unwrap();
 
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         let cleanup_at = last_access + AUTH_TTL;
         let boundary_cutoff = super::now_timestamp() - 180 * 24 * 60 * 60;
         database
@@ -10560,7 +10568,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_retention_settings_disable_trash_and_old_version_cleanup() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database
             .upsert_setting(
@@ -10618,7 +10626,7 @@ mod tests {
             .await
             .unwrap();
 
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
         state
@@ -10657,7 +10665,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_expiry_unload_keeps_latest_version_even_when_cleanup_due() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database.create_dir("dir".to_owned()).await.unwrap();
         database
@@ -10678,7 +10686,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         state.store_database_handle(database.clone()).await;
         state.store_password_verifier("correct").await;
         state
@@ -10722,7 +10730,7 @@ mod tests {
     #[tokio::test]
     async fn authorization_expiry_unload_orphans_files_after_old_version_cleanup_when_cleanup_due()
     {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database.create_dir("dir".to_owned()).await.unwrap();
         let old_id = database.create_file(b"old notes".to_vec()).await.unwrap();
@@ -10769,7 +10777,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let last_access = Instant::now();
+        let last_access = clock.instant();
         state.store_database_handle(database).await;
         state.store_password_verifier("correct").await;
         state

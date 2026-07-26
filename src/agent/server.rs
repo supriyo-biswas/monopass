@@ -131,6 +131,7 @@ fn database_routes(state: AgentState) -> Router<AgentState> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -143,12 +144,18 @@ mod tests {
     use tempfile::NamedTempFile;
     use tower::ServiceExt;
 
-    use crate::agent::clock::SuspendAwareInstant as Instant;
+    use crate::agent::clock::{SuspendAwareInstant as Instant, TestSuspendAwareClock};
     use crate::agent::models::AccessScope;
     use crate::agent::process::{ScopeHash, UltimateProcess};
     use crate::agent::state::{
         AgentState, DIR_DENY_OVERWRITE, DbHandle, ITEM_READ_MUSTAUTH, MAX_FILE_UPLOAD_BYTES,
     };
+
+    fn state_with_test_clock() -> (AgentState, Arc<TestSuspendAwareClock>) {
+        let clock = Arc::new(TestSuspendAwareClock::new(Duration::from_secs(10_000)));
+        let state = AgentState::from_database_path_with_clock("missing.db", clock.clone());
+        (state, clock)
+    }
 
     #[tokio::test]
     async fn locked_database_route_returns_access_denied() {
@@ -464,8 +471,8 @@ mod tests {
 
     #[tokio::test]
     async fn unlocked_database_route_refreshes_last_authorized_database_access() {
-        let state = AgentState::from_database_path("missing.db");
-        let last_access = Instant::now() - Duration::from_secs(60);
+        let (state, clock) = state_with_test_clock();
+        let last_access = clock.instant() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
         state.authorize_scope_hash(ScopeHash::test(1)).await;
         state

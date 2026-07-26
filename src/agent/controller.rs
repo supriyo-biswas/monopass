@@ -1065,11 +1065,12 @@ impl From<DbError> for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     #[cfg(any(
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant as StdInstant};
 
     use axum::body::Body;
@@ -1085,7 +1086,7 @@ mod tests {
         bearer_password, export_item, import_item, lock, parse_completion_kinds,
         send_upload_body_bytes, status, unlock_methods, validate_completion_prefix,
     };
-    use crate::agent::clock::SuspendAwareInstant as Instant;
+    use crate::agent::clock::{SuspendAwareInstant as Instant, TestSuspendAwareClock};
     #[cfg(any(
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
@@ -1101,6 +1102,12 @@ mod tests {
     use crate::agent::process::ProcessDisplay;
     use crate::agent::process::{DirectUnlockCaller, ScopeHash};
     use crate::agent::state::{AgentState, DbHandle, FILE_RECORD_PLAINTEXT_BYTES};
+
+    fn state_with_test_clock() -> (AgentState, Arc<TestSuspendAwareClock>) {
+        let clock = Arc::new(TestSuspendAwareClock::new(Duration::from_secs(10_000)));
+        let state = AgentState::from_database_path_with_clock("missing.db", clock.clone());
+        (state, clock)
+    }
 
     fn default_scope_query() -> Result<axum::extract::Query<AuthScopeQuery>, QueryRejection> {
         Ok(axum::extract::Query(AuthScopeQuery::default()))
@@ -1856,8 +1863,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_does_not_refresh_last_authorized_database_access() {
-        let state = AgentState::from_database_path("missing.db");
-        let last_access = Instant::now() - Duration::from_secs(60);
+        let (state, clock) = state_with_test_clock();
+        let last_access = clock.instant() - Duration::from_secs(60);
         state.store_database_handle(DbHandle::test()).await;
         state.authorize_scope_hash(ScopeHash::test(1)).await;
         state
@@ -1880,8 +1887,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_does_not_extend_auth_expiration() {
-        let state = AgentState::from_database_path("missing.db");
-        let authorized_at = Instant::now() - Duration::from_secs(899);
+        let (state, clock) = state_with_test_clock();
+        let authorized_at = clock.instant() - Duration::from_secs(899);
         let max_expires_at = authorized_at + Duration::from_secs(1);
         state.store_database_handle(DbHandle::test()).await;
         state
@@ -1915,12 +1922,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_with_expired_auth_returns_access_denied() {
-        let state = AgentState::from_database_path("missing.db");
+        let (state, clock) = state_with_test_clock();
         state.store_database_handle(DbHandle::test()).await;
         state
             .authorize_scope_hash_at(
                 ScopeHash::test(1),
-                Instant::now() - Duration::from_secs(900),
+                clock.instant() - Duration::from_secs(900),
             )
             .await;
 
