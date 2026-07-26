@@ -1,8 +1,10 @@
-# Git credential helper
+# Using monopass as a git credential cache
 
-`git-credential-monopass` lets Git store and retrieve HTTPS credentials through
-the monopass agent. Copy the following script to
-`~/.local/bin/git-credential-monopass`:
+By default, git asks your username and password for all authenticated operations. To avoid this, you can use monopass as a credential helper.
+
+## Install the helper
+
+Save this script as `~/.local/bin/git-credential-monopass`:
 
 ```sh
 #!/bin/sh
@@ -39,7 +41,8 @@ item_exists() {
 case "$action" in
     get)
         credential_path=$credential_base
-        if [ "$have_username" = true ] && item_exists "${credential_base}_${username}"; then
+        if [ "$have_username" = true ] &&
+            item_exists "${credential_base}_${username}"; then
             credential_path="${credential_base}_${username}"
         elif ! item_exists "$credential_base"; then
             exit 0
@@ -72,16 +75,19 @@ case "$action" in
                 fi
             fi
         else
-            [ "$have_username" = true ] && [ "$have_password" = true ] || exit 0
-            printf '%s\n' "$password" | monopass add "$credential_path" \
-                --username "$username" \
-                --field password \
-                --concealed-fields password
+            [ "$have_username" = true ] &&
+                [ "$have_password" = true ] || exit 0
+            printf '%s\n' "$password" |
+                monopass add "$credential_path" \
+                    --username "$username" \
+                    --field password \
+                    --concealed-fields password
         fi
         ;;
     erase)
         credential_path=$credential_base
-        if [ "$have_username" = true ] && item_exists "${credential_base}_${username}"; then
+        if [ "$have_username" = true ] &&
+            item_exists "${credential_base}_${username}"; then
             credential_path="${credential_base}_${username}"
         elif ! item_exists "$credential_base"; then
             exit 0
@@ -94,37 +100,56 @@ case "$action" in
 esac
 ```
 
-Make the helper executable, create its default directory, and register it
-globally with Git:
+Make the helper private and executable, create its item directory, and register it globally:
 
 ```sh
-mkdir -p ~/.local/bin
-chmod 700 ~/.local/bin/git-credential-monopass
+chmod 700 "$HOME/.local/bin/git-credential-monopass"
 monopass mkdir -p GitCredentials
-git config --global credential.helper "$HOME/.local/bin/git-credential-monopass"
+git config --global credential.helper \
+    "$HOME/.local/bin/git-credential-monopass"
 ```
 
-Verify the registration with:
+## Let Git store the first token
+
+On the next authenticated fetch, enter your username and token:
+
+```
+$ git fetch origin
+Username for 'https://github.com': your-name
+Password for 'https://your-name@github.com':
+From https://github.com/acme/deploy
+ * [new branch]      main       -> origin/main
+```
+
+Git passes both values to the helper on stdin. The helper stores a concealed
+item that you can inspect safely:
+
+```
+$ monopass show GitCredentials/https_github.com_your-name
+Name: https_github.com_your-name
+Created: 2026-07-25T11:07:31Z
+Updated: 2026-07-25T11:07:31Z
+Versions: 1
+Fields:
+  password: ******
+  username: your-name
+```
+
+A later fetch retrieves the credential without prompting:
+
+```
+$ git fetch origin
+# no output: the repository was already current
+```
+
+## Limit the helper to one repository
+
+The setup above applies globally. To scope it to one repository, remove the
+global entry, enter the repository, and configure a local absolute helper path:
 
 ```sh
-git config --global --get-all credential.helper
+git config --global --unset-all credential.helper
+cd "$HOME/src/acme-deploy"
+git config --local credential.helper \
+    "$HOME/.local/bin/git-credential-monopass"
 ```
-
-On the first authenticated Git operation, Git prompts for the username and
-password and asks the helper to store them. By default, an HTTPS credential for
-the GitHub username `supriyo-biswas` is stored as
-`GitCredentials/https_github.com_supriyo-biswas`, with fields named `username`
-and `password`. Later operations read those fields automatically.
-
-Git maps `get` to field reads, `store` to item creation or editing, and `erase`
-to a normal removal that moves the item to `Trash` for recovery. Credentials are
-saved in the `GitCredentials` directory; change that name in `credential_base`
-in the script if you prefer another directory.
-
-When Git supplies a username, the helper first looks for the username-specific
-item and then falls back to the legacy host-only item, such as
-`GitCredentials/https_github.com`. Stores use the username-specific item. Erase
-removes it when present, or removes the host-only fallback otherwise.
-
-To configure the helper for only one repository, run the `git config` command
-without `--global` from that repository.

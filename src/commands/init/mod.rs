@@ -69,7 +69,7 @@ pub fn run(config: &Config, args: Args) -> AppResult {
     }
 
     if should_configure_auto_start(args.auto_start)? {
-        autostart::enable_agent(config.listen_path())?;
+        autostart::enable_agent(config.listen_path()).map_err(auto_start_configuration_error)?;
         println!("Configured agent auto-start");
     }
 
@@ -93,10 +93,17 @@ fn prompt_auto_start() -> io::Result<bool> {
     prompt_confirmation("Configure agent auto-start? [y/n] ")
 }
 
+fn auto_start_configuration_error(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("auto-start configuration failed: {error}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
+    use std::{fs, io};
 
     use super::{Args, AutoStart, run};
     use crate::config::Config;
@@ -129,5 +136,19 @@ mod tests {
         assert!(config.database_path().exists());
         assert!(!config.file_store_path().exists());
         assert!(!config.job_store_path().exists());
+    }
+
+    #[test]
+    fn prefixes_auto_start_configuration_errors() {
+        let error = super::auto_start_configuration_error(io::Error::new(
+            io::ErrorKind::NotFound,
+            "systemctl was not found",
+        ));
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "auto-start configuration failed: systemctl was not found"
+        );
     }
 }
