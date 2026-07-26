@@ -186,7 +186,7 @@ monopass write-setting <name> <value>
 
 All settings commands require settings-scoped process-lineage authorization and
 use the settings unlock discovery flow. Names are exact full setting names such
-as `user.trustedProgramPaths`; the CLI does not add a `user.` prefix.
+as `agent.trustedProgramPaths`; the CLI does not add an `agent.` prefix.
 
 `ls-settings` calls `GET /api/v1/settings`, sorts the response by name, and
 prints one tab-separated `<name>\t<value>` row per setting. `read-setting` calls
@@ -198,13 +198,13 @@ the name is absent. Both commands append a newline to each printed value.
 argument is passed through unchanged. It produces no output on success. The
 agent remains responsible for rejecting unknown settings and invalid values.
 
-The retention settings `user.autoDeleteTrashItemsAfterSeconds` and
-`user.autoDeleteOldVersionsAfterSeconds` default to `15552000` seconds (180
+The retention settings `agent.autoDeleteTrashItemsAfterSeconds` and
+`agent.autoDeleteOldVersionsAfterSeconds` default to `15552000` seconds (180
 days), accept values from `0` through `157680000` seconds (five 365-day years),
 and use `0` to disable their respective cleanup category. Trash retention is
 measured from an item's current `updated_at`; moving or renaming it within Trash
 refreshes that timestamp and postpones deletion. Cleanup is best-effort on
-authorization-expiry unloads at the `user.gcSeconds` cadence.
+authorization-expiry unloads at the `agent.gcSeconds` cadence.
 
 ## init command
 
@@ -287,10 +287,19 @@ field/file precedence, TOTP behavior, checksum verification, and unlock retry
 behavior are the same as for `read`.
 
 This command is present only in macOS builds and Linux builds using the `gtk`
-or `qt` feature. On macOS it writes the reference bytes to `/usr/bin/pbcopy`.
-On Linux it writes them to `xclip -selection clipboard`, resolving `xclip` only
-at `/usr/local/bin/xclip` or `/usr/bin/xclip`, in that order. Fail if no
-supported clipboard command exists or if the command exits unsuccessfully.
+or `qt` feature. The reference value must be valid UTF-8. The command writes it
+through the native clipboard API and fails without changing the clipboard when
+the value is not UTF-8 or the current display does not support clipboard
+access. Linux builds request the standard password-manager clipboard-history
+exclusion hint where supported.
+
+After copying, print `Clearing clipboard after X seconds...` once to stderr and
+remain in the foreground. `cli.clearClipboardAfterSeconds` supplies `X`,
+defaults to `30`, and accepts integer seconds from `10` through `300`. When the
+duration elapses or the user presses Ctrl+C, read the current clipboard and
+clear it only if its text exactly matches the copied value. Preserve replacement
+text and exit successfully. Preserve the clipboard and fail if its contents
+cannot be read as text; also fail if an unchanged value cannot be cleared.
 
 ## run command
 

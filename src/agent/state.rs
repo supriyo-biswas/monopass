@@ -41,8 +41,8 @@ use crate::db;
 use crate::settings::{
     AUTH_TTL_SETTING, AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
     AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING,
-    SETTINGS_AUTH_TTL_SETTING, SettingsError, TRUSTED_PROGRAM_PATHS_SETTING,
-    trusted_program_path_matcher, user_setting,
+    SETTINGS_AUTH_TTL_SETTING, SettingsError, TRUSTED_PROGRAM_PATHS_SETTING, setting,
+    trusted_program_path_matcher,
 };
 
 const SCOPE_CACHE_CAPACITY: usize = 32;
@@ -240,11 +240,11 @@ impl AgentState {
                 return Err(UnlockError::AccessDenied);
             }
             let auth_ttl = database
-                .user_setting_duration(auth_ttl_setting(access_scope))
+                .setting_duration(auth_ttl_setting(access_scope))
                 .await
                 .map_err(|_| UnlockError::AccessDenied)?;
             let denial_ttl = database
-                .user_setting_duration(DENIAL_TTL_SETTING)
+                .setting_duration(DENIAL_TTL_SETTING)
                 .await
                 .map_err(|_| UnlockError::AccessDenied)?;
             let mut inner = self.inner.lock().await;
@@ -290,11 +290,11 @@ impl AgentState {
             return Err(UnlockError::AccessDenied);
         }
         let auth_ttl = handle
-            .user_setting_duration(auth_ttl_setting(access_scope))
+            .setting_duration(auth_ttl_setting(access_scope))
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
         let denial_ttl = handle
-            .user_setting_duration(DENIAL_TTL_SETTING)
+            .setting_duration(DENIAL_TTL_SETTING)
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
         let now = self.clock.now().ok_or(UnlockError::AccessDenied)?;
@@ -371,7 +371,7 @@ impl AgentState {
     ) -> Option<SuspendAwareInstant> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
-            .user_setting_duration(auth_ttl_setting(access_scope))
+            .setting_duration(auth_ttl_setting(access_scope))
             .await
             .ok()?;
         let now = self.clock.now()?;
@@ -447,7 +447,7 @@ impl AgentState {
             .contains(scope_hash, now, denial_ttl)
     }
 
-    pub async fn upsert_user_setting(
+    pub async fn upsert_setting(
         &self,
         database: &DbHandle,
         name: String,
@@ -455,7 +455,7 @@ impl AgentState {
     ) -> Result<(), DbError> {
         let denial_ttl = if name == DENIAL_TTL_SETTING {
             Some(
-                user_setting(&name)
+                setting(&name)
                     .and_then(|setting| setting.parse_duration(&value))
                     .map_err(map_settings_error)?,
             )
@@ -492,7 +492,7 @@ impl AgentState {
     ) -> Option<DbHandle> {
         let database = self.inner.lock().await.database.clone()?;
         let auth_ttl = database
-            .user_setting_duration(auth_ttl_setting(access_scope))
+            .setting_duration(auth_ttl_setting(access_scope))
             .await
             .ok()?;
 
@@ -518,24 +518,21 @@ impl AgentState {
             return false;
         };
         let auth_ttl = database
-            .user_setting_duration(AUTH_TTL_SETTING)
+            .setting_duration(AUTH_TTL_SETTING)
             .await
             .unwrap_or(Duration::ZERO);
         let settings_auth_ttl = database
-            .user_setting_duration(SETTINGS_AUTH_TTL_SETTING)
+            .setting_duration(SETTINGS_AUTH_TTL_SETTING)
             .await
             .unwrap_or(Duration::ZERO);
-        let gc_interval = database
-            .user_setting_duration(GC_SECONDS_SETTING)
-            .await
-            .ok();
+        let gc_interval = database.setting_duration(GC_SECONDS_SETTING).await.ok();
         let trash_retention = database
-            .user_setting_duration(AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING)
+            .setting_duration(AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING)
             .await
             .ok()
             .filter(|duration| !duration.is_zero());
         let version_retention = database
-            .user_setting_duration(AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING)
+            .setting_duration(AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING)
             .await
             .ok()
             .filter(|duration| !duration.is_zero());
@@ -794,7 +791,7 @@ struct InnerState {
 impl Default for InnerState {
     fn default() -> Self {
         let denial_ttl_setting =
-            user_setting(DENIAL_TTL_SETTING).expect("denial ttl setting must be registered");
+            setting(DENIAL_TTL_SETTING).expect("denial ttl setting must be registered");
         let denial_ttl = denial_ttl_setting
             .parse_duration(denial_ttl_setting.default)
             .expect("default denial ttl must be valid");
@@ -1318,6 +1315,11 @@ impl DbHandle {
             .await
     }
 
+    pub async fn get_setting(&self, name: String) -> Result<String, DbError> {
+        self.request_reader(|reply| DbCommand::GetSetting { name, reply })
+            .await
+    }
+
     pub async fn upsert_setting(&self, name: String, value: String) -> Result<(), DbError> {
         self.request_writer(|reply| DbCommand::UpsertSetting { name, value, reply })
             .await
@@ -1403,9 +1405,9 @@ impl DbHandle {
             .await
     }
 
-    async fn user_setting_duration(&self, name: &str) -> Result<Duration, DbError> {
+    async fn setting_duration(&self, name: &str) -> Result<Duration, DbError> {
         let name = name.to_owned();
-        self.request_reader(|reply| DbCommand::GetUserSettingDuration { name, reply })
+        self.request_reader(|reply| DbCommand::GetSettingDuration { name, reply })
             .await
     }
 
@@ -1605,7 +1607,7 @@ impl DbHandle {
         let _ = std::fs::remove_dir_all(&file_store_path);
         std::fs::create_dir_all(&file_store_path).unwrap();
         insert_test_file_key(&connection);
-        insert_test_user_settings(&connection);
+        insert_test_settings(&connection);
         Self::new(connection, readers, file_store_path)
     }
 
@@ -2008,6 +2010,10 @@ enum DbCommand {
     ListSettings {
         reply: oneshot::Sender<Result<HashMap<String, String>, DbError>>,
     },
+    GetSetting {
+        name: String,
+        reply: oneshot::Sender<Result<String, DbError>>,
+    },
     UpsertSetting {
         name: String,
         value: String,
@@ -2052,7 +2058,7 @@ enum DbCommand {
         email: String,
         reply: oneshot::Sender<Result<String, DbError>>,
     },
-    GetUserSettingDuration {
+    GetSettingDuration {
         name: String,
         reply: oneshot::Sender<Result<Duration, DbError>>,
     },
@@ -2283,6 +2289,9 @@ impl DatabaseWorker {
             DbCommand::ListSettings { reply } => {
                 let _ = reply.send(self.list_settings());
             }
+            DbCommand::GetSetting { name, reply } => {
+                let _ = reply.send(self.get_setting(&name));
+            }
             DbCommand::UpsertSetting { name, value, reply } => {
                 let _ = reply.send(self.upsert_setting(&name, &value));
             }
@@ -2335,8 +2344,8 @@ impl DatabaseWorker {
             DbCommand::ContactPublicKey { email, reply } => {
                 let _ = reply.send(self.contact_public_key(&email));
             }
-            DbCommand::GetUserSettingDuration { name, reply } => {
-                let _ = reply.send(self.user_setting_duration(&name));
+            DbCommand::GetSettingDuration { name, reply } => {
+                let _ = reply.send(self.setting_duration(&name));
             }
             DbCommand::CleanupBeforeUnload {
                 trash_cutoff,
@@ -2964,7 +2973,7 @@ impl DatabaseWorker {
                 r#"
                 SELECT name, value
                 FROM system_settings
-                WHERE name LIKE 'user.%'
+                WHERE name LIKE 'agent.%' OR name LIKE 'cli.%'
                 ORDER BY name
                 "#,
             )
@@ -2978,8 +2987,23 @@ impl DatabaseWorker {
             .map_err(|_| DbError::Internal)
     }
 
+    fn get_setting(&self, name: &str) -> Result<String, DbError> {
+        if !(name.starts_with("agent.") || name.starts_with("cli.")) {
+            return Err(setting_not_found(name));
+        }
+        self.connection
+            .query_row(
+                "SELECT value FROM system_settings WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| DbError::Internal)?
+            .ok_or_else(|| setting_not_found(name))
+    }
+
     fn upsert_setting(&self, name: &str, value: &str) -> Result<(), DbError> {
-        let setting = user_setting(name).map_err(|error| map_named_settings_error(error, name))?;
+        let setting = setting(name).map_err(|error| map_named_settings_error(error, name))?;
         let value = setting.normalize(value).map_err(map_settings_error)?;
         self.connection
             .execute(
@@ -3206,8 +3230,8 @@ impl DatabaseWorker {
         Ok(Zeroizing::new(key.to_owned()))
     }
 
-    fn user_setting_duration(&self, name: &str) -> Result<Duration, DbError> {
-        let setting = user_setting(name).map_err(|error| map_named_settings_error(error, name))?;
+    fn setting_duration(&self, name: &str) -> Result<Duration, DbError> {
+        let setting = setting(name).map_err(|error| map_named_settings_error(error, name))?;
         let value: String = self
             .connection
             .query_row(
@@ -4276,6 +4300,10 @@ fn job_not_found(job_id: &str) -> DbError {
     DbError::not_found(format!("job `{job_id}` not found"))
 }
 
+fn setting_not_found(name: &str) -> DbError {
+    DbError::not_found(format!("setting `{name}` not found"))
+}
+
 fn reference_not_found(dir_name: &str, item_name: &str, field_name: &str) -> DbError {
     DbError::not_found(format!(
         "reference `{dir_name}/{item_name}/{field_name}` not found"
@@ -4875,7 +4903,7 @@ fn map_settings_error(error: SettingsError) -> DbError {
 fn map_named_settings_error(error: SettingsError, name: &str) -> DbError {
     match error {
         SettingsError::InvalidValue => DbError::BadRequest("invalid setting value".to_owned()),
-        SettingsError::UnknownSetting => DbError::not_found(format!("setting `{name}` not found")),
+        SettingsError::UnknownSetting => setting_not_found(name),
     }
 }
 
@@ -5135,8 +5163,8 @@ fn insert_test_internal_key_item(
 }
 
 #[cfg(test)]
-fn insert_test_user_settings(connection: &Connection) {
-    for setting in crate::settings::USER_SETTINGS {
+fn insert_test_settings(connection: &Connection) {
+    for setting in crate::settings::SETTINGS {
         connection
             .execute(
                 "INSERT INTO system_settings (name, value) VALUES (?1, ?2)",
@@ -5144,6 +5172,12 @@ fn insert_test_user_settings(connection: &Connection) {
             )
             .unwrap();
     }
+    connection
+        .execute(
+            "INSERT INTO system_settings (name, value) VALUES ('cli.testSetting', 'test-value')",
+            [],
+        )
+        .unwrap();
 }
 
 fn encrypt_chunk_record(
@@ -6433,7 +6467,7 @@ mod tests {
             crate::db::open_encrypted_database_with_password(file.path(), "correct").unwrap();
         connection
             .execute(
-                "UPDATE system_settings SET value = '1' WHERE name = 'user.denialTtlSeconds'",
+                "UPDATE system_settings SET value = '1' WHERE name = 'agent.denialTtlSeconds'",
                 [],
             )
             .unwrap();
@@ -6461,9 +6495,9 @@ mod tests {
             .await;
 
         state
-            .upsert_user_setting(
+            .upsert_setting(
                 &database,
-                "user.denialTtlSeconds".to_owned(),
+                "agent.denialTtlSeconds".to_owned(),
                 "1".to_owned(),
             )
             .await
@@ -6794,7 +6828,7 @@ mod tests {
         );
 
         database
-            .upsert_setting("user.settingsAuthTtlSeconds".to_owned(), "1".to_owned())
+            .upsert_setting("agent.settingsAuthTtlSeconds".to_owned(), "1".to_owned())
             .await
             .unwrap();
         assert!(
@@ -7002,7 +7036,7 @@ mod tests {
         let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database
-            .upsert_setting("user.authTtlSeconds".to_owned(), "1".to_owned())
+            .upsert_setting("agent.authTtlSeconds".to_owned(), "1".to_owned())
             .await
             .unwrap();
         state.store_database_handle(database).await;
@@ -7172,7 +7206,7 @@ mod tests {
         let (state, clock) = state_with_test_clock("missing.db");
         let database = DbHandle::test();
         database
-            .upsert_setting("user.gcSeconds".to_owned(), "120".to_owned())
+            .upsert_setting("agent.gcSeconds".to_owned(), "120".to_owned())
             .await
             .unwrap();
         let now = clock.instant();
@@ -7404,7 +7438,7 @@ mod tests {
             crate::settings::AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING,
             crate::settings::AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
         ] {
-            let setting = crate::settings::user_setting(name).unwrap();
+            let setting = crate::settings::setting(name).unwrap();
             assert!(setting.validate(setting.default).is_ok());
             assert!(setting.validate("0").is_ok());
             assert!(setting.validate("157680000").is_ok());
@@ -7445,45 +7479,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_worker_lists_and_updates_user_settings_only() {
+    async fn database_worker_lists_and_updates_settings() {
         let database = DbHandle::test();
 
         database
-            .upsert_setting("user.authTtlSeconds".to_owned(), "1200".to_owned())
+            .upsert_setting("agent.authTtlSeconds".to_owned(), "1200".to_owned())
             .await
             .unwrap();
         let settings = database.list_settings().await.unwrap();
 
         assert_eq!(
             Some(&"1200".to_owned()),
-            settings.get("user.authTtlSeconds")
+            settings.get("agent.authTtlSeconds")
         );
         assert_eq!(
             Some(&"300".to_owned()),
-            settings.get("user.settingsAuthTtlSeconds")
+            settings.get("agent.settingsAuthTtlSeconds")
         );
         assert_eq!(
             Some(&"60".to_owned()),
-            settings.get("user.denialTtlSeconds")
+            settings.get("agent.denialTtlSeconds")
         );
-        assert_eq!(Some(&"3600".to_owned()), settings.get("user.gcSeconds"));
+        assert_eq!(Some(&"3600".to_owned()), settings.get("agent.gcSeconds"));
         assert_eq!(
             Some(&"15552000".to_owned()),
-            settings.get("user.autoDeleteTrashItemsAfterSeconds")
+            settings.get("agent.autoDeleteTrashItemsAfterSeconds")
         );
         assert_eq!(
             Some(&"15552000".to_owned()),
-            settings.get("user.autoDeleteOldVersionsAfterSeconds")
+            settings.get("agent.autoDeleteOldVersionsAfterSeconds")
         );
         assert_eq!(
             Some(&"[]".to_owned()),
-            settings.get("user.trustedProgramPaths")
+            settings.get("agent.trustedProgramPaths")
+        );
+        assert_eq!(
+            Some(&"30".to_owned()),
+            settings.get("cli.clearClipboardAfterSeconds")
+        );
+        assert_eq!(
+            Some(&"test-value".to_owned()),
+            settings.get("cli.testSetting")
         );
         assert!(!settings.contains_key("sys.fileEncryptionKey"));
 
+        assert_eq!(
+            "test-value",
+            database
+                .get_setting("cli.testSetting".to_owned())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            Err(DbError::NotFoundMessage(
+                "setting `user.authTtlSeconds` not found".to_owned()
+            )),
+            database.get_setting("user.authTtlSeconds".to_owned()).await
+        );
+
         database
             .upsert_setting(
-                "user.trustedProgramPaths".to_owned(),
+                "agent.trustedProgramPaths".to_owned(),
                 r#"["", "relative", "relative"]"#.to_owned(),
             )
             .await
@@ -7491,7 +7547,7 @@ mod tests {
         let settings = database.list_settings().await.unwrap();
         assert_eq!(
             Some(&r#"["","relative","relative"]"#.to_owned()),
-            settings.get("user.trustedProgramPaths")
+            settings.get("agent.trustedProgramPaths")
         );
     }
 
@@ -7642,13 +7698,13 @@ mod tests {
         assert_eq!(
             Err(DbError::BadRequest("invalid setting value".to_owned())),
             database
-                .upsert_setting("user.authTtlSeconds".to_owned(), "abc".to_owned())
+                .upsert_setting("agent.authTtlSeconds".to_owned(), "abc".to_owned())
                 .await
         );
         assert_eq!(
             Err(DbError::BadRequest("invalid setting value".to_owned())),
             database
-                .upsert_setting("user.authTtlSeconds".to_owned(), "604801".to_owned())
+                .upsert_setting("agent.authTtlSeconds".to_owned(), "604801".to_owned())
                 .await
         );
         assert_eq!(
@@ -7669,7 +7725,7 @@ mod tests {
             assert_eq!(
                 Err(DbError::BadRequest("invalid setting value".to_owned())),
                 database
-                    .upsert_setting("user.trustedProgramPaths".to_owned(), value.to_owned())
+                    .upsert_setting("agent.trustedProgramPaths".to_owned(), value.to_owned())
                     .await
             );
         }
@@ -11058,7 +11114,7 @@ mod tests {
         let connection = crate::db::open_encrypted_database_with_password(path, password).unwrap();
         connection
             .execute(
-                "UPDATE system_settings SET value = ?1 WHERE name = 'user.trustedProgramPaths'",
+                "UPDATE system_settings SET value = ?1 WHERE name = 'agent.trustedProgramPaths'",
                 [value],
             )
             .unwrap();

@@ -132,7 +132,7 @@ Concurrent GUI unlock requests are shown as separate dialogs.
 
 Clicking the explicit **Deny** button returns `403 temporary_lockout` and caches
 that result for the process-lineage and access-scope pair for
-`user.denialTtlSeconds`. Later GUI unlock requests for that pair fail with the
+`agent.denialTtlSeconds`. Later GUI unlock requests for that pair fail with the
 same error without opening a dialog until the cache entry expires. Escape,
 window close, backend failure, and
 wrong-password submission do not populate the denial cache.
@@ -155,7 +155,7 @@ It is the migrated form of the older `/auth/unlock` behavior. It validates the
 bearer master password, opens or verifies the unlocked database, and authorizes
 the caller's process lineage for only the requested access scope.
 
-Direct unlock is restricted by `user.trustedProgramPaths`. Policy uses the
+Direct unlock is restricted by `agent.trustedProgramPaths`. Policy uses the
 ultimate executable in the verified process lineage—the process connected
 directly to the Unix socket—not the process selected for GUI display. An
 ultimate executable with the same file identity as the running agent is always
@@ -198,4 +198,7 @@ API clients accessing settings use the same retry sequence with
 `scope=settings`, then retry the settings request without a bearer password.
 The built-in `ls-settings`, `read-setting`, and `write-setting` commands use
 settings API paths and therefore follow this settings-scoped flow. Other
-built-in command flows remain item-scoped.
+built-in command flows remain item-scoped. The agent also accepts an existing
+items-scoped authorization for an exact `GET /api/v1/settings/{name}` when the
+decoded name begins with `cli.`; the built-in settings commands do not select
+or otherwise depend on this exception.

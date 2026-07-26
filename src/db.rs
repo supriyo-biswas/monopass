@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::AppResult;
 #[cfg(debug_assertions)]
 use crate::config::Config;
-use crate::settings::USER_SETTINGS;
+use crate::settings::SETTINGS;
 
 const SCHEMA: &str = r#"
 CREATE TABLE system_settings (
@@ -117,6 +117,24 @@ const ITEM_HIDDEN: i64 = 1 << 0;
 const ITEM_READ_MUSTAUTH: i64 = 1 << 1;
 pub(crate) const DATABASE_SCHEMA_VERSION: i64 = 3;
 const BREAKING_SCHEMA_VERSION: i64 = 3;
+const LEGACY_SETTING_NAMES: &[(&str, &str)] = &[
+    ("user.authTtlSeconds", "agent.authTtlSeconds"),
+    (
+        "user.settingsAuthTtlSeconds",
+        "agent.settingsAuthTtlSeconds",
+    ),
+    ("user.denialTtlSeconds", "agent.denialTtlSeconds"),
+    ("user.gcSeconds", "agent.gcSeconds"),
+    (
+        "user.autoDeleteTrashItemsAfterSeconds",
+        "agent.autoDeleteTrashItemsAfterSeconds",
+    ),
+    (
+        "user.autoDeleteOldVersionsAfterSeconds",
+        "agent.autoDeleteOldVersionsAfterSeconds",
+    ),
+    ("user.trustedProgramPaths", "agent.trustedProgramPaths"),
+];
 
 #[derive(Debug)]
 pub enum DatabaseOpenError {
@@ -176,7 +194,8 @@ pub fn open_encrypted_database_with_password(
     configure_open_connection(&conn)?;
     migrate_compatible_database(&conn)?;
     require_current_schema(&conn)?;
-    insert_missing_user_setting_defaults(&conn)?;
+    migrate_setting_names(&conn)?;
+    insert_missing_setting_defaults(&conn)?;
 
     Ok(conn)
 }
@@ -217,7 +236,7 @@ pub(crate) fn create_encrypted_database_with_password(
     create_default_dirs(&conn)?;
     create_file_encryption_key_item(&conn)?;
     create_age_keypair_items(&conn)?;
-    create_default_user_settings(&conn)?;
+    create_default_settings(&conn)?;
     conn.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
 
     Ok(())
@@ -306,8 +325,8 @@ fn insert_internal_key_item(
     Ok(())
 }
 
-fn create_default_user_settings(conn: &Connection) -> rusqlite::Result<()> {
-    for setting in USER_SETTINGS {
+fn create_default_settings(conn: &Connection) -> rusqlite::Result<()> {
+    for setting in SETTINGS {
         conn.execute(
             "INSERT INTO system_settings (name, value) VALUES (?1, ?2)",
             (setting.name, setting.default),
@@ -316,8 +335,8 @@ fn create_default_user_settings(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn insert_missing_user_setting_defaults(conn: &Connection) -> rusqlite::Result<()> {
-    for setting in USER_SETTINGS {
+fn insert_missing_setting_defaults(conn: &Connection) -> rusqlite::Result<()> {
+    for setting in SETTINGS {
         conn.execute(
             r#"
             INSERT INTO system_settings (name, value)
@@ -328,6 +347,24 @@ fn insert_missing_user_setting_defaults(conn: &Connection) -> rusqlite::Result<(
         )?;
     }
     Ok(())
+}
+
+fn migrate_setting_names(conn: &Connection) -> rusqlite::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    for (legacy_name, name) in LEGACY_SETTING_NAMES {
+        transaction.execute(
+            r#"
+            INSERT INTO system_settings (name, value)
+            SELECT ?2, value
+            FROM system_settings
+            WHERE name = ?1
+            ON CONFLICT(name) DO NOTHING
+            "#,
+            (legacy_name, name),
+        )?;
+        transaction.execute("DELETE FROM system_settings WHERE name = ?1", [legacy_name])?;
+    }
+    transaction.commit()
 }
 
 fn migrate_compatible_database(conn: &Connection) -> rusqlite::Result<()> {
@@ -381,12 +418,14 @@ pub(crate) fn migrate_encrypted_database_with_password(
         return Err(rusqlite::Error::InvalidQuery.into());
     }
     if version == DATABASE_SCHEMA_VERSION {
-        insert_missing_user_setting_defaults(&conn)?;
+        migrate_setting_names(&conn)?;
+        insert_missing_setting_defaults(&conn)?;
         return Ok(false);
     }
 
     migrate_fields_to_rows(&conn)?;
-    insert_missing_user_setting_defaults(&conn)?;
+    migrate_setting_names(&conn)?;
+    insert_missing_setting_defaults(&conn)?;
     Ok(true)
 }
 
@@ -658,13 +697,14 @@ mod tests {
         assert_internal_file_encryption_key_exists(&conn);
         assert_internal_age_keypair_exists(&conn);
         assert_setting_missing(&conn, "sys.fileEncryptionKey");
-        assert_setting_value(&conn, "user.authTtlSeconds", "900");
-        assert_setting_value(&conn, "user.settingsAuthTtlSeconds", "300");
-        assert_setting_value(&conn, "user.denialTtlSeconds", "60");
-        assert_setting_value(&conn, "user.gcSeconds", "3600");
-        assert_setting_value(&conn, "user.autoDeleteTrashItemsAfterSeconds", "15552000");
-        assert_setting_value(&conn, "user.autoDeleteOldVersionsAfterSeconds", "15552000");
-        assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
+        assert_setting_value(&conn, "agent.authTtlSeconds", "900");
+        assert_setting_value(&conn, "agent.settingsAuthTtlSeconds", "300");
+        assert_setting_value(&conn, "agent.denialTtlSeconds", "60");
+        assert_setting_value(&conn, "agent.gcSeconds", "3600");
+        assert_setting_value(&conn, "agent.autoDeleteTrashItemsAfterSeconds", "15552000");
+        assert_setting_value(&conn, "agent.autoDeleteOldVersionsAfterSeconds", "15552000");
+        assert_setting_value(&conn, "agent.trustedProgramPaths", "[]");
+        assert_setting_value(&conn, "cli.clearClipboardAfterSeconds", "30");
     }
 
     #[test]
@@ -711,6 +751,7 @@ mod tests {
         let conn = Connection::open(file.path()).unwrap();
         conn.pragma_update(None, "key", "correct").unwrap();
         super::downgrade_to_schema_two(&conn);
+        rename_settings_to_legacy(&conn);
         conn.execute(
             "UPDATE dirs SET bitmask = ?1 WHERE name = 'Trash'",
             [super::DIR_HIDDEN | super::DIR_DENY_OVERWRITE | (1_i64 << 8)],
@@ -739,23 +780,72 @@ mod tests {
             "Trash",
             super::DIR_HIDDEN | super::DIR_DENY_OVERWRITE | (1_i64 << 8),
         );
-        assert_setting_value(&conn, "user.authTtlSeconds", "900");
-        assert_setting_value(&conn, "user.settingsAuthTtlSeconds", "300");
-        assert_setting_value(&conn, "user.denialTtlSeconds", "60");
-        assert_setting_value(&conn, "user.gcSeconds", "3600");
-        assert_setting_value(&conn, "user.autoDeleteTrashItemsAfterSeconds", "0");
-        assert_setting_value(&conn, "user.autoDeleteOldVersionsAfterSeconds", "15552000");
-        assert_setting_value(&conn, "user.trustedProgramPaths", "[]");
+        assert_setting_value(&conn, "agent.authTtlSeconds", "900");
+        assert_setting_value(&conn, "agent.settingsAuthTtlSeconds", "300");
+        assert_setting_value(&conn, "agent.denialTtlSeconds", "60");
+        assert_setting_value(&conn, "agent.gcSeconds", "3600");
+        assert_setting_value(&conn, "agent.autoDeleteTrashItemsAfterSeconds", "0");
+        assert_setting_value(&conn, "agent.autoDeleteOldVersionsAfterSeconds", "15552000");
+        assert_setting_value(&conn, "agent.trustedProgramPaths", "[]");
+        assert_setting_value(&conn, "cli.clearClipboardAfterSeconds", "30");
+        for (legacy_name, _) in super::LEGACY_SETTING_NAMES {
+            assert_setting_missing(&conn, legacy_name);
+        }
     }
 
     #[test]
     fn explicit_migration_is_idempotent_for_current_schema() {
         let file = NamedTempFile::new().unwrap();
         super::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        conn.pragma_update(None, "key", "correct").unwrap();
+        rename_settings_to_legacy(&conn);
+        drop(conn);
 
         assert!(!super::migrate_encrypted_database_with_password(file.path(), "correct").unwrap());
         let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
         assert_eq!(3, pragma_i64(&conn, "user_version"));
+        assert_setting_value(&conn, "agent.authTtlSeconds", "900");
+        assert_setting_missing(&conn, "user.authTtlSeconds");
+    }
+
+    #[test]
+    fn opening_current_database_migrates_legacy_setting_names_inline() {
+        let file = NamedTempFile::new().unwrap();
+        super::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        conn.pragma_update(None, "key", "correct").unwrap();
+        rename_settings_to_legacy(&conn);
+        conn.execute(
+            "UPDATE system_settings SET value = '120' WHERE name = 'user.gcSeconds'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_settings (name, value) VALUES ('agent.authTtlSeconds', '2400')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM system_settings WHERE name = 'cli.clearClipboardAfterSeconds'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
+        assert_eq!(3, pragma_i64(&conn, "user_version"));
+        assert_setting_value(&conn, "agent.authTtlSeconds", "2400");
+        assert_setting_value(&conn, "agent.gcSeconds", "120");
+        assert_setting_value(&conn, "cli.clearClipboardAfterSeconds", "30");
+        for (legacy_name, _) in super::LEGACY_SETTING_NAMES {
+            assert_setting_missing(&conn, legacy_name);
+        }
+        drop(conn);
+
+        let conn = super::open_encrypted_database_with_password(file.path(), "correct").unwrap();
+        assert_setting_value(&conn, "agent.authTtlSeconds", "2400");
+        assert_setting_value(&conn, "agent.gcSeconds", "120");
     }
 
     #[test]
@@ -1028,6 +1118,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expected, value);
+    }
+
+    fn rename_settings_to_legacy(conn: &Connection) {
+        for (legacy_name, name) in super::LEGACY_SETTING_NAMES {
+            conn.execute(
+                "UPDATE system_settings SET name = ?1 WHERE name = ?2",
+                (legacy_name, name),
+            )
+            .unwrap();
+        }
     }
 
     fn sqlite_code(error: rusqlite::Error) -> rusqlite::ErrorCode {

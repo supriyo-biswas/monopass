@@ -2,9 +2,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes, HttpBody};
+use axum::extract::Path;
 use axum::extract::Request;
 use axum::extract::State;
 use axum::extract::connect_info::{ConnectInfo, Connected};
+use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::IncomingStream;
@@ -113,11 +115,39 @@ pub async fn require_settings_authorization(
     require_authorized_database(state, request, next, AccessScope::Settings).await
 }
 
+pub async fn require_setting_member_authorization(
+    State(state): State<AgentState>,
+    Path(name): Path<String>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if request.method() == Method::GET && name.starts_with("cli.") {
+        require_authorized_database_for_scopes(
+            state,
+            request,
+            next,
+            &[AccessScope::Items, AccessScope::Settings],
+        )
+        .await
+    } else {
+        require_authorized_database(state, request, next, AccessScope::Settings).await
+    }
+}
+
 async fn require_authorized_database(
+    state: AgentState,
+    request: Request,
+    next: Next,
+    access_scope: AccessScope,
+) -> Result<Response, ApiError> {
+    require_authorized_database_for_scopes(state, request, next, &[access_scope]).await
+}
+
+async fn require_authorized_database_for_scopes(
     state: AgentState,
     mut request: Request,
     next: Next,
-    access_scope: AccessScope,
+    access_scopes: &[AccessScope],
 ) -> Result<Response, ApiError> {
     let Some(scope_hash) = request.extensions().get::<ScopeHash>() else {
         return Err(ApiError::access_denied());
@@ -127,10 +157,17 @@ async fn require_authorized_database(
         return Err(ApiError::migration_needed());
     }
 
-    if let Some(database) = state
-        .authorize_database_access_for_scope(scope_hash, access_scope)
-        .await
-    {
+    let mut database = None;
+    for access_scope in access_scopes {
+        database = state
+            .authorize_database_access_for_scope(scope_hash, *access_scope)
+            .await;
+        if database.is_some() {
+            break;
+        }
+    }
+
+    if let Some(database) = database {
         let active_request = state.begin_active_database_request();
         request.extensions_mut().insert(database);
         let response = next.run(request).await;

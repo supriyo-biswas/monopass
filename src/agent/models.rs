@@ -218,6 +218,11 @@ pub struct UpdateSettingRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingResponse {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateContactRequest {
     pub name: Option<String>,
     #[serde(rename = "age_public_key")]

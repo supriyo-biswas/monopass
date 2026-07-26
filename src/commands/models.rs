@@ -36,6 +36,16 @@ pub struct ShellCompletionsResponse {
     pub truncated: bool,
 }
 
+#[cfg(any(
+    test,
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingResponse {
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirResponse {
     pub name: String,

@@ -82,15 +82,15 @@ mod tests {
     #[test]
     fn list_writes_sorted_name_value_rows() {
         let settings = BTreeMap::from([
-            ("user.trustedProgramPaths".to_owned(), "[]".to_owned()),
-            ("user.authTtlSeconds".to_owned(), "900".to_owned()),
+            ("agent.trustedProgramPaths".to_owned(), "[]".to_owned()),
+            ("agent.authTtlSeconds".to_owned(), "900".to_owned()),
         ]);
         let mut output = Vec::new();
 
         write_settings(&mut output, &settings).unwrap();
 
         assert_eq!(
-            b"user.authTtlSeconds\t900\nuser.trustedProgramPaths\t[]\n",
+            b"agent.authTtlSeconds\t900\nagent.trustedProgramPaths\t[]\n",
             output.as_slice()
         );
     }
@@ -98,29 +98,29 @@ mod tests {
     #[test]
     fn read_writes_exact_serialized_value() {
         let settings = BTreeMap::from([(
-            "user.trustedProgramPaths".to_owned(),
+            "agent.trustedProgramPaths".to_owned(),
             r#"["/usr/bin/example"]"#.to_owned(),
         )]);
         let mut output = Vec::new();
 
-        write_setting(&mut output, &settings, "user.trustedProgramPaths").unwrap();
+        write_setting(&mut output, &settings, "agent.trustedProgramPaths").unwrap();
 
         assert_eq!(b"[\"/usr/bin/example\"]\n", output.as_slice());
     }
 
     #[test]
     fn read_rejects_missing_setting() {
-        let error = write_setting(&mut Vec::new(), &BTreeMap::new(), "user.missing").unwrap_err();
+        let error = write_setting(&mut Vec::new(), &BTreeMap::new(), "agent.missing").unwrap_err();
 
         assert_eq!(io::ErrorKind::NotFound, error.kind());
-        assert_eq!("setting `user.missing` not found", error.to_string());
+        assert_eq!("setting `agent.missing` not found", error.to_string());
     }
 
     #[test]
     fn write_path_encodes_the_full_setting_name_and_preserves_the_value() {
         assert_eq!(
-            "/api/v1/settings/user.trustedProgramPaths%2Fchild",
-            setting_api_path("user.trustedProgramPaths/child")
+            "/api/v1/settings/agent.trustedProgramPaths%2Fchild",
+            setting_api_path("agent.trustedProgramPaths/child")
         );
         assert_eq!(
             r#"{"value":"[\"relative\"]"}"#,
