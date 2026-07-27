@@ -62,4 +62,4 @@ Fields:
 
 | Previous chapter | Next chapter |
 | --- | --- |
-| [Securing access to your vault](04-secure-access-to-your-vault.md) | [Connecting existing tools](06-connect-existing-tools.md) |
+| [Securing access to your vault](04-secure-access-to-your-vault.md) | [Scripting with the CLI](06-scripting-with-the-cli.md) |

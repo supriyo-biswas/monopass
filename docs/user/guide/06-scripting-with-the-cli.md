@@ -1,8 +1,10 @@
-# Connect existing tools
+# Scripting with the CLI
 
 You have a variety of ways of integrating monopass with other command line tools. This chapter discusses a few of them.
 
-While the earlier chapters describe commands like `ls`, `cp`, and `mv`, which already provide a surface for CLI integration, there are a few other commands that make scripting much easier. In addition, there are a few [recipes](#recipes) that you can use for easy integration with industry-standard tools, bypassing the need for custom scripts.
+While the earlier chapters describe commands like `ls`, `cp`, and `mv`, which already provide a surface for CLI integration, we'll note some additional features that make scripting much easier.
+
+Be sure to check the [recipes](../../../README.md#recipes) to see if there's an existing integration that you can use, bypassing the need for a custom script.
 
 ## Retrieve an item as JSON
 
@@ -19,6 +21,58 @@ This will print a JSON-formatted view, like this:
 ```
 
 Just as with the original show command, the concealed fields are masked, and you can use `--reveal` to show the values.
+
+## Piping secrets to `add` or `edit`
+
+When driving the `add` or `edit` commands via scripting, you might need to pipe in secrets from elsewhere. These commands accept inputs from stdin in the same order as the `--field` flags. You should mark any concealed fields with `--concealed-fields`, and the use of `--password` is discouraged because it only accepts input from a TTY.
+
+As an example, if you want to save a username and password from a script into an item called Personal/GitHub, with the `username`, `email` and `password` fields, and these values are coming from stdin, you might do something like:
+
+```sh
+printf '%s\n%s\n%s' \
+    my.user \
+    my.email@example.com \
+    MySuperStrongPassw0rd \
+    | monopass add Personal/GitHub \
+        --field username \
+        --field email \
+        --field password \
+        --concealed-fields password
+```
+
+For a more practical example, consider the `aws iam create-access-key --user-name myuser` command, which returns values like this:
+
+```json
+{
+    "AccessKey": {
+        "UserName": "myuser",
+        "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+        "Status": "Active",
+        "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "CreateDate": "2026-07-27T10:15:00Z"
+    }
+}
+```
+
+Let's say you're interested in saving the `AccessKeyId` and `SecretAccessKey` values. Begin by transforming the JSON into a series of lines. This can be done with `jq`:
+
+```
+$ aws iam create-access-key --user-name myuser | \
+    jq -r '.AccessKey.AccessKeyId + "\n" + .AccessKey.SecretAccessKey'
+AKIAIOSFODNN7EXAMPLE
+wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+You can now save this in monopass using the following command:
+
+```sh
+aws iam create-access-key --user-name myuser | \
+    jq -r '.AccessKey.AccessKeyId + "\n" + .AccessKey.SecretAccessKey' | \
+    monopass add Personal/AWSAccessKey \
+        --field aws_access_key_id \
+        --field aws_secret_access_key \
+        --concealed-fields aws_secret_access_key
+```
 
 ## Read a single field or file
 
@@ -44,7 +98,7 @@ As an example, imagine you have a `deploy-aws.sh` script that performs operation
 export AWS_ACCESS_KEY_ID=$(monopass read Work/AWSProdDeployKey/aws_access_key_id)
 export AWS_SECRET_ACCESS_KEY=$(monopass read Work/AWSProdDeployKey/aws_secret_access_key)
 
-# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are recognized by `aws`
+# `aws` expects credentials to be passed via AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
 aws ec2 create-instance ...
 ```
 
@@ -60,7 +114,7 @@ trap 'rm -f $GOOGLE_APPLICATION_CREDENTIALS || true' EXIT INT TERM HUP ERR
 # GOOGLE_APPLICATION_CREDENTIALS=/tmp/<randomId>.json
 monopass read Work/GoogleProdDeployKey/credentials.json -o $GOOGLE_APPLICATION_CREDENTIALS
 
-# GOOGLE_APPLICATION_CREDENTIALS is recognized by `gcloud`
+# `gcloud` expects the GOOGLE_APPLICATION_CREDENTIALS to be the path to a credentials file
 gcloud compute images ...
 ```
 
@@ -88,14 +142,6 @@ monopass run gcloud compute images ...
 ```
 
 You can also use this with a `.env` file; see [chapter 7](./07-env-files-and-references.md) for an example. 1Password-style references using `op://` instead of `pass://` are also understood.
-
-## Recipes
-
-Refer to the following recipes to learn how to integrate monopass with industry-standard tools:
-
-- [Git credential provider](../recipes/git-credential-cache.md): A helper that integrates with `git` to store credentials securely.
-- [Ansible Vault integration](../recipes/ansible-vault.md) for encrypting Ansible secrets using a vault password.
-- [AWS CLI external process integration](../recipes/aws-cli.md), to store credentials in monopass instead of `aws configure`, which uses plaintext.
 
 | Previous chapter | Next chapter |
 | --- | --- |

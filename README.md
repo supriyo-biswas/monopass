@@ -32,12 +32,14 @@ monopass show Personal/GitHub --reveal
 
 ## Documentation
 
+### User guide
+
 1. [Getting started](docs/user/guide/01-getting-started.md)
 2. [Creating and editing directories and items](docs/user/guide/02-creating-dirs-and-items.md)
 3. [Listing, moving, deleting and versioning items](docs/user/guide/03-listing-moving-deleting-versioning.md)
 4. [Secure access to your vault](docs/user/guide/04-secure-access-to-your-vault.md)
 5. [Sharing items](docs/user/guide/05-sharing-items.md)
-6. [Connect existing tools](docs/user/guide/06-connect-existing-tools.md)
+6. [Connect existing tools](docs/user/guide/06-scripting-with-the-cli.md)
 7. [`.env` files and references](docs/user/guide/07-env-files-and-references.md)
 8. [Use the local agent API](docs/user/guide/08-integrate-an-application.md)
 

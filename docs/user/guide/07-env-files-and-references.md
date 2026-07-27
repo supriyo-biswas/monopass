@@ -2,11 +2,11 @@
 
 It is common for many software projects to carry unencrypted secrets in their `.env` files, or worse, make use of hardcoded credentials. For local development, `monopass` provides a number of utilities to replace unencrypted secrets, as well as allowing you to run specific programs with said secrets.
 
-For sharing local development secrets with other users in a team environment, see [sharing a credential](./05-sharing-items.md).
+For sharing local development secrets with other users in a team environment, see [sharing items](./05-sharing-items.md).
 
 For production environments, you should continue to use a secret management system native to the deployment mechanism, such as [Kubernetes secrets](https://kubernetes.io/docs/concepts/configuration/secret/) or [AWS Secrets Manager](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html).
 
-For other ways of connecting local applications for development, see [connecting existing tools](./06-connect-existing-tools.md).
+For additional information on scripting use cases, see [chapter 6](./06-scripting-with-the-cli.md) and the [recipes](../../../README.md#recipes).
 
 ## Moving secrets from the `.env` file
 
@@ -20,7 +20,7 @@ AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
-The `OPENAI_API_KEY` and `APP_CLIENT_CERT` values are secrets and should be moved to monopass. Create a directory for your development secrets and store them there. In this example, we will store our secrets under `Work/MyAppDevSecrets`:
+The `OPENAI_API_KEY`, `APP_CLIENT_CERT`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are secrets and should be moved to monopass. Create a directory for your development secrets and store them there. In this example, we will store our secrets under `Work/MyAppDevSecrets`:
 
 ```sh
 monopass mkdir -p Work
@@ -56,4 +56,4 @@ The application can then use these environment variables.
 
 | Previous chapter | Next chapter |
 | --- | --- |
-| [Connecting existing tools](06-connect-existing-tools.md) | [Integrating an application](08-integrate-an-application.md) |
+| [Scripting with the CLI](06-scripting-with-the-cli.md) | [Integrating an application](08-integrate-an-application.md) |
