@@ -121,10 +121,20 @@ fn database_routes(state: AgentState) -> Router<AgentState> {
         .merge(
             Router::new()
                 .route("/api/v1/settings", get(controller::list_settings))
-                .route("/api/v1/settings/{name}", put(controller::update_setting))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth::require_settings_authorization,
+                )),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    "/api/v1/settings/{name}",
+                    get(controller::get_setting).put(controller::update_setting),
+                )
                 .route_layer(middleware::from_fn_with_state(
                     state,
-                    auth::require_settings_authorization,
+                    auth::require_setting_member_authorization,
                 )),
         )
 }
@@ -2520,7 +2530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_api_lists_and_updates_user_settings() {
+    async fn settings_api_lists_and_updates_registered_settings() {
         let state = settings_authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);
 
@@ -2536,13 +2546,15 @@ mod tests {
         assert_eq!(StatusCode::OK, response.status());
         assert_eq!(
             json!({
-                "user.authTtlSeconds":"900",
-                "user.autoDeleteOldVersionsAfterSeconds":"15552000",
-                "user.autoDeleteTrashItemsAfterSeconds":"15552000",
-                "user.denialTtlSeconds":"60",
-                "user.gcSeconds":"3600",
-                "user.settingsAuthTtlSeconds":"300",
-                "user.trustedProgramPaths":"[]"
+                "agent.authTtlSeconds":"900",
+                "agent.autoDeleteOldVersionsAfterSeconds":"15552000",
+                "agent.autoDeleteTrashItemsAfterSeconds":"15552000",
+                "agent.denialTtlSeconds":"60",
+                "agent.gcSeconds":"3600",
+                "agent.settingsAuthTtlSeconds":"300",
+                "agent.trustedProgramPaths":"[]",
+                "cli.clearClipboardAfterSeconds":"30",
+                "cli.testSetting":"test-value"
             }),
             json_body(response).await
         );
@@ -2551,7 +2563,7 @@ mod tests {
             .clone()
             .oneshot(json_request_with_hash_and_password(
                 "PUT",
-                "/api/v1/settings/user.authTtlSeconds",
+                "/api/v1/settings/agent.authTtlSeconds",
                 json!({"value":"1200"}),
                 ScopeHash::test(1),
                 "correct",
@@ -2565,7 +2577,7 @@ mod tests {
             .clone()
             .oneshot(json_request_with_hash_and_password(
                 "PUT",
-                "/api/v1/settings/user.autoDeleteTrashItemsAfterSeconds",
+                "/api/v1/settings/agent.autoDeleteTrashItemsAfterSeconds",
                 json!({"value":"0"}),
                 ScopeHash::test(1),
                 "correct",
@@ -2578,7 +2590,7 @@ mod tests {
             .clone()
             .oneshot(json_request_with_hash_and_password(
                 "PUT",
-                "/api/v1/settings/user.denialTtlSeconds",
+                "/api/v1/settings/agent.denialTtlSeconds",
                 json!({"value":"120"}),
                 ScopeHash::test(1),
                 "correct",
@@ -2592,7 +2604,7 @@ mod tests {
             .clone()
             .oneshot(json_request_with_hash(
                 "PUT",
-                "/api/v1/settings/user.settingsAuthTtlSeconds",
+                "/api/v1/settings/agent.settingsAuthTtlSeconds",
                 json!({"value":"600"}),
                 ScopeHash::test(1),
             ))
@@ -2604,8 +2616,20 @@ mod tests {
             .clone()
             .oneshot(json_request_with_hash(
                 "PUT",
-                "/api/v1/settings/user.trustedProgramPaths",
+                "/api/v1/settings/agent.trustedProgramPaths",
                 json!({"value":r#"["", "relative", "relative"]"#}),
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+
+        let response = router
+            .clone()
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/settings/cli.clearClipboardAfterSeconds",
+                json!({"value":"10"}),
                 ScopeHash::test(1),
             ))
             .await
@@ -2621,13 +2645,14 @@ mod tests {
             .await
             .unwrap();
         let body = json_body(response).await;
-        assert_eq!("1200", body["user.authTtlSeconds"]);
-        assert_eq!("120", body["user.denialTtlSeconds"]);
-        assert_eq!("600", body["user.settingsAuthTtlSeconds"]);
-        assert_eq!("0", body["user.autoDeleteTrashItemsAfterSeconds"]);
+        assert_eq!("1200", body["agent.authTtlSeconds"]);
+        assert_eq!("120", body["agent.denialTtlSeconds"]);
+        assert_eq!("600", body["agent.settingsAuthTtlSeconds"]);
+        assert_eq!("0", body["agent.autoDeleteTrashItemsAfterSeconds"]);
+        assert_eq!("10", body["cli.clearClipboardAfterSeconds"]);
         assert_eq!(
             r#"["","relative","relative"]"#,
-            body["user.trustedProgramPaths"]
+            body["agent.trustedProgramPaths"]
         );
     }
 
@@ -2664,6 +2689,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_setting_member_reads_accept_items_or_settings_authorization() {
+        let state = authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
+                "/api/v1/settings/cli.testSetting",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(json!({"value":"test-value"}), json_body(response).await);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/settings/cli%2EtestSetting",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(json!({"value":"test-value"}), json_body(response).await);
+
+        let state = settings_authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/settings/cli.testSetting",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(json!({"value":"test-value"}), json_body(response).await);
+    }
+
+    #[tokio::test]
+    async fn non_cli_setting_member_reads_and_all_writes_require_settings_authorization() {
+        let state = authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
+                "/api/v1/settings/agent.authTtlSeconds",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
+
+        let response = router
+            .oneshot(json_request_with_hash(
+                "PUT",
+                "/api/v1/settings/cli.clearClipboardAfterSeconds",
+                json!({"value":"60"}),
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
+
+        let state = settings_authorized_state().await;
+        let router = super::database_routes(state.clone()).with_state(state);
+        let response = router
+            .clone()
+            .oneshot(request_with_hash(
+                "/api/v1/settings/agent.authTtlSeconds",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(json!({"value":"900"}), json_body(response).await);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/settings/user.authTtlSeconds",
+                ScopeHash::test(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NOT_FOUND, response.status());
+        assert_eq!("not_found", json_body(response).await["error"]["code"]);
+    }
+
+    #[tokio::test]
     async fn settings_api_rejects_invalid_unknown_and_internal_settings() {
         let state = settings_authorized_state().await;
         let router = super::database_routes(state.clone()).with_state(state);
@@ -2673,7 +2785,7 @@ mod tests {
                 .clone()
                 .oneshot(json_request_with_hash_and_password(
                     "PUT",
-                    "/api/v1/settings/user.authTtlSeconds",
+                    "/api/v1/settings/agent.authTtlSeconds",
                     body,
                     ScopeHash::test(1),
                     "correct",
@@ -2715,7 +2827,7 @@ mod tests {
                 .clone()
                 .oneshot(json_request_with_hash(
                     "PUT",
-                    "/api/v1/settings/user.trustedProgramPaths",
+                    "/api/v1/settings/agent.trustedProgramPaths",
                     json!({"value":value}),
                     ScopeHash::test(1),
                 ))
@@ -2731,10 +2843,21 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let router = super::database_routes(state.clone()).with_state(state);
         let response = router
+            .clone()
             .oneshot(request_with_hash_and_password(
                 "/api/v1/settings",
                 ScopeHash::test(1),
                 "correct",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::FORBIDDEN, response.status());
+        assert_eq!("access_denied", json_body(response).await["error"]["code"]);
+
+        let response = router
+            .oneshot(request_with_hash(
+                "/api/v1/settings/cli.testSetting",
+                ScopeHash::test(1),
             ))
             .await
             .unwrap();

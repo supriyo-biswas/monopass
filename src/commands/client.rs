@@ -124,6 +124,24 @@ impl<'a> Client<'a> {
         Ok(serde_json::from_slice(&response.body)?)
     }
 
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    pub fn get_json_with_item_scope<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
+        let response = self.request_with_unlock_prompt_for_scope(
+            "GET",
+            path,
+            Zeroizing::new(Vec::new()),
+            None,
+            AuthMode::ProcessOnly,
+            AccessScope::Items,
+            prompt_master_password,
+        )?;
+        Ok(serde_json::from_slice(&response.body)?)
+    }
+
     pub fn shell_completions(
         &self,
         prefix: &str,
@@ -278,10 +296,34 @@ impl<'a> Client<'a> {
     where
         F: FnOnce() -> io::Result<Zeroizing<String>>,
     {
+        self.request_with_unlock_prompt_for_scope(
+            method,
+            path,
+            body,
+            content_type,
+            auth_mode,
+            AccessScope::for_api_path(path),
+            prompt,
+        )
+    }
+
+    fn request_with_unlock_prompt_for_scope<F>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Zeroizing<Vec<u8>>,
+        content_type: Option<&str>,
+        auth_mode: AuthMode,
+        access_scope: AccessScope,
+        prompt: F,
+    ) -> AppResult<Response>
+    where
+        F: FnOnce() -> io::Result<Zeroizing<String>>,
+    {
         let mut password: Option<Zeroizing<String>> = None;
         let mut response = self.request(method, path, &body, content_type, None)?;
         if is_access_denied(&response) {
-            let unlock_method = self.first_unlock_method(AccessScope::for_api_path(path))?;
+            let unlock_method = self.first_unlock_method(access_scope)?;
             if unlock_method.accepts_master_password {
                 let prompted = prompt()?;
                 self.unlock(&unlock_method, Some(&prompted))?;
@@ -632,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             AccessScope::Settings,
-            AccessScope::for_api_path("/api/v1/settings/user.authTtlSeconds")
+            AccessScope::for_api_path("/api/v1/settings/agent.authTtlSeconds")
         );
         assert_eq!(
             AccessScope::Items,
@@ -830,6 +872,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn explicit_item_scope_setting_read_uses_items_unlock_flow() {
+        let path = "/api/v1/settings/cli.clearClipboardAfterSeconds";
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path,
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/gui","accepts_master_password":false}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/gui",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path,
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(r#"{"value":"30"}"#),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+
+        let response: crate::commands::models::SettingResponse =
+            Client::with_capabilities(&config, None)
+                .get_json_with_item_scope(path)
+                .unwrap();
+
+        assert_eq!("30", response.value);
         server.join();
     }
 

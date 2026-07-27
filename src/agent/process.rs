@@ -146,6 +146,22 @@ pub(crate) struct GuiApplication {
     pub(crate) same_as_primary: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    all(target_os = "linux", not(any(feature = "gtk", feature = "qt"))),
+    allow(dead_code)
+)]
+pub(crate) enum GuiApplicationMatchKind {
+    Process,
+    Context,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuiApplicationMatch {
+    pub(crate) application: GuiApplication,
+    pub(crate) kind: GuiApplicationMatchKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessDisplay {
     pub(crate) name: String,
@@ -385,14 +401,30 @@ fn process_display_from_chain_with_agent_and_gui(
         })?;
     let mut display = process_display(primary)?;
     let resolve_gui_application = || {
-        chain.iter().rev().find_map(|process| {
-            let mut application = gui_resolver.gui_application(process)?;
-            application.same_as_primary = process.instance == primary.instance
-                || process
-                    .executable
-                    .is_some_and(|identity| primary.executable == Some(identity));
-            Some(application)
-        })
+        let mut context = None;
+        for process in chain.iter().rev() {
+            let matched = match gui_resolver.gui_application(process) {
+                Some(matched) => matched,
+                None => continue,
+            };
+            let mut application = matched.application;
+            match matched.kind {
+                GuiApplicationMatchKind::Process => {
+                    application.same_as_primary = process.instance == primary.instance
+                        || process
+                            .executable
+                            .is_some_and(|identity| primary.executable == Some(identity));
+                    return Some(application);
+                }
+                GuiApplicationMatchKind::Context => {
+                    application.same_as_primary = false;
+                    if context.is_none() {
+                        context = Some(application);
+                    }
+                }
+            }
+        }
+        context
     };
     display.gui_application = resolve_gui_application();
     if display.gui_application.is_none() && gui_resolver.refresh_after_miss() {
@@ -421,7 +453,7 @@ fn process_display(process: &ProcessInfo) -> Option<ProcessDisplay> {
 }
 
 trait GuiApplicationResolver {
-    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication>;
+    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplicationMatch>;
 
     fn refresh_after_miss(&self) -> bool {
         false
@@ -432,7 +464,7 @@ struct PlatformGuiApplicationResolver;
 
 #[cfg(target_os = "macos")]
 impl GuiApplicationResolver for PlatformGuiApplicationResolver {
-    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication> {
+    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplicationMatch> {
         use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 
         let application =
@@ -451,17 +483,20 @@ impl GuiApplicationResolver for PlatformGuiApplicationResolver {
         if name.is_empty() {
             return None;
         }
-        Some(GuiApplication {
-            name,
-            icon: Some(ProcessIconSource::Path(PathBuf::from(bundle_path))),
-            same_as_primary: false,
+        Some(GuiApplicationMatch {
+            application: GuiApplication {
+                name,
+                icon: Some(ProcessIconSource::Path(PathBuf::from(bundle_path))),
+                same_as_primary: false,
+            },
+            kind: GuiApplicationMatchKind::Process,
         })
     }
 }
 
 #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
 impl GuiApplicationResolver for PlatformGuiApplicationResolver {
-    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplication> {
+    fn gui_application(&self, process: &ProcessInfo) -> Option<GuiApplicationMatch> {
         let executable = process.executable_path.as_deref()?;
         super::desktop::application_for_process(process.instance.pid, executable)
     }
@@ -473,7 +508,7 @@ impl GuiApplicationResolver for PlatformGuiApplicationResolver {
 
 #[cfg(all(target_os = "linux", not(any(feature = "gtk", feature = "qt"))))]
 impl GuiApplicationResolver for PlatformGuiApplicationResolver {
-    fn gui_application(&self, _process: &ProcessInfo) -> Option<GuiApplication> {
+    fn gui_application(&self, _process: &ProcessInfo) -> Option<GuiApplicationMatch> {
         None
     }
 }
@@ -1533,6 +1568,58 @@ mod tests {
     }
 
     #[test]
+    fn exact_gui_ancestor_takes_priority_over_inherited_context() {
+        let resolver = FakeResolver::default()
+            .with_path(11, 10, UID, 3, "/usr/bin/python3.12")
+            .with_path(10, 9, UID, 2, "/bin/bash")
+            .with_path(9, 1, UID, 1, "/usr/share/code/code")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default()
+            .with_context(11, "Inherited Context")
+            .with_context(10, "Inherited Context")
+            .with(9, "Visual Studio Code");
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[9, 10, 11]),
+            Some(test_executable(4)),
+            &gui,
+        )
+        .unwrap();
+
+        assert_eq!(
+            "python3 (via Visual Studio Code)",
+            display.presentation_name()
+        );
+        assert_eq!(PathBuf::from("/usr/bin/python3.12"), display.path);
+        assert!(!display.gui_application.unwrap().same_as_primary);
+    }
+
+    #[test]
+    fn inherited_gui_context_is_never_the_primary_process() {
+        let resolver = FakeResolver::default()
+            .with_path(11, 10, UID, 3, "/usr/bin/python3.12")
+            .with_path(10, 1, UID, 2, "/bin/bash")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default()
+            .with_context(11, "Visual Studio Code")
+            .with_context(10, "Visual Studio Code");
+
+        let display = super::process_display_from_chain_with_agent_and_gui(
+            &chain(&resolver, &[10, 11]),
+            Some(test_executable(4)),
+            &gui,
+        )
+        .unwrap();
+
+        assert_eq!(
+            "python3 (via Visual Studio Code)",
+            display.presentation_name()
+        );
+        assert_eq!(PathBuf::from("/usr/bin/python3.12"), display.path);
+        assert!(!display.gui_application.unwrap().same_as_primary);
+    }
+
+    #[test]
     fn missing_gui_metadata_is_retried_after_catalog_refresh() {
         let resolver = FakeResolver::default()
             .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
@@ -1711,25 +1798,37 @@ mod tests {
 
     #[derive(Default)]
     struct FakeGuiResolver {
-        applications: HashMap<i32, super::GuiApplication>,
+        applications: HashMap<i32, super::GuiApplicationMatch>,
     }
 
     impl FakeGuiResolver {
         fn with(mut self, pid: i32, name: &str) -> Self {
+            self.insert(pid, name, super::GuiApplicationMatchKind::Process);
+            self
+        }
+
+        fn with_context(mut self, pid: i32, name: &str) -> Self {
+            self.insert(pid, name, super::GuiApplicationMatchKind::Context);
+            self
+        }
+
+        fn insert(&mut self, pid: i32, name: &str, kind: super::GuiApplicationMatchKind) {
             self.applications.insert(
                 pid,
-                super::GuiApplication {
-                    name: name.to_owned(),
-                    icon: Some(super::ProcessIconSource::ThemeName("test-icon".into())),
-                    same_as_primary: false,
+                super::GuiApplicationMatch {
+                    application: super::GuiApplication {
+                        name: name.to_owned(),
+                        icon: Some(super::ProcessIconSource::ThemeName("test-icon".into())),
+                        same_as_primary: false,
+                    },
+                    kind,
                 },
             );
-            self
         }
     }
 
     impl super::GuiApplicationResolver for FakeGuiResolver {
-        fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplication> {
+        fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplicationMatch> {
             self.applications.get(&process.instance.pid).cloned()
         }
     }
@@ -1741,12 +1840,15 @@ mod tests {
     }
 
     impl super::GuiApplicationResolver for RefreshingFakeGuiResolver {
-        fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplication> {
+        fn gui_application(&self, process: &ProcessInfo) -> Option<super::GuiApplicationMatch> {
             (self.refreshed.get() && process.instance.pid == self.application_pid).then(|| {
-                super::GuiApplication {
-                    name: "LXTerminal".to_owned(),
-                    icon: Some(super::ProcessIconSource::ThemeName("lxterminal".into())),
-                    same_as_primary: false,
+                super::GuiApplicationMatch {
+                    application: super::GuiApplication {
+                        name: "LXTerminal".to_owned(),
+                        icon: Some(super::ProcessIconSource::ThemeName("lxterminal".into())),
+                        same_as_primary: false,
+                    },
+                    kind: super::GuiApplicationMatchKind::Process,
                 }
             })
         }

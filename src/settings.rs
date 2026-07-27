@@ -2,34 +2,35 @@ use std::time::Duration;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
-pub(crate) const AUTH_TTL_SETTING: &str = "user.authTtlSeconds";
-pub(crate) const SETTINGS_AUTH_TTL_SETTING: &str = "user.settingsAuthTtlSeconds";
-pub(crate) const DENIAL_TTL_SETTING: &str = "user.denialTtlSeconds";
-pub(crate) const GC_SECONDS_SETTING: &str = "user.gcSeconds";
+pub(crate) const AUTH_TTL_SETTING: &str = "agent.authTtlSeconds";
+pub(crate) const SETTINGS_AUTH_TTL_SETTING: &str = "agent.settingsAuthTtlSeconds";
+pub(crate) const DENIAL_TTL_SETTING: &str = "agent.denialTtlSeconds";
+pub(crate) const GC_SECONDS_SETTING: &str = "agent.gcSeconds";
 pub(crate) const AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING: &str =
-    "user.autoDeleteTrashItemsAfterSeconds";
+    "agent.autoDeleteTrashItemsAfterSeconds";
 pub(crate) const AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING: &str =
-    "user.autoDeleteOldVersionsAfterSeconds";
-pub(crate) const TRUSTED_PROGRAM_PATHS_SETTING: &str = "user.trustedProgramPaths";
+    "agent.autoDeleteOldVersionsAfterSeconds";
+pub(crate) const TRUSTED_PROGRAM_PATHS_SETTING: &str = "agent.trustedProgramPaths";
+pub(crate) const CLEAR_CLIPBOARD_AFTER_SECONDS_SETTING: &str = "cli.clearClipboardAfterSeconds";
 
 const FIVE_YEARS_SECONDS: u64 = 5 * 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UserSettingKind {
+pub(crate) enum SettingKind {
     Seconds { min: u64, max: u64 },
     TrustedProgramPaths,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UserSetting {
+pub(crate) struct Setting {
     pub name: &'static str,
     pub default: &'static str,
-    pub kind: UserSettingKind,
+    pub kind: SettingKind,
 }
 
-impl UserSetting {
+impl Setting {
     pub fn parse_seconds(&self, value: &str) -> Result<u64, SettingsError> {
-        let UserSettingKind::Seconds { min, max } = self.kind else {
+        let SettingKind::Seconds { min, max } = self.kind else {
             return Err(SettingsError::InvalidValue);
         };
         let seconds = value
@@ -52,11 +53,11 @@ impl UserSetting {
 
     pub fn normalize(&self, value: &str) -> Result<String, SettingsError> {
         match self.kind {
-            UserSettingKind::Seconds { .. } => {
+            SettingKind::Seconds { .. } => {
                 self.parse_seconds(value)?;
                 Ok(value.to_owned())
             }
-            UserSettingKind::TrustedProgramPaths => {
+            SettingKind::TrustedProgramPaths => {
                 let values = serde_json::from_str::<Vec<String>>(value)
                     .map_err(|_| SettingsError::InvalidValue)?;
                 compile_trusted_program_paths(&values)?;
@@ -72,64 +73,69 @@ pub(crate) enum SettingsError {
     UnknownSetting,
 }
 
-pub(crate) const USER_SETTINGS: &[UserSetting] = &[
-    UserSetting {
+pub(crate) const SETTINGS: &[Setting] = &[
+    Setting {
         name: AUTH_TTL_SETTING,
         default: "900",
-        kind: UserSettingKind::Seconds {
+        kind: SettingKind::Seconds {
             min: 1,
             max: 604_800,
         },
     },
-    UserSetting {
+    Setting {
         name: SETTINGS_AUTH_TTL_SETTING,
         default: "300",
-        kind: UserSettingKind::Seconds {
+        kind: SettingKind::Seconds {
             min: 1,
             max: 604_800,
         },
     },
-    UserSetting {
+    Setting {
         name: DENIAL_TTL_SETTING,
         default: "60",
-        kind: UserSettingKind::Seconds {
+        kind: SettingKind::Seconds {
             min: 1,
             max: 604_800,
         },
     },
-    UserSetting {
+    Setting {
         name: GC_SECONDS_SETTING,
         default: "3600",
-        kind: UserSettingKind::Seconds {
+        kind: SettingKind::Seconds {
             min: 60,
             max: 2_592_000,
         },
     },
-    UserSetting {
+    Setting {
         name: AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING,
         default: "15552000",
-        kind: UserSettingKind::Seconds {
+        kind: SettingKind::Seconds {
             min: 0,
             max: FIVE_YEARS_SECONDS,
         },
     },
-    UserSetting {
+    Setting {
         name: AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
         default: "15552000",
-        kind: UserSettingKind::Seconds {
+        kind: SettingKind::Seconds {
             min: 0,
             max: FIVE_YEARS_SECONDS,
         },
     },
-    UserSetting {
+    Setting {
         name: TRUSTED_PROGRAM_PATHS_SETTING,
         default: "[]",
-        kind: UserSettingKind::TrustedProgramPaths,
+        kind: SettingKind::TrustedProgramPaths,
+    },
+    Setting {
+        name: CLEAR_CLIPBOARD_AFTER_SECONDS_SETTING,
+        default: "30",
+        kind: SettingKind::Seconds { min: 10, max: 300 },
     },
 ];
 
-pub(crate) fn user_setting(name: &str) -> Result<&'static UserSetting, SettingsError> {
-    USER_SETTINGS
+pub(crate) fn setting(name: &str) -> Result<&'static Setting, SettingsError> {
+    SETTINGS
         .iter()
         .find(|setting| setting.name == name)
         .ok_or(SettingsError::UnknownSetting)
@@ -155,28 +161,28 @@ fn compile_trusted_program_paths(patterns: &[String]) -> Result<GlobSet, Setting
 }
 
 #[cfg(test)]
-pub(crate) fn auth_ttl_setting() -> &'static UserSetting {
-    user_setting(AUTH_TTL_SETTING).expect("auth ttl setting must be registered")
+pub(crate) fn auth_ttl_setting() -> &'static Setting {
+    setting(AUTH_TTL_SETTING).expect("auth ttl setting must be registered")
 }
 
 #[cfg(test)]
-pub(crate) fn settings_auth_ttl_setting() -> &'static UserSetting {
-    user_setting(SETTINGS_AUTH_TTL_SETTING).expect("settings auth ttl setting must be registered")
+pub(crate) fn settings_auth_ttl_setting() -> &'static Setting {
+    setting(SETTINGS_AUTH_TTL_SETTING).expect("settings auth ttl setting must be registered")
 }
 
 #[cfg(test)]
-pub(crate) fn denial_ttl_setting() -> &'static UserSetting {
-    user_setting(DENIAL_TTL_SETTING).expect("denial ttl setting must be registered")
+pub(crate) fn denial_ttl_setting() -> &'static Setting {
+    setting(DENIAL_TTL_SETTING).expect("denial ttl setting must be registered")
 }
 
 #[cfg(test)]
-pub(crate) fn gc_seconds_setting() -> &'static UserSetting {
-    user_setting(GC_SECONDS_SETTING).expect("gc seconds setting must be registered")
+pub(crate) fn gc_seconds_setting() -> &'static Setting {
+    setting(GC_SECONDS_SETTING).expect("gc seconds setting must be registered")
 }
 
 #[cfg(test)]
-pub(crate) fn trusted_program_paths_setting() -> &'static UserSetting {
-    user_setting(TRUSTED_PROGRAM_PATHS_SETTING)
+pub(crate) fn trusted_program_paths_setting() -> &'static Setting {
+    setting(TRUSTED_PROGRAM_PATHS_SETTING)
         .expect("trusted program paths setting must be registered")
 }
 
@@ -201,5 +207,16 @@ mod tests {
     #[test]
     fn trusted_program_globs_reject_malformed_syntax() {
         assert!(super::trusted_program_path_matcher(r#"["[unterminated"]"#).is_err());
+    }
+
+    #[test]
+    fn clear_clipboard_seconds_accepts_only_configured_range() {
+        let setting = super::setting(super::CLEAR_CLIPBOARD_AFTER_SECONDS_SETTING).unwrap();
+
+        assert_eq!(10, setting.parse_seconds("10").unwrap());
+        assert_eq!(300, setting.parse_seconds("300").unwrap());
+        for value in ["-1", "invalid", "9", "301"] {
+            assert!(setting.parse_seconds(value).is_err(), "{value}");
+        }
     }
 }

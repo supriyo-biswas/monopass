@@ -96,20 +96,24 @@ observations. The `login` process is excluded from the authorization chain. If
 verification fails, traversal stops at the boundary and preserves the narrower
 per-shell scope. The resulting verified ancestry also uses the normal
 GUI-application recognition described below. Different identities are shown as
-a composite such as `bash (via Terminal)`; a direct GUI caller uses its localized
-application name without redundant attribution. The executable path remains
-that of the direct executable selected for display. All prompt scopes use the
-same application icon resolution: they prefer the GUI application icon, then
-use the existing generic icon fallback. Dialogs do not display executable
-modification timestamps.
+a composite such as `bash (via Terminal)`; a caller confidently identified as
+the GUI application uses its localized application name without redundant
+attribution. The executable path remains that of the direct executable selected
+for display. All prompt scopes use the same application icon resolution: they
+prefer the GUI application icon, then use the existing generic icon fallback.
+Dialogs do not display executable modification timestamps.
 
 On macOS, regular and accessory application ancestors with an application
 bundle provide localized names and bundle icons. Linux GUI builds use a cached,
-locale-aware XDG desktop-entry catalog. Exact unique `Exec`/`TryExec` executable
-matches are preferred, followed by exact desktop-file IDs derived from systemd
-application scopes and stable application slices. If the complete ancestry has
-no GUI match, the agent refreshes the catalog at runtime and retries once;
-repeated miss-triggered refreshes are briefly throttled. This allows newly
+locale-aware XDG desktop-entry catalog. The complete ancestry is first searched
+for the nearest exact unique `Exec`/`TryExec` executable match. Only when no such
+match exists does presentation fall back to an exact desktop-file ID derived
+from systemd application scopes or stable application slices. Because child
+processes inherit application cgroups, a cgroup-only result is always treated as
+hosting context and displayed with `via`; it never replaces the direct
+executable name. If the complete ancestry has no GUI match, the agent refreshes
+the catalog at runtime and retries once. Repeated miss-triggered refreshes are
+briefly throttled. This allows newly
 installed applications to be recognized without restarting the agent. Hidden,
 non-display, terminal-hosted, wrong-desktop, and ambiguous entries are ignored.
 Missing metadata or icon-load failures preserve the direct executable label and
@@ -132,7 +136,7 @@ Concurrent GUI unlock requests are shown as separate dialogs.
 
 Clicking the explicit **Deny** button returns `403 temporary_lockout` and caches
 that result for the process-lineage and access-scope pair for
-`user.denialTtlSeconds`. Later GUI unlock requests for that pair fail with the
+`agent.denialTtlSeconds`. Later GUI unlock requests for that pair fail with the
 same error without opening a dialog until the cache entry expires. Escape,
 window close, backend failure, and
 wrong-password submission do not populate the denial cache.
@@ -155,7 +159,7 @@ It is the migrated form of the older `/auth/unlock` behavior. It validates the
 bearer master password, opens or verifies the unlocked database, and authorizes
 the caller's process lineage for only the requested access scope.
 
-Direct unlock is restricted by `user.trustedProgramPaths`. Policy uses the
+Direct unlock is restricted by `agent.trustedProgramPaths`. Policy uses the
 ultimate executable in the verified process lineage—the process connected
 directly to the Unix socket—not the process selected for GUI display. An
 ultimate executable with the same file identity as the running agent is always
@@ -198,4 +202,7 @@ API clients accessing settings use the same retry sequence with
 `scope=settings`, then retry the settings request without a bearer password.
 The built-in `ls-settings`, `read-setting`, and `write-setting` commands use
 settings API paths and therefore follow this settings-scoped flow. Other
-built-in command flows remain item-scoped.
+built-in command flows remain item-scoped. The agent also accepts an existing
+items-scoped authorization for an exact `GET /api/v1/settings/{name}` when the
+decoded name begins with `cli.`; the built-in settings commands do not select
+or otherwise depend on this exception.

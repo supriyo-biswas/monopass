@@ -29,8 +29,8 @@ use super::models::{
     AccessScope, AuthScopeQuery, AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse,
     ContactResponse, CreateContactRequest, CreateFileResponse, CreateItemRequest,
     JobAcceptedResponse, JobResponse, JobStatus, ListItemsQuery, ListPageQuery, PaginatedResponse,
-    ShellCompletionKind, ShellCompletionsQuery, ShellCompletionsResponse, UpdateContactRequest,
-    UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
+    SettingResponse, ShellCompletionKind, ShellCompletionsQuery, ShellCompletionsResponse,
+    UpdateContactRequest, UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
 #[cfg(any(not(target_os = "macos"), test))]
 use super::process::DirectUnlockCaller;
@@ -447,6 +447,17 @@ pub async fn list_settings(
         .map_err(ApiError::from)
 }
 
+pub async fn get_setting(
+    Extension(database): Extension<DbHandle>,
+    Path(name): Path<String>,
+) -> Result<Json<SettingResponse>, ApiError> {
+    database
+        .get_setting(name)
+        .await
+        .map(|value| Json(SettingResponse { value }))
+        .map_err(ApiError::from)
+}
+
 pub async fn update_setting(
     State(state): State<AgentState>,
     Extension(database): Extension<DbHandle>,
@@ -455,7 +466,7 @@ pub async fn update_setting(
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = request.map_err(|error| ApiError::bad_request(error.to_string()))?;
     state
-        .upsert_user_setting(&database, name, request.value)
+        .upsert_setting(&database, name, request.value)
         .await
         .map(|()| empty_json())
         .map_err(ApiError::from)

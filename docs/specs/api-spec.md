@@ -4,7 +4,8 @@ Base path: `/api/v1`
 
 All database-backed routes require the agent database to be unlocked and the
 caller process lineage to be authorized for the route's access scope. Settings
-routes require `settings`; all other database routes require `items`.
+routes require `settings`, except that an exact `cli.*` setting read accepts
+either `items` or `settings`; all other database routes require `items`.
 Unauthorized or locked access returns `403 access_denied`.
 
 Timestamps are stored as Unix seconds and returned as RFC3339 UTC strings.
@@ -160,26 +161,29 @@ GNOME Terminal are part of the verified lineage even when a child terminal
 creates a new process session. On macOS, the verified `/usr/bin/login` bridge
 described above lets Terminal and iTerm2 participate in both authorization and
 presentation. Other different-user boundaries remain excluded. For example, a
-shell request can be shown as `bash (via Terminal)`. A direct GUI caller uses
-its localized application name without redundant `via` text. The executable
-path always describes the direct executable selected for display, not its GUI
-host. All prompt scopes use the same application icon resolution: they prefer
-the GUI application's icon, then use the existing generic icon fallback if GUI
-application or icon discovery is missing or ambiguous. Linux resolves exact
-unique desktop-entry executables and systemd desktop IDs from both randomized
-application scopes and stable application slices. Its cached XDG desktop-entry
-catalog is refreshed and the ancestry retried once after a complete miss, with
-repeated miss-triggered refreshes briefly throttled. Dialogs do not display
-executable modification timestamps. This GUI metadata is presentation-only and
-is not part of process authorization or direct-unlock trust evaluation. Linux
-GUI unlock requires an accepted GUI session capability (`x-session` or
-`wayland-session`) and uses in-process GTK4 or Qt Quick/QML SDK dialogs with
-forced X11 backend usage. A wrong password, cancelled dialog, or closed dialog
-denies the request. Concurrent GUI unlock requests are displayed as separate
-dialogs.
+shell request can be shown as `bash (via Terminal)`. A caller confidently
+identified as the GUI application uses its localized application name without
+redundant `via` text. The executable path always describes the direct executable
+selected for display, not its GUI host. All prompt scopes use the same
+application icon resolution: they prefer the GUI application's icon, then use
+the existing generic icon fallback if GUI application or icon discovery is
+missing or ambiguous. Linux first searches the complete ancestry for the
+nearest exact unique desktop-entry executable. Only when none exists does it
+fall back to a systemd desktop ID from a randomized application scope or stable
+application slice. Inherited cgroup matches are presentation context only, so
+they always retain the direct executable name and add the GUI application with
+`via`. The cached XDG desktop-entry catalog is refreshed and the ancestry
+retried once after a complete miss, with repeated miss-triggered refreshes
+briefly throttled. Dialogs do not display executable modification timestamps.
+This GUI metadata is presentation-only and is not part of process authorization
+or direct-unlock trust evaluation. Linux GUI unlock requires an accepted GUI
+session capability (`x-session` or `wayland-session`) and uses in-process GTK4
+or Qt Quick/QML SDK dialogs with forced X11 backend usage. A wrong password,
+cancelled dialog, or closed dialog denies the request. Concurrent GUI unlock
+requests are displayed as separate dialogs.
 
 Clicking the explicit **Deny** button records a denial for the requesting
-process-lineage and access-scope pair. Until `user.denialTtlSeconds` expires,
+process-lineage and access-scope pair. Until `agent.denialTtlSeconds` expires,
 later GUI unlock requests for that pair return `403 temporary_lockout` without
 displaying another dialog. The Deny-button response itself uses the same error. Other
 scopes remain unaffected. Escape, window close, prompt backend
@@ -206,7 +210,7 @@ uses the ultimate executable in the verified process lineage: the process
 connected directly to the Unix socket, independently of the process selected
 for GUI display. An executable with the same file identity as the running agent
 is always allowed. Every other caller's executable path is canonicalized and
-must match at least one glob in `user.trustedProgramPaths`.
+must match at least one glob in `agent.trustedProgramPaths`.
 
 The agent does not perform breaking schema migrations. When the supplied
 password opens a database whose schema is behind a known breaking boundary,
@@ -263,10 +267,11 @@ Failure:
 
 ## Settings
 
-Settings routes are database-backed and require a cached `settings`
-authorization for the caller's process lineage. An `items` authorization does
-not grant settings access, even if the request includes a valid master-password
-bearer. Settings requests do not consume bearer passwords.
+Settings routes are database-backed and normally require a cached `settings`
+authorization for the caller's process lineage. An exact `GET` for a `cli.*`
+setting also accepts cached `items` authorization. This exception does not
+apply to collection reads or writes. Settings requests do not consume bearer
+passwords.
 
 Directories may carry internal bitmask flags. `DIR_HIDDEN = 1 << 0` hides a
 directory from public directory lists, and `DIR_SYSTEM = 1 << 1` blocks public
@@ -283,42 +288,45 @@ or wrong bearer passwords return
 `403 access_denied` only when the target public item has `ITEM_READ_MUSTAUTH`;
 masked `GET Item`, `List Items`, and `List Item Versions` do not enforce it.
 
-User-configurable settings are stored as string values in `system_settings`
-under `user.*` names:
+Registered agent and CLI settings are stored as string values in
+`system_settings`:
 
 | Name | Default | Allowed values |
 | --- | --- | --- |
-| `user.authTtlSeconds` | `900` | integer seconds, `1..=604800` |
-| `user.settingsAuthTtlSeconds` | `300` | integer seconds, `1..=604800` |
-| `user.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
-| `user.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
-| `user.autoDeleteTrashItemsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
-| `user.autoDeleteOldVersionsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
-| `user.trustedProgramPaths` | `[]` | JSON-serialized array of valid path globs |
+| `agent.authTtlSeconds` | `900` | integer seconds, `1..=604800` |
+| `agent.settingsAuthTtlSeconds` | `300` | integer seconds, `1..=604800` |
+| `agent.denialTtlSeconds` | `60` | integer seconds, `1..=604800` |
+| `agent.gcSeconds` | `3600` | integer seconds, `60..=2592000` |
+| `agent.autoDeleteTrashItemsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
+| `agent.autoDeleteOldVersionsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
+| `agent.trustedProgramPaths` | `[]` | JSON-serialized array of valid path globs |
+| `cli.clearClipboardAfterSeconds` | `30` | integer seconds, `10..=300` |
 
-Opening a database inserts any missing registered user settings with their
-defaults and leaves existing rows unchanged.
+Opening a database transactionally renames the seven legacy `user.*` rows to
+their canonical `agent.*` names, preserving existing canonical rows if both
+names are present. This compatible inline migration does not change the schema
+version. The open then inserts missing registered settings with their defaults.
 
-`user.authTtlSeconds` controls process-lineage authorization TTL. Changes take
+`agent.authTtlSeconds` controls process-lineage authorization TTL. Changes take
 effect immediately for new and existing cached item authorizations. The TTL uses
 a monotonic clock that advances during system suspend, so sleep time counts
 toward expiry while wall-clock adjustments do not extend authorization.
-`user.settingsAuthTtlSeconds` independently controls settings authorization TTL
+`agent.settingsAuthTtlSeconds` independently controls settings authorization TTL
 and likewise applies immediately to new and existing entries with the same
 suspend-aware clock behavior.
-`user.denialTtlSeconds` controls explicit GUI denial TTL. The agent uses 60
+`agent.denialTtlSeconds` controls explicit GUI denial TTL. The agent uses 60
 seconds until the encrypted setting is first loaded by a successful unlock,
 then keeps the loaded value in memory through later database unloads. Changes
 take effect immediately for new and existing cached denials, and suspend time
-counts toward their expiry. `user.gcSeconds` controls the best-effort idle
+counts toward their expiry. `agent.gcSeconds` controls the best-effort idle
 cleanup cadence.
-`user.autoDeleteTrashItemsAfterSeconds` controls how long items remain in
+`agent.autoDeleteTrashItemsAfterSeconds` controls how long items remain in
 `Trash`, measured from its current `updated_at` timestamp. Moving or renaming
 an item within `Trash` refreshes `updated_at` and postpones deletion.
-`user.autoDeleteOldVersionsAfterSeconds`
+`agent.autoDeleteOldVersionsAfterSeconds`
 controls retention of non-latest item versions. For either setting, `0`
 disables that category of automatic deletion and positive values take effect
-on the next eligible cleanup. `user.trustedProgramPaths`
+on the next eligible cleanup. `agent.trustedProgramPaths`
 controls which non-agent ultimate executables may use direct unlock. Patterns
 are matched case-sensitively against canonical executable paths. `*` does not
 cross path separators; `**` may match recursive path components. Empty,
@@ -338,18 +346,35 @@ HTTP/1.1 200 OK
 Content-Type: application/json
 
 {
-  "user.authTtlSeconds": "900",
-  "user.autoDeleteOldVersionsAfterSeconds": "15552000",
-  "user.autoDeleteTrashItemsAfterSeconds": "15552000",
-  "user.settingsAuthTtlSeconds": "300",
-  "user.denialTtlSeconds": "60",
-  "user.gcSeconds": "3600",
-  "user.trustedProgramPaths": "[]"
+  "agent.authTtlSeconds": "900",
+  "agent.autoDeleteOldVersionsAfterSeconds": "15552000",
+  "agent.autoDeleteTrashItemsAfterSeconds": "15552000",
+  "agent.settingsAuthTtlSeconds": "300",
+  "agent.denialTtlSeconds": "60",
+  "agent.gcSeconds": "3600",
+  "agent.trustedProgramPaths": "[]",
+  "cli.clearClipboardAfterSeconds": "30"
 }
 ```
 
-Returns all `user.*` settings currently stored in `system_settings`. Internal
-`sys.*` rows are not returned.
+Returns all `agent.*` and `cli.*` settings currently stored in
+`system_settings`. Internal and legacy rows are not returned.
+
+### Get Setting
+
+```http
+GET /api/v1/settings/{name}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{ "value": "stored string" }
+```
+
+Returns one exact setting. A name beginning with `cli.` accepts either cached
+`items` or cached `settings` authorization. Every other name requires cached
+`settings` authorization. Missing settings and names outside the `agent.*` and
+`cli.*` namespaces return `404 not_found` after authorization succeeds.
 
 ### Update Setting
 
@@ -364,10 +389,12 @@ HTTP/1.1 200 OK
 ```
 
 Known duration settings are upserted when `value` is an in-range integer string.
-`user.trustedProgramPaths` accepts a JSON-serialized string array of valid globs
+`agent.trustedProgramPaths` accepts a JSON-serialized string array of valid globs
 and stores it in canonical compact form. For example, its request body is
 `{ "value": "[\"/usr/bin/example\",\"relative-program\"]" }`. Unknown
-settings, including `sys.*`, return `404 not_found`. Malformed request JSON,
+settings, including unregistered `cli.*`, `user.*`, and `sys.*`, return
+`404 not_found`.
+Malformed request JSON,
 missing `value`, invalid setting JSON, non-string array elements, malformed glob
 syntax, non-integer duration values, and out-of-range duration values return
 `400 bad_request`.
@@ -967,7 +994,7 @@ deleted. Orphan file rows are `files` rows that have no matching rows in
 `item_version_file_mapping`.
 
 The authorization-expiry unload path performs best-effort cleanup while the
-database is still unlocked and `user.gcSeconds` says cleanup is due. It
+database is still unlocked and `agent.gcSeconds` says cleanup is due. It
 permanently deletes items joined to the reserved `Trash` directory whose
 `updated_at` timestamp has reached the configured Trash retention period, then
 deletes non-latest item versions whose
@@ -1023,13 +1050,14 @@ CREATE TABLE system_settings (
 
 INSERT INTO system_settings (name, value)
 VALUES
-  ('user.authTtlSeconds', '900'),
-  ('user.settingsAuthTtlSeconds', '300'),
-  ('user.denialTtlSeconds', '60'),
-  ('user.gcSeconds', '3600'),
-  ('user.autoDeleteTrashItemsAfterSeconds', '15552000'),
-  ('user.autoDeleteOldVersionsAfterSeconds', '15552000'),
-  ('user.trustedProgramPaths', '[]');
+  ('agent.authTtlSeconds', '900'),
+  ('agent.settingsAuthTtlSeconds', '300'),
+  ('agent.denialTtlSeconds', '60'),
+  ('agent.gcSeconds', '3600'),
+  ('agent.autoDeleteTrashItemsAfterSeconds', '15552000'),
+  ('agent.autoDeleteOldVersionsAfterSeconds', '15552000'),
+  ('agent.trustedProgramPaths', '[]'),
+  ('cli.clearClipboardAfterSeconds', '30');
 
 -- Init also creates:
 -- - dir `Trash` with bitmask `DIR_HIDDEN | DIR_DENY_OVERWRITE`
