@@ -307,6 +307,18 @@ monopass edit Personal/Chase \
   --remove-file receipt.pdf
 ```
 
+To retrieve the file `receipt.pdf` from the `Personal/Chase` item in your current directory under the same name, use the following command:
+
+```sh
+monopass read Personal/Chase/receipt.pdf -o receipt.pdf
+```
+
+By default, monopass creates the file with 0600 permissions, to prevent other system users from reading the file. You can set the `--file-mode` flag to control this. For example, to make the file readable and editable for your user, and readable to all system users, you would use:
+
+```sh
+monopass read Personal/Chase/receipt.pdf -o receipt.pdf --file-mode 0644
+```
+
 | Previous chapter | Next chapter |
 | --- | --- |
 | [Getting started](01-getting-started.md) | [Listing, moving, deleting, and versioning items](03-listing-moving-deleting-versioning.md) |

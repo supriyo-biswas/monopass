@@ -33,7 +33,11 @@ Alice first adds Bob as a contact:
 alice$ monopass add-contact bob@example.com \
     age1ysxuaeqlk7xd8uqsh8lsnfwt9jzzjlqf49ruhpjrrj5yatlcuf7qke4pqe \
     --name Bob
+```
 
+Then, she encrypts the item for Bob using his public key:
+
+```
 alice$ monopass share Work/AcmeDeploy bob@example.com \
     --out-file ./AcmeDeploy-for-Bob.export
 ./AcmeDeploy-for-Bob.export
