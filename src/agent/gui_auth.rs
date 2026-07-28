@@ -354,7 +354,11 @@ mod linux_prompt {
         let path = gtk::Label::new(Some(&metadata.executable_path_text));
         path.set_xalign(0.0);
         path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        path.add_css_class("monospace");
+        let path_attributes = gtk::pango::AttrList::new();
+        path_attributes.insert(gtk::pango::AttrFontDesc::new(
+            &gtk::pango::FontDescription::from_string("monospace"),
+        ));
+        path.set_attributes(Some(&path_attributes));
         text.append(&intro);
         text.append(&app_name);
         text.append(&path);
@@ -981,9 +985,9 @@ Window {
             width: 460
             minimumWidth: 460
             maximumWidth: 460
-            height: 196
-            minimumHeight: 196
-            maximumHeight: 196
+            height: 236
+            minimumHeight: 236
+            maximumHeight: 236
             x: 80 + ((promptId - 1) % 8) * 28
             y: 80 + ((promptId - 1) % 8) * 28
             visible: true
@@ -1050,7 +1054,7 @@ Window {
                     Image {
                         id: icon
                         source: prompt.currentIconSource()
-                        visible: source.length > 0 && status !== Image.Error
+                        visible: source.toString().length > 0 && status !== Image.Error
                         sourceSize.width: 40
                         sourceSize.height: 40
                         Layout.preferredWidth: visible ? 40 : 0

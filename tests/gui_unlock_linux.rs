@@ -527,7 +527,7 @@ fn submit_prompt(password: &str, action: PromptAction) {
             }
             #[cfg(feature = "qt")]
             {
-                run_xdotool(&["mousemove", "--window", &window, "330", "165"]);
+                run_xdotool(&["mousemove", "--window", &window, "330", "205"]);
                 run_xdotool(&["click", "--window", &window, "1"]);
             }
         }
