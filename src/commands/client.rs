@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -91,10 +92,11 @@ struct AuthUnlockMethod {
     accepts_master_password: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Client<'a> {
     config: &'a Config,
     capabilities: Option<String>,
+    connection: RefCell<Option<UnixStream>>,
 }
 
 impl<'a> Client<'a> {
@@ -102,6 +104,7 @@ impl<'a> Client<'a> {
         Self {
             config,
             capabilities: detect_client_capabilities(),
+            connection: RefCell::new(None),
         }
     }
 
@@ -110,6 +113,7 @@ impl<'a> Client<'a> {
         Self {
             config,
             capabilities,
+            connection: RefCell::new(None),
         }
     }
 
@@ -427,9 +431,8 @@ impl<'a> Client<'a> {
         bearer_password: Option<&str>,
         include_client_capabilities: bool,
     ) -> AppResult<Response> {
-        let mut stream = UnixStream::connect(self.config.listen_path())?;
         let mut request = Zeroizing::new(format!(
-            "{method} {path} HTTP/1.1\r\nHost: monopass\r\nConnection: close\r\nContent-Length: {}\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: monopass\r\nContent-Length: {}\r\n",
             body.len()
         ));
         if let Some(content_type) = content_type {
@@ -450,13 +453,39 @@ impl<'a> Client<'a> {
         }
         request.push_str("\r\n");
 
-        stream.write_all(request.as_bytes())?;
-        stream.write_all(body)?;
+        let mut connection = self.connection.borrow_mut();
+        if connection.is_none() {
+            *connection = Some(UnixStream::connect(self.config.listen_path())?);
+        }
 
-        let mut raw = Zeroizing::new(Vec::new());
-        stream.read_to_end(&mut raw)?;
-        parse_response(raw)
+        let result = send_request(
+            connection.as_mut().expect("connection was initialized"),
+            &request,
+            body,
+        );
+        match result {
+            Ok((response, reusable)) => {
+                if !reusable {
+                    connection.take();
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                connection.take();
+                Err(error)
+            }
+        }
     }
+}
+
+fn send_request(
+    stream: &mut UnixStream,
+    request: &str,
+    body: &[u8],
+) -> AppResult<(Response, bool)> {
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    read_response(stream)
 }
 
 fn detect_client_capabilities() -> Option<String> {
@@ -507,21 +536,46 @@ pub fn query_value(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-fn parse_response(raw: Zeroizing<Vec<u8>>) -> AppResult<Response> {
+fn read_response(stream: &mut UnixStream) -> AppResult<(Response, bool)> {
+    let mut raw = Zeroizing::new(Vec::new());
+    let mut buffer = [0_u8; 8192];
+    let header_end = loop {
+        if let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break header_end;
+        }
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "response headers ended early",
+            )
+            .into());
+        }
+        raw.extend_from_slice(&buffer[..read]);
+    };
+
+    parse_response(stream, raw, header_end)
+}
+
+fn parse_response(
+    stream: &mut UnixStream,
+    raw: Zeroizing<Vec<u8>>,
+    header_end: usize,
+) -> AppResult<(Response, bool)> {
     let header_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
+        .get(..header_end)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
-    let header_bytes = &raw[..header_end];
-    let mut body = Zeroizing::new(raw[header_end + 4..].to_vec());
-    let headers_text = std::str::from_utf8(header_bytes)?;
+    let headers_text = std::str::from_utf8(header_end)?;
     let mut lines = headers_text.split("\r\n");
     let status_line = lines
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status"))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP version"))?;
+    let status = status_parts
+        .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status code"))?
         .parse::<u16>()?;
     let mut headers = HashMap::new();
@@ -532,45 +586,181 @@ fn parse_response(raw: Zeroizing<Vec<u8>>) -> AppResult<Response> {
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
     }
 
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
-    {
-        body = decode_chunked(&body)?;
-    }
+    let body_start = header_end.len() + 4;
+    let initial_body = raw
+        .get(body_start..)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
+    let connection_close = header_has_token(&headers, "connection", "close");
+    let mut reusable = match version {
+        "HTTP/1.1" => !connection_close,
+        "HTTP/1.0" => header_has_token(&headers, "connection", "keep-alive"),
+        _ => false,
+    };
 
-    Ok(Response {
-        status,
-        headers,
-        body,
-    })
+    let body = if response_has_no_body(status) {
+        if !initial_body.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "body is not allowed for response status",
+            )
+            .into());
+        }
+        Zeroizing::new(Vec::new())
+    } else if let Some(transfer_encoding) = headers.get("transfer-encoding") {
+        let encodings = transfer_encoding
+            .split(',')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if encodings.len() != 1 || !encodings[0].eq_ignore_ascii_case("chunked") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported transfer encoding",
+            )
+            .into());
+        }
+        decode_chunked(stream, initial_body)?
+    } else if let Some(content_length) = headers.get("content-length") {
+        let content_length = content_length.parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid response content-length",
+            )
+        })?;
+        read_content_length(stream, initial_body, content_length)?
+    } else {
+        reusable = false;
+        let mut body = Zeroizing::new(initial_body.to_vec());
+        stream.read_to_end(&mut body)?;
+        body
+    };
+
+    Ok((
+        Response {
+            status,
+            headers,
+            body,
+        },
+        reusable,
+    ))
 }
 
-fn decode_chunked(mut body: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+fn read_content_length(
+    stream: &mut UnixStream,
+    initial_body: &[u8],
+    content_length: usize,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    if initial_body.len() > content_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response body exceeds content-length",
+        ));
+    }
+    let mut body = Zeroizing::new(Vec::with_capacity(content_length));
+    body.extend_from_slice(initial_body);
+    let start = body.len();
+    body.resize(content_length, 0);
+    stream.read_exact(&mut body[start..])?;
+    Ok(body)
+}
+
+fn decode_chunked(stream: &mut UnixStream, initial_body: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut reader = ResponseBodyReader::new(stream, initial_body);
     let mut decoded = Zeroizing::new(Vec::new());
     loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk"))?;
-        let size_text = std::str::from_utf8(&body[..line_end])
+        let size_line = reader.read_line()?;
+        let size_text = std::str::from_utf8(&size_line)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let size_text = size_text.split(';').next().unwrap_or(size_text);
         let size = usize::from_str_radix(size_text.trim(), 16)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        body = &body[line_end + 2..];
         if size == 0 {
+            loop {
+                if reader.read_line()?.is_empty() {
+                    break;
+                }
+            }
             return Ok(decoded);
         }
-        if body.len() < size + 2 || &body[size..size + 2] != b"\r\n" {
+        reader.read_exact_into(&mut decoded, size)?;
+        if reader.read_byte()? != b'\r' || reader.read_byte()? != b'\n' {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "chunk shorter than declared size",
+                "chunk is missing its terminator",
             ));
         }
-        decoded.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
     }
+}
+
+struct ResponseBodyReader<'a> {
+    stream: &'a mut UnixStream,
+    initial: Zeroizing<Vec<u8>>,
+    position: usize,
+}
+
+impl<'a> ResponseBodyReader<'a> {
+    fn new(stream: &'a mut UnixStream, initial: &[u8]) -> Self {
+        Self {
+            stream,
+            initial: Zeroizing::new(initial.to_vec()),
+            position: 0,
+        }
+    }
+
+    fn read_byte(&mut self) -> io::Result<u8> {
+        if let Some(byte) = self.initial.get(self.position).copied() {
+            self.position += 1;
+            return Ok(byte);
+        }
+        let mut byte = [0_u8; 1];
+        self.stream.read_exact(&mut byte)?;
+        Ok(byte[0])
+    }
+
+    fn read_line(&mut self) -> io::Result<Zeroizing<Vec<u8>>> {
+        let mut line = Zeroizing::new(Vec::new());
+        loop {
+            match self.read_byte()? {
+                b'\r' if self.read_byte()? == b'\n' => return Ok(line),
+                b'\r' => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed chunk line",
+                    ));
+                }
+                byte => line.push(byte),
+            }
+        }
+    }
+
+    fn read_exact_into(
+        &mut self,
+        destination: &mut Zeroizing<Vec<u8>>,
+        length: usize,
+    ) -> io::Result<()> {
+        let available = self.initial.len().saturating_sub(self.position);
+        let from_initial = available.min(length);
+        destination.extend_from_slice(
+            &self.initial[self.position..self.position.saturating_add(from_initial)],
+        );
+        self.position += from_initial;
+
+        let remaining = length - from_initial;
+        let start = destination.len();
+        destination.resize(start + remaining, 0);
+        self.stream.read_exact(&mut destination[start..])
+    }
+}
+
+fn header_has_token(headers: &HashMap<String, String>, name: &str, token: &str) -> bool {
+    headers.get(name).is_some_and(|value| {
+        value
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case(token))
+    })
+}
+
+fn response_has_no_body(status: u16) -> bool {
+    (100..200).contains(&status) || matches!(status, 204 | 304)
 }
 
 fn is_access_denied(response: &Response) -> bool {
@@ -1139,6 +1329,107 @@ mod tests {
         server.join();
     }
 
+    #[test]
+    fn chunked_response_keeps_connection_aligned_for_next_request() {
+        let body = r#"{"entries":[{"value":"Personal","kind":"dir"}],"truncated":false}"#;
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: chunked_json_response(body),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(body),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        for _ in 0..2 {
+            let response = client
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .unwrap();
+            assert_eq!("Personal", response.entries[0].value);
+        }
+        server.join();
+    }
+
+    #[test]
+    fn server_connection_close_causes_next_request_to_reconnect() {
+        let body = r#"{"entries":[],"truncated":false}"#;
+        let server = TestServer::with_connections(vec![
+            vec![ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: close_json_response(body),
+            }],
+            vec![ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(body),
+            }],
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        assert!(
+            client
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_some()
+        );
+        assert!(
+            client
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_some()
+        );
+        server.join();
+    }
+
+    #[test]
+    fn truncated_response_causes_next_request_to_reconnect() {
+        let body = r#"{"entries":[],"truncated":false}"#;
+        let server = TestServer::with_connections(vec![
+            vec![ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}".to_owned(),
+            }],
+            vec![ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/shell/completions?prefix=Per&kinds=dir",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(body),
+            }],
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        assert!(
+            client
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_none()
+        );
+        assert!(
+            client
+                .shell_completions("Per", &[ShellCompletionKind::Dir])
+                .is_some()
+        );
+        server.join();
+    }
+
     fn request_with_test_prompt(config: &Config, auth_mode: AuthMode) -> Response {
         Client::with_capabilities(config, None)
             .request_with_unlock_prompt(
@@ -1182,18 +1473,24 @@ mod tests {
 
     impl TestServer {
         fn new(expected: Vec<ExpectedRequest>) -> Self {
+            Self::with_connections(vec![expected])
+        }
+
+        fn with_connections(expected_connections: Vec<Vec<ExpectedRequest>>) -> Self {
             let tempdir = tempfile::TempDir::new().unwrap();
             let listen_path = tempdir.path().join("agent.sock");
             let listener = UnixListener::bind(&listen_path).unwrap();
             let handle = thread::spawn(move || {
-                for expected in expected {
+                for expected in expected_connections {
                     let (mut stream, _) = listener.accept().unwrap();
-                    let request = read_request(&mut stream);
-                    assert_eq!(expected.method, request.method);
-                    assert_eq!(expected.path, request.path);
-                    assert_eq!(expected.authorization, request.authorization);
-                    assert_eq!(expected.client_capabilities, request.client_capabilities);
-                    stream.write_all(expected.response.as_bytes()).unwrap();
+                    for expected in expected {
+                        let request = read_request(&mut stream);
+                        assert_eq!(expected.method, request.method);
+                        assert_eq!(expected.path, request.path);
+                        assert_eq!(expected.authorization, request.authorization);
+                        assert_eq!(expected.client_capabilities, request.client_capabilities);
+                        stream.write_all(expected.response.as_bytes()).unwrap();
+                    }
                 }
             });
 
@@ -1223,22 +1520,23 @@ mod tests {
     fn read_request(stream: &mut std::os::unix::net::UnixStream) -> RecordedRequest {
         let mut raw = Vec::new();
         let mut buffer = [0_u8; 1024];
-        loop {
+        let header_end = loop {
+            if let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                break header_end;
+            }
             let read = stream.read(&mut buffer).unwrap();
             assert_ne!(0, read, "client closed before request headers");
             raw.extend_from_slice(&buffer[..read]);
-            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-        }
+        };
 
-        let text = std::str::from_utf8(&raw).unwrap();
+        let text = std::str::from_utf8(&raw[..header_end]).unwrap();
         let mut lines = text.split("\r\n");
         let mut request_line = lines.next().unwrap().split_whitespace();
         let method = request_line.next().unwrap().to_owned();
         let path = request_line.next().unwrap().to_owned();
         let mut authorization = None;
         let mut client_capabilities = None;
+        let mut content_length = 0;
         for line in lines {
             if let Some(value) = line.strip_prefix("Authorization: ") {
                 authorization = Some(value.to_owned());
@@ -1246,6 +1544,18 @@ mod tests {
             if let Some(value) = line.strip_prefix("X-Client-Capabilities: ") {
                 client_capabilities = Some(value.to_owned());
             }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                content_length = value.parse::<usize>().unwrap();
+            }
+            assert_ne!("Connection: close", line);
+        }
+
+        let body_start = header_end + 4;
+        assert!(raw.len() <= body_start + content_length);
+        while raw.len() < body_start + content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(0, read, "client closed before request body");
+            raw.extend_from_slice(&buffer[..read]);
         }
 
         RecordedRequest {
@@ -1269,6 +1579,23 @@ mod tests {
 
     fn ok_empty_response() -> String {
         http_response(200, "")
+    }
+
+    fn close_json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn chunked_json_response(body: &str) -> String {
+        let midpoint = body.len() / 2;
+        let (first, second) = body.split_at(midpoint);
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\nX-Test: complete\r\n\r\n",
+            first.len(),
+            second.len()
+        )
     }
 
     fn http_response(status: u16, body: &str) -> String {

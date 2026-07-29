@@ -26,9 +26,16 @@ wiring only and put implementation in focused modules, for example:
 
 Implement a small blocking HTTP client over the Unix socket at
 `Config::listen_path()`. The client should decode structured API errors and
-preserve status codes for command-specific handling. On any auth-required
-request that returns `403 access_denied`, select the first advertised unlock
-method through the discovery flow in
+preserve status codes for command-specific handling. Each client keeps one
+HTTP/1.1 connection open and serially reuses it for ordinary requests,
+authorization discovery and unlock, request retries, pagination, and job
+polling. A response that requests connection closure, uses EOF body framing, or
+fails transport or protocol validation discards that connection so the next
+request opens a new one. A request is not automatically replayed after a
+transport failure because the agent may already have applied it.
+
+On any auth-required request that returns `403 access_denied`, select the first
+advertised unlock method through the discovery flow in
 [`flexible-auth-spec.md`](flexible-auth-spec.md). When `DISPLAY` is set, send
 `X-Client-Capabilities: x-session=<DISPLAY>` on method discovery and GUI unlock
 requests. When `DISPLAY` is unset and `WAYLAND_DISPLAY` is set, send
