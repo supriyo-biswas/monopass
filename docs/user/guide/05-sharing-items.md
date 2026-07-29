@@ -45,11 +45,22 @@ alice$ monopass share Work/AcmeDeploy bob@example.com \
 
 Alice then sends the encrypted `AcmeDeploy-for-Bob.export` file to Bob.
 
+The `.export` file is age-encrypted. Its authenticated plaintext is a versioned
+gzip-compressed tar stream, so monopass can share large files without creating
+a plaintext archive on disk or loading the complete archive into memory.
+Exports made by older ZIP-based versions are intentionally incompatible with
+this format and must be recreated by the sender.
+
 ## Bob imports the credential
 
 Bob receives the file that Alice sent, and imports it in his monopass instance by running `monopass import`. He can then view the item using `monopass show`:
 
 ```
+
+monopass validates the complete archive and its age, gzip, size, and SHA-256
+checks before creating the item. If validation fails after a new file blob was
+stored, that unattached blob is removed; an already existing deduplicated blob
+is left intact.
 bob$ monopass import Work/AcmeDeploy ./AcmeDeploy-for-Bob.export
 bob$ monopass show Work/AcmeDeploy
 Name: AcmeDeploy

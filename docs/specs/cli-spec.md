@@ -664,20 +664,20 @@ monopass share [-g|--globoff] [-r|--recursive] <item>... <contact>
     [--out-file <file> | --out-dir <dir>]
 ```
 
-Export each item as an age-encrypted ZIP for the contact by fetching the
-contact, item, and file contents. For each item:
+Export each item as an age-encrypted, gzip-compressed version 1 tar archive for
+the contact. The `.export` extension is unchanged. For each item:
 
 1. Request an agent export job for the requested contact email.
-2. Fetch raw item metadata with
-   `GET /api/v1/dir/{dirName}/item/{itemName}?raw=true`.
-3. For every file entry in the item metadata, stream
-   `GET /api/v1/ref/{dirName}/{itemName}/{fileName}` into the ZIP as
-   `files/<sha256>`, using the response `ETag` as the plaintext SHA-256 and
-   verifying it against the streamed bytes.
-4. Write `fields.json` from the item response, replacing each file metadata
-   entry with an importable entry containing the file `name` and plaintext
-   SHA-256 from the `ETag`.
-5. Encrypt the ZIP to the contact's age public key.
+2. Poll the existing job status API until it succeeds or fails.
+3. Stream the completed encrypted job file to the selected destination or
+   stdout. Do not load it with `fs::read`.
+4. Remove the agent job output only after the destination stream and flush
+   succeed.
+
+The agent obtains one database snapshot and streams
+`database -> tar -> gzip -> age -> random private temporary file`. The decrypted
+entry order, manifest shape and 16 MiB manifest limit are specified in the API
+specification. Older ZIP exports are intentionally incompatible.
 
 Every item source component is a case-sensitive glob pattern by default and is
 expanded through ListItems before any export job starts. `-g`/`--globoff`
@@ -725,10 +725,18 @@ bytes as `application/octet-stream`. The agent uses the hidden local age
 private identity to decrypt and validate the archive in a background import
 job, then returns `202 Accepted` with a job ID.
 
+Open the input once and stream it through the shared Unix-socket client with
+zeroizing transfer chunks. Use its file length for `Content-Length` and rewind
+the open file before retrying the original upload after unlock. Do not load the
+whole encrypted export into memory.
+
 After submit, poll `GET /api/v1/jobs/status/{job_id}` until the status is terminal.
 Exit successfully only for `succeeded`. For `failed`, print/return the job's
 structured error code and message as the command failure. The CLI must not open
 the encrypted database directly and must not read the local age private key.
+The agent writes only the encrypted upload to temporary storage, bounds archive
+memory by the 16 MiB manifest, metadata, channels, and library buffers, and
+removes newly created blobs if later validation fails.
 
 # `pwgenspec` specification
 

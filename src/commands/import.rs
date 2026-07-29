@@ -1,14 +1,12 @@
-use std::fs;
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Args as ClapArgs;
-use clap_complete::engine::ArgValueCompleter;
-use zeroize::Zeroizing;
-
 use crate::AppResult;
 use crate::config::Config;
+use clap::Args as ClapArgs;
+use clap_complete::engine::ArgValueCompleter;
 
 use super::client::{Client, api_path, path_component};
 use super::models::{JobAcceptedResponse, JobResponse, JobStatus};
@@ -25,14 +23,16 @@ pub struct Args {
 pub fn run(config: &Config, args: Args) -> AppResult {
     let item_path = parse_item_path(&args.path)?;
     let client = Client::new(config);
-    let encrypted = Zeroizing::new(fs::read(args.file)?);
-    let accepted: JobAcceptedResponse = client.put_bytes_json(
+    let mut encrypted = File::open(args.file)?;
+    let content_length = encrypted.metadata()?.len();
+    let accepted: JobAcceptedResponse = client.put_reader_json(
         &api_path(&format!(
             "/jobs/import/{}/{}",
             path_component(&item_path.dir),
             path_component(&item_path.item),
         )),
-        encrypted,
+        &mut encrypted,
+        content_length,
     )?;
     poll_job(&client, &accepted.job_id)
 }

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -82,7 +82,9 @@ pub fn run(config: &Config, args: Args) -> AppResult {
         let output_path = poll_export_job(&client, &accepted.job_id)?;
         copy_job_output(&output_path, &destination)?;
         fs::remove_file(&output_path)?;
-        copied.push(destination);
+        if destination != Path::new("-") {
+            copied.push(destination);
+        }
     }
 
     for path in copied {
@@ -245,18 +247,27 @@ fn poll_export_job(client: &Client<'_>, job_id: &str) -> AppResult<PathBuf> {
 }
 
 fn copy_job_output(source: &Path, destination: &Path) -> io::Result<()> {
-    let bytes = fs::read(source)?;
+    if destination == Path::new("-") {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        return copy_job_output_to_writer(source, &mut stdout);
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)?;
-    file.write_all(&bytes)?;
-    file.flush()
+    copy_job_output_to_writer(source, &mut file)
+}
+
+fn copy_job_output_to_writer(source: &Path, destination: &mut impl Write) -> io::Result<()> {
+    let mut source = File::open(source)?;
+    io::copy(&mut source, destination)?;
+    destination.flush()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemPath, plan_share_items};
+    use super::{ItemPath, copy_job_output, copy_job_output_to_writer, plan_share_items};
     use crate::AppResult;
 
     fn no_lists(_: &str, _: Option<&str>) -> AppResult<Vec<String>> {
@@ -317,6 +328,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Github", "Gitlab", "Codehub"]
         );
+    }
+
+    #[test]
+    fn job_output_is_streamed_to_a_writer_and_new_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("job.export");
+        let destination = temp.path().join("copied.export");
+        let bytes = vec![0xa5; 64 * 1024 + 7];
+        std::fs::write(&source, &bytes).unwrap();
+
+        let mut streamed = Vec::new();
+        copy_job_output_to_writer(&source, &mut streamed).unwrap();
+        assert_eq!(bytes, streamed);
+
+        copy_job_output(&source, &destination).unwrap();
+        assert_eq!(bytes, std::fs::read(destination).unwrap());
     }
 
     #[test]

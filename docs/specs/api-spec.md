@@ -905,21 +905,82 @@ Content-Type: application/json
 ```
 
 Starts an agent-backed background import job for an age-encrypted share export.
-The request body is spooled to a private temporary file; the background job
-uses the local hidden age private identity, decrypts the payload, validates the
-ZIP archive, verifies every `files/<sha256>` entry against its plaintext
-SHA-256, uploads files with short file-write operations, and creates the target
-item once all archive content is valid. Existing target items fail with a
-failed job rather than replacing or merging.
+The request body is spooled as encrypted bytes only. A blocking parser streams
+`age -> gzip -> tar` through bounded buffers and sends plaintext file chunks
+over the bounded database worker channel. No plaintext archive is written to
+disk.
 
-The archive `fields.json` uses the same item shape as `GET Item`: `fields` and
-`files` are arrays with unique `name` values. Export file entries replace item
-file metadata with `{ "name": "...", "sha256": "..." }`.
+The decrypted payload is a versioned tar archive, compressed with gzip. Its
+entries are exactly:
+
+1. `manifest.json`
+2. one regular `files/<lowercase-sha256>` entry per manifest file, in manifest
+   order
+3. the tar terminator, with no additional entries or trailing data
+
+`manifest.json` is limited to 16 MiB and has this shape:
+
+```json
+{
+  "format": "monopass-export",
+  "version": 1,
+  "name": "Original item name",
+  "fields": [
+    {"name": "password", "type": "string", "concealed": true, "data": "secret"}
+  ],
+  "files": [
+    {"name": "notes.bin", "sha256": "<64 lowercase hex>", "size": 1234}
+  ]
+}
+```
+
+The manifest item name is informational; `{dirName}/{itemName}` selects the
+import target. Unknown fields or versions, duplicate names or checksums,
+invalid hashes, oversized files, non-regular entries, path/type/size/order
+mismatches, missing or extra entries, checksum failures, truncation, invalid
+gzip checksums, and failed age authentication all fail closed. Version 1 ZIP
+exports from older monopass releases are intentionally incompatible and fail
+as `bad_archive`.
+
+Each file's declared size and SHA-256 are validated by the file worker before
+the encrypted blob is committed. The item is created only after the tar
+terminator, gzip checksum, and age authentication have been fully consumed.
+If a later validation or item-create step fails, newly created unattached
+blobs are deleted immediately; pre-existing deduplicated blobs are preserved.
+Normal orphan collection remains crash recovery. Existing target items fail
+with a failed job rather than replacing or merging.
 
 The endpoint requires the same unlocked database and authorized process lineage
 as other database routes. Initial submit errors use normal structured API
 errors. Archive, decrypt, missing target directory, file write, and item
 conflict failures after acceptance are recorded in the job status.
+
+### Export Item
+
+```http
+PUT /api/v1/jobs/export/{dirName}/{itemName}/{contactEmail}
+
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+
+{
+  "job_id": "00112233445566778899aabbccddeeff",
+  "status": "queued"
+}
+```
+
+Starts an agent-backed background export job without changing the job model or
+the `.export` suffix. One database snapshot supplies raw fields and each file's
+name, size, and SHA-256 in stable name order. A blocking worker streams
+`database chunks -> tar -> gzip -> age` into a cryptographically randomly named
+`0600` temporary file inside the random private job directory. File byte counts
+and SHA-256 values are checked against the snapshot while streaming.
+
+Tar headers and gzip metadata are deterministic. Tar, gzip, age, and file
+flushing are finalized in that order. The encrypted output is atomically
+published with no-clobber semantics only after complete success; failure drops
+and removes the random temporary file. Job storage never contains a plaintext
+archive.
 
 ## Jobs
 

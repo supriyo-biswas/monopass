@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
+use age::secrecy::ExposeSecret;
 use base64::Engine;
 use base64::engine::general_purpose;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1146,6 +1148,7 @@ impl DbHandle {
         self.create_file_from_bytes(Zeroizing::new(body)).await
     }
 
+    #[cfg(test)]
     pub async fn create_file_from_bytes(
         &self,
         body: Zeroizing<Vec<u8>>,
@@ -1170,13 +1173,33 @@ impl DbHandle {
         chunks: mpsc::Receiver<Zeroizing<Vec<u8>>>,
         expected_size: u64,
     ) -> Result<String, DbError> {
+        self.create_file_from_chunks_validated(chunks, expected_size, None)
+            .await
+            .map(|created| created.id)
+    }
+
+    pub async fn create_file_from_chunks_validated(
+        &self,
+        chunks: mpsc::Receiver<Zeroizing<Vec<u8>>>,
+        expected_size: u64,
+        expected_sha256: Option<String>,
+    ) -> Result<CreatedFile, DbError> {
         validate_file_upload_size(expected_size)?;
+        if let Some(expected_sha256) = expected_sha256.as_deref() {
+            validate_sha256_hex(expected_sha256)?;
+        }
         self.request_writer(|reply| DbCommand::CreateFile {
             chunks,
             expected_size,
+            expected_sha256,
             reply,
         })
         .await
+    }
+
+    pub async fn delete_unattached_file(&self, id: String) -> Result<(), DbError> {
+        self.request_writer(|reply| DbCommand::DeleteUnattachedFile { id, reply })
+            .await
     }
 
     pub async fn lookup_file_by_sha256(&self, sha256: String) -> Result<String, DbError> {
@@ -1217,6 +1240,19 @@ impl DbHandle {
             reveal,
             raw,
             mustauth_satisfied,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn export_snapshot(
+        &self,
+        dir_name: String,
+        item_name: String,
+    ) -> Result<ExportSnapshot, DbError> {
+        self.request_reader(|reply| DbCommand::ExportSnapshot {
+            dir_name,
+            item_name,
             reply,
         })
         .await
@@ -1837,6 +1873,25 @@ pub enum ReferenceBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedFile {
+    pub id: String,
+    pub newly_created: bool,
+}
+
+pub struct ExportSnapshot {
+    pub name: String,
+    pub fields: Vec<FieldEntry>,
+    pub files: Vec<ExportSnapshotFile>,
+}
+
+pub struct ExportSnapshotFile {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+    pub chunks: mpsc::Receiver<Result<Zeroizing<Vec<u8>>, DbError>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbError {
     AccessDenied,
     BadRequest(String),
@@ -1948,7 +2003,12 @@ enum DbCommand {
     CreateFile {
         chunks: mpsc::Receiver<Zeroizing<Vec<u8>>>,
         expected_size: u64,
-        reply: oneshot::Sender<Result<String, DbError>>,
+        expected_sha256: Option<String>,
+        reply: oneshot::Sender<Result<CreatedFile, DbError>>,
+    },
+    DeleteUnattachedFile {
+        id: String,
+        reply: oneshot::Sender<Result<(), DbError>>,
     },
     LookupFileBySha256 {
         sha256: String,
@@ -1969,6 +2029,11 @@ enum DbCommand {
         raw: bool,
         mustauth_satisfied: bool,
         reply: oneshot::Sender<Result<ItemResponse, DbError>>,
+    },
+    ExportSnapshot {
+        dir_name: String,
+        item_name: String,
+        reply: oneshot::Sender<Result<ExportSnapshot, DbError>>,
     },
     UpdateItem {
         dir_name: String,
@@ -2196,9 +2261,13 @@ impl DatabaseWorker {
             DbCommand::CreateFile {
                 chunks,
                 expected_size,
+                expected_sha256,
                 reply,
             } => {
-                let _ = reply.send(self.create_file(chunks, expected_size));
+                let _ = reply.send(self.create_file(chunks, expected_size, expected_sha256));
+            }
+            DbCommand::DeleteUnattachedFile { id, reply } => {
+                let _ = reply.send(self.delete_unattached_file(&id));
             }
             DbCommand::LookupFileBySha256 { sha256, reply } => {
                 let _ = reply.send(self.lookup_file_by_sha256(&sha256));
@@ -2229,6 +2298,13 @@ impl DatabaseWorker {
                     raw,
                     mustauth_satisfied,
                 ));
+            }
+            DbCommand::ExportSnapshot {
+                dir_name,
+                item_name,
+                reply,
+            } => {
+                let _ = reply.send(self.export_snapshot(&dir_name, &item_name));
             }
             DbCommand::UpdateItem {
                 dir_name,
@@ -3310,7 +3386,8 @@ impl DatabaseWorker {
         &mut self,
         mut chunks: mpsc::Receiver<Zeroizing<Vec<u8>>>,
         expected_size: u64,
-    ) -> Result<String, DbError> {
+        expected_sha256: Option<String>,
+    ) -> Result<CreatedFile, DbError> {
         validate_file_upload_size(expected_size)?;
         let key = self.file_encryption_key()?;
         let mut id = [0u8; FILE_ID_BYTES];
@@ -3363,10 +3440,20 @@ impl DatabaseWorker {
         temp_file.flush().map_err(|_| DbError::Internal)?;
         drop(temp_file);
         let sha256 = hex_encode(&sha256.finalize());
+        if expected_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != sha256)
+        {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(DbError::BadRequest("file checksum mismatch".to_owned()));
+        }
 
         if let Some(existing_id) = self.file_id_by_sha256(&sha256)? {
             let _ = std::fs::remove_file(&temp_path);
-            return Ok(hex_encode(&existing_id));
+            return Ok(CreatedFile {
+                id: hex_encode(&existing_id),
+                newly_created: false,
+            });
         }
 
         let transaction = self
@@ -3401,7 +3488,56 @@ impl DatabaseWorker {
             return Err(DbError::Internal);
         }
 
-        Ok(id_hex)
+        Ok(CreatedFile {
+            id: id_hex,
+            newly_created: true,
+        })
+    }
+
+    fn delete_unattached_file(&mut self, id: &str) -> Result<(), DbError> {
+        let id = hex_decode_exact(id, FILE_ID_BYTES)
+            .ok_or_else(|| DbError::BadRequest("invalid file id".to_owned()))?;
+        let is_unattached = self
+            .connection
+            .query_row(
+                r#"
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM item_version_file_mapping
+                    WHERE file_id = ?1
+                )
+                "#,
+                [&id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|_| DbError::Internal)?;
+        let Some(true) = is_unattached else {
+            return Ok(());
+        };
+
+        let id_hex = hex_encode(&id);
+        let path = file_path(&self.file_store_path, &id_hex);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(DbError::Internal),
+        }
+        self.connection
+            .execute(
+                r#"
+                DELETE FROM files
+                WHERE id = ?1
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM item_version_file_mapping
+                    WHERE file_id = ?1
+                  )
+                "#,
+                [&id],
+            )
+            .map(|_| ())
+            .map_err(|_| DbError::Internal)
     }
 
     fn lookup_file_by_sha256(&self, sha256: &str) -> Result<String, DbError> {
@@ -3484,6 +3620,91 @@ impl DatabaseWorker {
             created_at: format_timestamp(row.item_created_at),
             updated_at: format_timestamp(row.item_updated_at),
             total_versions,
+        })
+    }
+
+    fn export_snapshot(&self, dir_name: &str, item_name: &str) -> Result<ExportSnapshot, DbError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| DbError::Internal)?;
+        let dir_id = dir_id_in(&transaction, dir_name)?.ok_or_else(|| dir_not_found(dir_name))?;
+        public_item_row_in(&transaction, dir_id, item_name)?
+            .ok_or_else(|| item_not_found(dir_name, item_name))?;
+        let row = item_version_row(&transaction, dir_id, item_name, None)?;
+        let fields = field_entries(item_fields_for_version(
+            &transaction,
+            row.item_id,
+            row.version_id,
+        )?);
+
+        let mut statement = transaction
+            .prepare(
+                r#"
+                SELECT m.file_name, f.id, f.sha256, f.size, f.nonce
+                FROM item_version_file_mapping m
+                JOIN files f ON f.id = m.file_id
+                WHERE m.item_id = ?1 AND m.version_id = ?2
+                ORDER BY m.file_name
+                "#,
+            )
+            .map_err(|_| DbError::Internal)?;
+        let files = statement
+            .query_map((row.item_id, row.version_id), |row| {
+                let size = row.get::<_, i64>(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    StoredFile {
+                        id: row.get(1)?,
+                        sha256: row.get(2)?,
+                        nonce: row.get(4)?,
+                    },
+                    size,
+                ))
+            })
+            .map_err(|_| DbError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| DbError::Internal)?;
+        drop(statement);
+
+        let internal_dir_id =
+            dir_id_in(&transaction, INTERNAL_DIR_NAME)?.ok_or(DbError::Internal)?;
+        let key_item_id = item_id_in(&transaction, internal_dir_id, FILE_ENCRYPTION_KEY_ITEM_NAME)?
+            .ok_or(DbError::Internal)?;
+        let key_fields = source_fields(&transaction, key_item_id)?;
+        let key_hex = key_fields
+            .get("key")
+            .filter(|field| matches!(field.field_type, FieldType::String))
+            .map(|field| Zeroizing::new(field.data.as_str().to_owned()))
+            .ok_or(DbError::Internal)?;
+        let key = decode_file_key(key_hex.as_str())?;
+        transaction.commit().map_err(|_| DbError::Internal)?;
+
+        let mut snapshot_files = Vec::with_capacity(files.len());
+        let mut stream_jobs = Vec::with_capacity(files.len());
+        for (name, file, size) in files {
+            let size = u64::try_from(size).map_err(|_| DbError::Internal)?;
+            let sha256 = file.sha256.clone();
+            let (sender, chunks) = mpsc::channel(8);
+            stream_jobs.push((file, sender));
+            snapshot_files.push(ExportSnapshotFile {
+                name,
+                size,
+                sha256,
+                chunks,
+            });
+        }
+        let file_store_path = self.file_store_path.clone();
+        std::thread::spawn(move || {
+            for (file, sender) in stream_jobs {
+                stream_decrypt_stored_file(&file_store_path, &key, &file, sender);
+            }
+        });
+
+        Ok(ExportSnapshot {
+            name: row.item_name,
+            fields,
+            files: snapshot_files,
         })
     }
 
@@ -5097,11 +5318,20 @@ fn insert_test_file_key(connection: &Connection) {
         0,
         r#"{"key":{"type":"string","concealed":false,"data":"age1unused"}}"#,
     );
+    let identity = age::x25519::Identity::generate();
+    let private_key_fields = serde_json::json!({
+        "key": {
+            "type": "string",
+            "concealed": true,
+            "data": identity.to_string().expose_secret(),
+        }
+    })
+    .to_string();
     insert_test_internal_key_item(
         connection,
         AGE_PRIVATE_KEY_ITEM_NAME,
         ITEM_HIDDEN | ITEM_READ_MUSTAUTH,
-        r#"{"key":{"type":"string","concealed":true,"data":"AGE-SECRET-KEY-unused"}}"#,
+        &private_key_fields,
     );
 }
 
@@ -7625,7 +7855,7 @@ mod tests {
             .mark_job_failed(
                 job_id.clone(),
                 "bad_archive".to_owned(),
-                "fields.json is malformed".to_owned(),
+                "manifest.json is malformed".to_owned(),
             )
             .await
             .unwrap();

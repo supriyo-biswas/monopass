@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 
 use base64::Engine;
@@ -270,6 +270,24 @@ impl<'a> Client<'a> {
         Ok(serde_json::from_slice(&response.body)?)
     }
 
+    pub fn put_reader_json<T: DeserializeOwned, R: Read + Seek>(
+        &self,
+        path: &str,
+        body: &mut R,
+        content_length: u64,
+    ) -> AppResult<T> {
+        let response = self.request_reader_with_unlock_prompt(
+            "PUT",
+            path,
+            body,
+            content_length,
+            Some("application/octet-stream"),
+            AuthMode::ProcessOnly,
+            prompt_master_password,
+        )?;
+        Ok(serde_json::from_slice(&response.body)?)
+    }
+
     pub fn request_with_unlock(
         &self,
         method: &str,
@@ -363,6 +381,60 @@ impl<'a> Client<'a> {
         Ok(response)
     }
 
+    fn request_reader_with_unlock_prompt<R, F>(
+        &self,
+        method: &str,
+        path: &str,
+        body: &mut R,
+        content_length: u64,
+        content_type: Option<&str>,
+        auth_mode: AuthMode,
+        prompt: F,
+    ) -> AppResult<Response>
+    where
+        R: Read + Seek,
+        F: FnOnce() -> io::Result<Zeroizing<String>>,
+    {
+        let mut password: Option<Zeroizing<String>> = None;
+        body.seek(SeekFrom::Start(0))?;
+        let mut response =
+            self.request_reader(method, path, body, content_length, content_type, None)?;
+        if is_access_denied(&response) {
+            let unlock_method = self.first_unlock_method(AccessScope::for_api_path(path))?;
+            if unlock_method.accepts_master_password {
+                let prompted = prompt()?;
+                self.unlock(&unlock_method, Some(&prompted))?;
+                password = Some(prompted);
+            } else {
+                self.unlock(&unlock_method, None)?;
+            }
+
+            let bearer = match auth_mode {
+                AuthMode::ProcessOnly => None,
+                AuthMode::IncludePassword => password.as_deref().map(String::as_str),
+            };
+            body.seek(SeekFrom::Start(0))?;
+            response =
+                self.request_reader(method, path, body, content_length, content_type, bearer)?;
+        }
+
+        if is_access_denied(&response) {
+            return Err(ApiError {
+                status: response.status,
+                code: "access_denied".to_owned(),
+                message: "access denied".to_owned(),
+            }
+            .into());
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(api_error(response).into());
+        }
+        if let Some(mut password) = password {
+            password.zeroize();
+        }
+        Ok(response)
+    }
+
     fn first_unlock_method(&self, access_scope: AccessScope) -> AppResult<AuthUnlockMethod> {
         let response = self.request_with_client_capabilities(
             "GET",
@@ -420,6 +492,55 @@ impl<'a> Client<'a> {
             bearer_password,
             false,
         )
+    }
+
+    fn request_reader<R: Read>(
+        &self,
+        method: &str,
+        path: &str,
+        body: &mut R,
+        content_length: u64,
+        content_type: Option<&str>,
+        bearer_password: Option<&str>,
+    ) -> AppResult<Response> {
+        let mut request = Zeroizing::new(format!(
+            "{method} {path} HTTP/1.1\r\nHost: monopass\r\nContent-Length: {content_length}\r\n"
+        ));
+        if let Some(content_type) = content_type {
+            request.push_str("Content-Type: ");
+            request.push_str(content_type);
+            request.push_str("\r\n");
+        }
+        if let Some(password) = bearer_password {
+            let token = Zeroizing::new(general_purpose::STANDARD.encode(password.as_bytes()));
+            request.push_str("Authorization: Bearer ");
+            request.push_str(&token);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+
+        let mut connection = self.connection.borrow_mut();
+        if connection.is_none() {
+            *connection = Some(UnixStream::connect(self.config.listen_path())?);
+        }
+        let result = send_request_reader(
+            connection.as_mut().expect("connection was initialized"),
+            &request,
+            body,
+            content_length,
+        );
+        match result {
+            Ok((response, reusable)) => {
+                if !reusable {
+                    connection.take();
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                connection.take();
+                Err(error)
+            }
+        }
     }
 
     fn request_with_client_capabilities(
@@ -485,6 +606,39 @@ fn send_request(
 ) -> AppResult<(Response, bool)> {
     stream.write_all(request.as_bytes())?;
     stream.write_all(body)?;
+    read_response(stream)
+}
+
+fn send_request_reader<R: Read>(
+    stream: &mut UnixStream,
+    request: &str,
+    body: &mut R,
+    content_length: u64,
+) -> AppResult<(Response, bool)> {
+    stream.write_all(request.as_bytes())?;
+    let mut remaining = content_length;
+    let mut buffer = Zeroizing::new(vec![0_u8; 16 * 1024]);
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| io::Error::other("request body length overflow"))?;
+        let read = body.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "request body ended before content-length",
+            )
+            .into());
+        }
+        stream.write_all(&buffer[..read])?;
+        remaining -= u64::try_from(read).map_err(io::Error::other)?;
+    }
+    if body.read(&mut buffer[..1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request body exceeds content-length",
+        )
+        .into());
+    }
     read_response(stream)
 }
 
@@ -1210,6 +1364,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(200, response.status);
+        server.join();
+    }
+
+    #[test]
+    fn streamed_request_is_rewound_for_unlock_retry() {
+        let path = "/api/v1/jobs/import/Personal/Github";
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "PUT",
+                path,
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/gui","accepts_master_password":false}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/gui",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "PUT",
+                path,
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"job_id":"00112233445566778899aabbccddeeff","status":"queued"}"#,
+                ),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let mut body = std::io::Cursor::new(vec![0xa5; 32 * 1024 + 7]);
+        let content_length = body.get_ref().len() as u64;
+
+        let response: crate::commands::models::JobAcceptedResponse =
+            Client::with_capabilities(&config, None)
+                .put_reader_json(path, &mut body, content_length)
+                .unwrap();
+
+        assert_eq!("00112233445566778899aabbccddeeff", response.job_id);
         server.join();
     }
 

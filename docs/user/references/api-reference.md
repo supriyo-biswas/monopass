@@ -644,6 +644,20 @@ Content-Type: application/json
 }
 ```
 
+The encrypted payload contains a gzip-compressed version 1 tar archive. Its
+first entry is a `manifest.json` of at most 16 MiB, followed by regular
+`files/<lowercase-sha256>` entries in manifest order and the tar terminator.
+The manifest identifies `format: "monopass-export"`, `version: 1`, the original
+item name, fields, and each file's name, SHA-256, and size. The URL chooses the
+new item name.
+
+Import streams the authenticated payload without writing plaintext archives to
+disk. Unknown versions or fields, duplicates, invalid metadata, ordering
+errors, missing or extra entries, checksum/authentication failures, and
+truncation are rejected. Old ZIP-based exports are not compatible. Newly
+created blobs are removed after a later failure, while existing deduplicated
+blobs are retained.
+
 Failures: `400 bad_request`, `403 access_denied`, `404 not_found`, `409 conflict`.
 
 ### Export an item
@@ -661,6 +675,11 @@ Content-Type: application/json
   "status": "queued"
 }
 ```
+
+Export takes one database snapshot and streams files through tar, gzip, and age
+into a random `0600` job file. Plaintext archives are never stored on disk, and
+the final output is published atomically only after all checks and finalization
+succeed.
 
 Failures: `400 bad_request`, `403 access_denied`, `404 not_found`.
 
@@ -697,7 +716,9 @@ Failures: `400 bad_request`, `403 access_denied`, `404 not_found`.
 After `PUT /jobs/import/...` or `PUT /jobs/export/...` returns `202 Accepted`, poll `GET /jobs/status/{job_id}` approximately every 250 milliseconds.
 
 1. When `status` is `queued` or `running`, wait and poll again.
-2. When `status` is `succeeded`, the import is complete. For an export, read or copy the completed file named by `output_path`, then remove that temporary output file when you no longer need it.
+2. When `status` is `succeeded`, the import is complete. For an export, stream
+   the completed file named by `output_path` to its destination, then remove
+   the job output only after the copy succeeds.
 3. When `status` is `failed`, show the job's `error.code` and `error.message` to the user.
 
 The built-in `monopass import` and `monopass share` commands use this same submit-and-poll flow.
