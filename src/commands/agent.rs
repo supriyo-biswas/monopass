@@ -1,15 +1,20 @@
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::FromRawFd;
+#[cfg(unix)]
 use std::path::Path;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 use std::ptr;
 
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 use crate::AppResult;
@@ -28,6 +33,7 @@ pub fn run(config: &Config) -> AppResult {
 
     #[cfg(any(
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     {
@@ -37,6 +43,7 @@ pub fn run(config: &Config) -> AppResult {
 
     #[cfg(not(any(
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     )))]
     {
@@ -64,11 +71,12 @@ fn configure_prompt_backend_environment() {
     };
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn configure_prompt_backend_environment() {}
 
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 fn run_with_prompt_dispatcher(config: &Config) -> AppResult {
@@ -115,9 +123,34 @@ fn harden_agent_process() -> io::Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn harden_agent_process() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            IsDebuggerPresent, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+        };
+        use windows_sys::Win32::System::ErrorReporting::{
+            WER_FAULT_REPORTING_FLAG_NOHEAP, WER_FAULT_REPORTING_NO_UI, WerSetFlags,
+        };
+
+        if unsafe { IsDebuggerPresent() } != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "debugger detected; refusing to start agent",
+            ));
+        }
+        unsafe { SetErrorMode(SEM_NOGPFAULTERRORBOX) };
+        let result =
+            unsafe { WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP | WER_FAULT_REPORTING_NO_UI) };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
     disable_core_dumps()
 }
 
+#[cfg(unix)]
 fn disable_core_dumps() -> io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: 0,
@@ -205,6 +238,15 @@ async fn serve(config: &Config) -> AppResult {
     let listener = create_listener(listen_path)?;
     println!("Listening on {}", listen_path.display());
 
+    #[cfg(unix)]
+    axum::serve(
+        listener,
+        agent::Server::new(config)
+            .router()
+            .into_make_service_with_connect_info::<agent::PeerConnectInfo>(),
+    )
+    .await?;
+    #[cfg(windows)]
     axum::serve(
         listener,
         agent::Server::new(config)
@@ -215,6 +257,7 @@ async fn serve(config: &Config) -> AppResult {
     Ok(())
 }
 
+#[cfg(unix)]
 fn create_listener(listen_path: &Path) -> io::Result<UnixListener> {
     if let Some(listener) = socket_activated_listener()? {
         return Ok(listener);
@@ -224,6 +267,11 @@ fn create_listener(listen_path: &Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(listen_path)?;
     fs::set_permissions(listen_path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+#[cfg(windows)]
+fn create_listener(listen_path: &std::path::Path) -> io::Result<agent::NamedPipeListener> {
+    agent::NamedPipeListener::bind(listen_path.as_os_str())
 }
 
 #[cfg(target_os = "macos")]
@@ -262,7 +310,7 @@ fn socket_activated_listener() -> io::Result<Option<UnixListener>> {
     UnixListener::from_std(listener).map(Some)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn socket_activated_listener() -> io::Result<Option<UnixListener>> {
     Ok(None)
 }
@@ -354,6 +402,7 @@ fn launchd_socket_activation_fd() -> io::Result<Option<i32>> {
     Ok(Some(fd))
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(listen_path: &Path) -> io::Result<()> {
     match fs::metadata(listen_path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(listen_path),

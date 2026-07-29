@@ -1,5 +1,6 @@
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 use std::path::PathBuf;
@@ -119,8 +120,24 @@ fn run_prompt_dispatcher_inner<T>(receiver: PromptRequestReceiver, server: &Join
     linux_prompt::run_prompt_dispatcher(receiver, server);
 }
 
+#[cfg(windows)]
+fn run_prompt_dispatcher_inner<T>(receiver: PromptRequestReceiver, server: &JoinHandle<T>) {
+    loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(request) => {
+                let outcome = windows_prompt::prompt(&request);
+                let _ = request.response.send(outcome);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if server.is_finished() => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 #[cfg(not(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 )))]
 fn run_prompt_dispatcher_inner<T>(receiver: PromptRequestReceiver, server: &JoinHandle<T>) {
@@ -149,6 +166,166 @@ fn initialize_prompt_backend() {
 
 #[cfg(not(target_os = "macos"))]
 fn initialize_prompt_backend() {}
+
+#[cfg(windows)]
+mod windows_prompt {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::ERROR_CANCELLED;
+    use windows_sys::Win32::Security::Credentials::{
+        CREDUI_INFOW, CREDUIWIN_IN_CRED_ONLY, CREDUIWIN_SECURE_PROMPT,
+        CredPackAuthenticationBufferW, CredUIPromptForWindowsCredentialsW,
+        CredUnPackAuthenticationBufferW,
+    };
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+    use zeroize::{Zeroize, Zeroizing};
+
+    use super::{PromptMetadata, PromptOutcome, PromptRequest};
+
+    pub(super) fn prompt(request: &PromptRequest) -> PromptOutcome {
+        prompt_inner(request).unwrap_or(PromptOutcome::Dismissed)
+    }
+
+    fn prompt_inner(request: &PromptRequest) -> Option<PromptOutcome> {
+        let metadata = PromptMetadata::from_display(request.display.as_ref(), request.access_scope);
+        let caption = wide(&metadata.title);
+        let message = wide(&format!(
+            "{}\n\nRequesting application: {}\n{}",
+            metadata.intro, metadata.app_name, metadata.executable_path_text
+        ));
+        let username = current_username()?;
+        let empty_password = [0u16];
+        let mut packed_len = 0u32;
+        unsafe {
+            CredPackAuthenticationBufferW(
+                0,
+                username.as_ptr(),
+                empty_password.as_ptr(),
+                ptr::null_mut(),
+                &mut packed_len,
+            )
+        };
+        if packed_len == 0 {
+            return None;
+        }
+        let mut packed = Zeroizing::new(vec![0u8; packed_len as usize]);
+        if unsafe {
+            CredPackAuthenticationBufferW(
+                0,
+                username.as_ptr(),
+                empty_password.as_ptr(),
+                packed.as_mut_ptr(),
+                &mut packed_len,
+            )
+        } == 0
+        {
+            return None;
+        }
+
+        let info = CREDUI_INFOW {
+            cbSize: std::mem::size_of::<CREDUI_INFOW>() as u32,
+            hwndParent: ptr::null_mut(),
+            pszMessageText: message.as_ptr(),
+            pszCaptionText: caption.as_ptr(),
+            hbmBanner: ptr::null_mut(),
+        };
+        let mut auth_package = 0u32;
+        let mut output: *mut c_void = ptr::null_mut();
+        let mut output_len = 0u32;
+        let status = unsafe {
+            CredUIPromptForWindowsCredentialsW(
+                &info,
+                0,
+                &mut auth_package,
+                packed.as_ptr().cast(),
+                packed_len,
+                &mut output,
+                &mut output_len,
+                ptr::null_mut(),
+                CREDUIWIN_SECURE_PROMPT | CREDUIWIN_IN_CRED_ONLY,
+            )
+        };
+        if status == ERROR_CANCELLED {
+            return Some(PromptOutcome::Denied);
+        }
+        if status != 0 || output.is_null() || output_len == 0 {
+            return None;
+        }
+
+        let result = unpack_password(output, output_len);
+        unsafe {
+            std::slice::from_raw_parts_mut(output.cast::<u8>(), output_len as usize).zeroize();
+            CoTaskMemFree(output);
+        }
+        result.map(PromptOutcome::Allowed)
+    }
+
+    fn unpack_password(output: *mut c_void, output_len: u32) -> Option<Zeroizing<String>> {
+        let mut username_len = 0u32;
+        let mut domain_len = 0u32;
+        let mut password_len = 0u32;
+        unsafe {
+            CredUnPackAuthenticationBufferW(
+                0,
+                output,
+                output_len,
+                ptr::null_mut(),
+                &mut username_len,
+                ptr::null_mut(),
+                &mut domain_len,
+                ptr::null_mut(),
+                &mut password_len,
+            )
+        };
+        if password_len == 0 {
+            return None;
+        }
+        let mut username = Zeroizing::new(vec![0u16; username_len as usize]);
+        let mut domain = Zeroizing::new(vec![0u16; domain_len as usize]);
+        let mut password = Zeroizing::new(vec![0u16; password_len as usize]);
+        if unsafe {
+            CredUnPackAuthenticationBufferW(
+                0,
+                output,
+                output_len,
+                username.as_mut_ptr(),
+                &mut username_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                password.as_mut_ptr(),
+                &mut password_len,
+            )
+        } == 0
+        {
+            return None;
+        }
+        let used = password
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(password.len());
+        let value = String::from_utf16(&password[..used]).ok()?;
+        Some(Zeroizing::new(value))
+    }
+
+    fn current_username() -> Option<Vec<u16>> {
+        let mut len = 0u32;
+        unsafe { GetUserNameW(ptr::null_mut(), &mut len) };
+        if len == 0 {
+            return None;
+        }
+        let mut value = vec![0u16; len as usize];
+        if unsafe { GetUserNameW(value.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        Some(value)
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(Some(0)).collect()
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn pump_appkit_once(mtm: objc2_foundation::MainThreadMarker) {
@@ -1458,6 +1635,7 @@ use appkit_prompt::PromptController;
 
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1473,6 +1651,7 @@ struct PromptMetadata {
 
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 impl PromptMetadata {

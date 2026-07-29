@@ -1,7 +1,11 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 use base64::Engine;
 use base64::engine::general_purpose;
@@ -91,10 +95,30 @@ struct AuthUnlockMethod {
     accepts_master_password: bool,
 }
 
-#[derive(Debug, Clone)]
 pub struct Client<'a> {
     config: &'a Config,
     capabilities: Option<String>,
+    connection: RefCell<Option<LocalStream>>,
+}
+
+impl fmt::Debug for Client<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Client")
+            .field("config", &self.config)
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for Client<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            capabilities: self.capabilities.clone(),
+            connection: RefCell::new(None),
+        }
+    }
 }
 
 impl<'a> Client<'a> {
@@ -102,6 +126,7 @@ impl<'a> Client<'a> {
         Self {
             config,
             capabilities: detect_client_capabilities(),
+            connection: RefCell::new(None),
         }
     }
 
@@ -110,6 +135,7 @@ impl<'a> Client<'a> {
         Self {
             config,
             capabilities,
+            connection: RefCell::new(None),
         }
     }
 
@@ -127,6 +153,7 @@ impl<'a> Client<'a> {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub fn get_json_with_item_scope<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
@@ -427,9 +454,8 @@ impl<'a> Client<'a> {
         bearer_password: Option<&str>,
         include_client_capabilities: bool,
     ) -> AppResult<Response> {
-        let mut stream = UnixStream::connect(self.config.listen_path())?;
         let mut request = Zeroizing::new(format!(
-            "{method} {path} HTTP/1.1\r\nHost: monopass\r\nConnection: close\r\nContent-Length: {}\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: monopass\r\nConnection: keep-alive\r\nContent-Length: {}\r\n",
             body.len()
         ));
         if let Some(content_type) = content_type {
@@ -450,16 +476,127 @@ impl<'a> Client<'a> {
         }
         request.push_str("\r\n");
 
-        stream.write_all(request.as_bytes())?;
-        stream.write_all(body)?;
+        let mut connection = self.connection.borrow_mut();
+        if connection.is_none() {
+            *connection = Some(connect_transport(self.config.listen_path())?);
+        }
 
-        let mut raw = Zeroizing::new(Vec::new());
-        stream.read_to_end(&mut raw)?;
-        parse_response(raw)
+        let result = {
+            let stream = connection.as_mut().expect("connection was initialized");
+            stream
+                .write_all(request.as_bytes())
+                .and_then(|()| stream.write_all(body))
+                .and_then(|()| read_response(stream, method))
+        };
+        match result {
+            Ok((response, true)) => Ok(response),
+            Ok((response, false)) => {
+                *connection = None;
+                Ok(response)
+            }
+            Err(error) => {
+                *connection = None;
+                Err(error.into())
+            }
+        }
     }
 }
 
+#[cfg(unix)]
+type LocalStream = UnixStream;
+#[cfg(windows)]
+type LocalStream = std::fs::File;
+
+#[cfg(unix)]
+fn connect_transport(path: &std::path::Path) -> io::Result<LocalStream> {
+    UnixStream::connect(path)
+}
+
+#[cfg(windows)]
+fn connect_transport(path: &std::path::Path) -> io::Result<LocalStream> {
+    use std::fs::OpenOptions;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut launched = false;
+    loop {
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(stream) => {
+                let mut server_pid = 0u32;
+                if unsafe {
+                    GetNamedPipeServerProcessId(stream.as_raw_handle().cast(), &mut server_pid)
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let server_pid = i32::try_from(server_pid)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid agent pid"))?;
+                let server_principal = crate::agent::process::windows_process_principal(server_pid)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::PermissionDenied, "unverified agent")
+                    })?;
+                let current_principal = crate::agent::process::current_windows_principal()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::PermissionDenied, "unverified client")
+                    })?;
+                let server_exe = crate::agent::process::windows_process_executable_path(server_pid)
+                    .and_then(|path| std::fs::canonicalize(path).ok());
+                let current_exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| std::fs::canonicalize(path).ok());
+                if server_principal != current_principal
+                    || server_exe.is_none()
+                    || server_exe != current_exe
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "named-pipe server identity verification failed",
+                    ));
+                }
+                return Ok(stream);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PIPE_BUSY as i32
+                ) && Instant::now() < deadline =>
+            {
+                if !launched && error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                    launch_windows_agent()?;
+                    launched = true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn launch_windows_agent() -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    Command::new(std::env::current_exe()?)
+        .arg("agent")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
 fn detect_client_capabilities() -> Option<String> {
+    #[cfg(windows)]
+    {
+        return Some("windows-secure-desktop".to_owned());
+    }
+    #[cfg(unix)]
     client_capabilities_from_env(|name| std::env::var(name).ok())
 }
 
@@ -507,70 +644,245 @@ pub fn query_value(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-fn parse_response(raw: Zeroizing<Vec<u8>>) -> AppResult<Response> {
-    let header_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
-    let header_bytes = &raw[..header_end];
-    let mut body = Zeroizing::new(raw[header_end + 4..].to_vec());
-    let headers_text = std::str::from_utf8(header_bytes)?;
+const MAX_RESPONSE_HEADERS: usize = 64 * 1024;
+
+fn read_response(stream: &mut LocalStream, request_method: &str) -> io::Result<(Response, bool)> {
+    for _ in 0..16 {
+        let result = read_one_response(stream, request_method)?;
+        if (100..200).contains(&result.0.status) && result.0.status != 101 {
+            continue;
+        }
+        return Ok(result);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "too many informational HTTP responses",
+    ))
+}
+
+fn read_one_response(
+    stream: &mut LocalStream,
+    request_method: &str,
+) -> io::Result<(Response, bool)> {
+    let header_bytes = read_headers(stream)?;
+    let headers_text =
+        std::str::from_utf8(header_bytes.strip_suffix(b"\r\n\r\n").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response")
+        })?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut lines = headers_text.split("\r\n");
     let status_line = lines
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status"))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts
+        .next()
+        .filter(|version| matches!(*version, "HTTP/1.0" | "HTTP/1.1"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP version"))?;
+    let status = status_parts
+        .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status code"))?
-        .parse::<u16>()?;
+        .parse::<u16>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut headers = HashMap::new();
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP header"))?;
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty HTTP header name",
+            ));
+        }
+        let value = value.trim();
+        headers
+            .entry(name)
+            .and_modify(|current: &mut String| {
+                current.push_str(", ");
+                current.push_str(value);
+            })
+            .or_insert_with(|| value.to_owned());
     }
 
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
-    {
-        body = decode_chunked(&body)?;
-    }
+    let connection_close = header_has_token(&headers, "connection", "close");
+    let connection_keep_alive = header_has_token(&headers, "connection", "keep-alive");
+    let bodyless = request_method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || matches!(status, 204 | 304);
+    let chunked = header_has_token(&headers, "transfer-encoding", "chunked");
+    let content_length = parse_content_length(&headers)?;
 
-    Ok(Response {
-        status,
-        headers,
-        body,
+    let (body, close_delimited) = if bodyless {
+        (Zeroizing::new(Vec::new()), false)
+    } else if chunked {
+        (read_chunked_body(stream)?, false)
+    } else if let Some(length) = content_length {
+        (read_exact_body(stream, length)?, false)
+    } else {
+        (read_close_delimited_body(stream)?, true)
+    };
+
+    let reusable = !connection_close
+        && !close_delimited
+        && status != 101
+        && (version == "HTTP/1.1" || connection_keep_alive);
+    Ok((
+        Response {
+            status,
+            headers,
+            body,
+        },
+        reusable,
+    ))
+}
+
+fn read_headers(stream: &mut LocalStream) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut headers = Zeroizing::new(Vec::new());
+    while headers.len() < MAX_RESPONSE_HEADERS {
+        let mut byte = [0_u8; 1];
+        let read = stream.read(&mut byte)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before response headers completed",
+            ));
+        }
+        headers.push(byte[0]);
+        byte.zeroize();
+        if headers.ends_with(b"\r\n\r\n") {
+            return Ok(headers);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "HTTP response headers exceed 64 KiB",
+    ))
+}
+
+fn parse_content_length(headers: &HashMap<String, String>) -> io::Result<Option<usize>> {
+    let Some(value) = headers.get("content-length") else {
+        return Ok(None);
+    };
+    let mut lengths = value.split(',').map(str::trim);
+    let first = lengths
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty Content-Length"))?
+        .parse::<usize>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    for length in lengths {
+        let length = length
+            .parse::<usize>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if length != first {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conflicting Content-Length headers",
+            ));
+        }
+    }
+    Ok(Some(first))
+}
+
+fn header_has_token(headers: &HashMap<String, String>, header_name: &str, expected: &str) -> bool {
+    headers.get(header_name).is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case(expected))
     })
 }
 
-fn decode_chunked(mut body: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+fn read_exact_body(stream: &mut LocalStream, length: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut body = Zeroizing::new(vec![0_u8; length]);
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn read_close_delimited_body(stream: &mut LocalStream) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut body = Zeroizing::new(Vec::new());
+    let mut buffer = Zeroizing::new([0_u8; 8192]);
+    loop {
+        match stream.read(&mut *buffer) {
+            Ok(0) => return Ok(body),
+            Ok(read) => body.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(body),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_chunked_body(stream: &mut LocalStream) -> io::Result<Zeroizing<Vec<u8>>> {
     let mut decoded = Zeroizing::new(Vec::new());
     loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed chunk"))?;
-        let size_text = std::str::from_utf8(&body[..line_end])
+        let size_line = read_crlf_line(stream, "chunk size")?;
+        let size_text = std::str::from_utf8(&size_line)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let size_text = size_text.split(';').next().unwrap_or(size_text);
-        let size = usize::from_str_radix(size_text.trim(), 16)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        body = &body[line_end + 2..];
-        if size == 0 {
-            return Ok(decoded);
-        }
-        if body.len() < size + 2 || &body[size..size + 2] != b"\r\n" {
+        let size_text = size_text.split(';').next().unwrap_or(size_text).trim();
+        if size_text.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "chunk shorter than declared size",
+                "empty chunk size",
             ));
         }
-        decoded.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if size == 0 {
+            consume_chunk_trailers(stream)?;
+            return Ok(decoded);
+        }
+
+        let chunk = read_exact_body(stream, size)?;
+        decoded.extend_from_slice(&chunk);
+        let mut terminator = Zeroizing::new([0_u8; 2]);
+        stream.read_exact(&mut *terminator)?;
+        if terminator.as_slice() != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed chunk terminator",
+            ));
+        }
     }
+}
+
+fn consume_chunk_trailers(stream: &mut LocalStream) -> io::Result<()> {
+    loop {
+        let trailer = read_crlf_line(stream, "chunk trailer")?;
+        if trailer.is_empty() {
+            return Ok(());
+        }
+        if !trailer.contains(&b':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed chunk trailer",
+            ));
+        }
+    }
+}
+
+fn read_crlf_line(stream: &mut LocalStream, context: &str) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut line = Zeroizing::new(Vec::new());
+    while line.len() < MAX_RESPONSE_HEADERS {
+        let mut byte = [0_u8; 1];
+        let read = stream.read(&mut byte)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("connection closed while reading {context}"),
+            ));
+        }
+        line.push(byte[0]);
+        byte.zeroize();
+        if line.ends_with(b"\r\n") {
+            let content_length = line.len() - 2;
+            line.truncate(content_length);
+            return Ok(line);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{context} exceeds 64 KiB"),
+    ))
 }
 
 fn is_access_denied(response: &Response) -> bool {
@@ -635,7 +947,7 @@ fn unlock_method_api_path(url: &str) -> io::Result<String> {
     Ok(url.to_owned())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
@@ -768,7 +1080,7 @@ mod tests {
         let response = request_with_test_prompt(&config, AuthMode::ProcessOnly);
 
         assert_eq!(200, response.status);
-        server.join();
+        assert_eq!(1, server.join());
     }
 
     #[test]
@@ -1139,6 +1451,309 @@ mod tests {
         server.join();
     }
 
+    #[test]
+    fn consecutive_requests_reuse_one_connection() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/first",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(r#"{"value":1}"#),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/second",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(r#"{"value":2}"#),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        let first = client.request("GET", "/first", &[], None, None).unwrap();
+        let second = client.request("GET", "/second", &[], None, None).unwrap();
+
+        assert_eq!(br#"{"value":1}"#, first.body.as_slice());
+        assert_eq!(br#"{"value":2}"#, second.body.as_slice());
+        assert_eq!(1, server.join());
+    }
+
+    #[test]
+    fn chunked_response_with_trailers_allows_next_response() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/chunked",
+                authorization: None,
+                client_capabilities: None,
+                response: concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Transfer-Encoding: chunked\r\n\r\n",
+                    "4\r\nWiki\r\n",
+                    "5;extension=yes\r\npedia\r\n",
+                    "0\r\nChecksum: ignored\r\nAnother: trailer\r\n\r\n"
+                )
+                .to_owned(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/after",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("after"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        let chunked = client.request("GET", "/chunked", &[], None, None).unwrap();
+        let after = client.request("GET", "/after", &[], None, None).unwrap();
+
+        assert_eq!(b"Wikipedia", chunked.body.as_slice());
+        assert_eq!(b"after", after.body.as_slice());
+        assert_eq!(1, server.join());
+    }
+
+    #[test]
+    fn bodyless_response_allows_next_response() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/empty",
+                authorization: None,
+                client_capabilities: None,
+                response: concat!("HTTP/1.1 204 No Content\r\n", "Content-Length: 99\r\n\r\n")
+                    .to_owned(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/after",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("after"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        let empty = client.request("GET", "/empty", &[], None, None).unwrap();
+        let after = client.request("GET", "/after", &[], None, None).unwrap();
+
+        assert!(empty.body.is_empty());
+        assert_eq!(b"after", after.body.as_slice());
+        assert_eq!(1, server.join());
+    }
+
+    #[test]
+    fn connection_close_reconnects_on_next_explicit_request() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/closing",
+                authorization: None,
+                client_capabilities: None,
+                response: http_response_with_headers(200, "first", "Connection: close\r\n"),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/next",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("second"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        assert_eq!(
+            b"first",
+            client
+                .request("GET", "/closing", &[], None, None)
+                .unwrap()
+                .body
+                .as_slice()
+        );
+        assert_eq!(
+            b"second",
+            client
+                .request("GET", "/next", &[], None, None)
+                .unwrap()
+                .body
+                .as_slice()
+        );
+        assert_eq!(2, server.join());
+    }
+
+    #[test]
+    fn close_delimited_response_reconnects_on_next_explicit_request() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/eof",
+                authorization: None,
+                client_capabilities: None,
+                response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfirst".to_owned(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/next",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("second"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        let first = client.request("GET", "/eof", &[], None, None).unwrap();
+        let second = client.request("GET", "/next", &[], None, None).unwrap();
+
+        assert_eq!(b"first", first.body.as_slice());
+        assert_eq!(b"second", second.body.as_slice());
+        assert_eq!(2, server.join());
+    }
+
+    #[test]
+    fn truncated_response_is_not_replayed_and_invalidates_connection() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/truncated",
+                authorization: None,
+                client_capabilities: None,
+                response: concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Connection: close\r\n",
+                    "Content-Length: 10\r\n\r\nshort"
+                )
+                .to_owned(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/next",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("ok"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        let error = client
+            .request("GET", "/truncated", &[], None, None)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(
+            b"ok",
+            client
+                .request("GET", "/next", &[], None, None)
+                .unwrap()
+                .body
+                .as_slice()
+        );
+        assert_eq!(2, server.join());
+    }
+
+    #[test]
+    fn malformed_response_is_not_replayed_and_invalidates_connection() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/malformed",
+                authorization: None,
+                client_capabilities: None,
+                response: concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Connection: close\r\n",
+                    "Content-Length: invalid\r\n\r\n"
+                )
+                .to_owned(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/next",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("ok"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        assert!(
+            client
+                .request("GET", "/malformed", &[], None, None)
+                .is_err()
+        );
+        assert_eq!(
+            b"ok",
+            client
+                .request("GET", "/next", &[], None, None)
+                .unwrap()
+                .body
+                .as_slice()
+        );
+        assert_eq!(2, server.join());
+    }
+
+    #[test]
+    fn transport_failure_is_not_replayed_and_invalidates_connection() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/failed",
+                authorization: None,
+                client_capabilities: None,
+                response: String::new(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/next",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("ok"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+
+        assert!(client.request("GET", "/failed", &[], None, None).is_err());
+        assert_eq!(
+            b"ok",
+            client
+                .request("GET", "/next", &[], None, None)
+                .unwrap()
+                .body
+                .as_slice()
+        );
+        assert_eq!(2, server.join());
+    }
+
+    #[test]
+    fn cloned_client_starts_with_a_disconnected_transport() {
+        let server = TestServer::new(vec![ExpectedRequest {
+            method: "GET",
+            path: "/original",
+            authorization: None,
+            client_capabilities: None,
+            response: ok_json_response("original"),
+        }]);
+        let config = test_config(server.listen_path());
+        let client = Client::with_capabilities(&config, None);
+        client.request("GET", "/original", &[], None, None).unwrap();
+        let cloned = client.clone();
+
+        assert!(client.connection.borrow().is_some());
+        assert!(cloned.connection.borrow().is_none());
+        assert_eq!(1, server.join());
+    }
+
     fn request_with_test_prompt(config: &Config, auth_mode: AuthMode) -> Response {
         Client::with_capabilities(config, None)
             .request_with_unlock_prompt(
@@ -1177,7 +1792,7 @@ mod tests {
     struct TestServer {
         _tempdir: tempfile::TempDir,
         listen_path: PathBuf,
-        handle: thread::JoinHandle<()>,
+        handle: thread::JoinHandle<usize>,
     }
 
     impl TestServer {
@@ -1186,15 +1801,27 @@ mod tests {
             let listen_path = tempdir.path().join("agent.sock");
             let listener = UnixListener::bind(&listen_path).unwrap();
             let handle = thread::spawn(move || {
+                let mut stream = None;
+                let mut connections = 0;
                 for expected in expected {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let request = read_request(&mut stream);
+                    if stream.is_none() {
+                        let (accepted, _) = listener.accept().unwrap();
+                        stream = Some(accepted);
+                        connections += 1;
+                    }
+                    let active = stream.as_mut().unwrap();
+                    let request = read_request(active);
                     assert_eq!(expected.method, request.method);
                     assert_eq!(expected.path, request.path);
                     assert_eq!(expected.authorization, request.authorization);
                     assert_eq!(expected.client_capabilities, request.client_capabilities);
-                    stream.write_all(expected.response.as_bytes()).unwrap();
+                    assert_eq!(Some("keep-alive"), request.connection.as_deref());
+                    active.write_all(expected.response.as_bytes()).unwrap();
+                    if response_closes_connection(&expected.response) {
+                        stream = None;
+                    }
                 }
+                connections
             });
 
             Self {
@@ -1208,8 +1835,8 @@ mod tests {
             &self.listen_path
         }
 
-        fn join(self) {
-            self.handle.join().unwrap();
+        fn join(self) -> usize {
+            self.handle.join().unwrap()
         }
     }
 
@@ -1218,6 +1845,7 @@ mod tests {
         path: String,
         authorization: Option<String>,
         client_capabilities: Option<String>,
+        connection: Option<String>,
     }
 
     fn read_request(stream: &mut std::os::unix::net::UnixStream) -> RecordedRequest {
@@ -1232,13 +1860,19 @@ mod tests {
             }
         }
 
-        let text = std::str::from_utf8(&raw).unwrap();
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let text = std::str::from_utf8(&raw[..header_end]).unwrap();
         let mut lines = text.split("\r\n");
         let mut request_line = lines.next().unwrap().split_whitespace();
         let method = request_line.next().unwrap().to_owned();
         let path = request_line.next().unwrap().to_owned();
         let mut authorization = None;
         let mut client_capabilities = None;
+        let mut connection = None;
+        let mut content_length = 0;
         for line in lines {
             if let Some(value) = line.strip_prefix("Authorization: ") {
                 authorization = Some(value.to_owned());
@@ -1246,6 +1880,17 @@ mod tests {
             if let Some(value) = line.strip_prefix("X-Client-Capabilities: ") {
                 client_capabilities = Some(value.to_owned());
             }
+            if let Some(value) = line.strip_prefix("Connection: ") {
+                connection = Some(value.to_owned());
+            }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                content_length = value.parse::<usize>().unwrap();
+            }
+        }
+        let body_read = raw.len() - header_end - 4;
+        if body_read < content_length {
+            let mut remaining = vec![0_u8; content_length - body_read];
+            stream.read_exact(&mut remaining).unwrap();
         }
 
         RecordedRequest {
@@ -1253,7 +1898,23 @@ mod tests {
             path,
             authorization,
             client_capabilities,
+            connection,
         }
+    }
+
+    fn response_closes_connection(response: &str) -> bool {
+        let headers = response
+            .split_once("\r\n\r\n")
+            .map_or(response, |(headers, _)| headers);
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Connection: close"))
+            || (!headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                && !headers
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding:")))
     }
 
     fn access_denied_response() -> String {
@@ -1272,8 +1933,12 @@ mod tests {
     }
 
     fn http_response(status: u16, body: &str) -> String {
+        http_response_with_headers(status, body, "")
+    }
+
+    fn http_response_with_headers(status: u16, body: &str, headers: &str) -> String {
         format!(
-            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{headers}\r\n{body}",
             body.len()
         )
     }

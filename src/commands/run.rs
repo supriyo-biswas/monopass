@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -54,11 +53,7 @@ pub fn run(config: &Config, args: Args) -> AppResult {
         let mut bytes = super::read::fetch_reference(config, &reference)?;
         if item.files.iter().any(|file| file.name == reference.name) {
             let file_path = tempdir.path().join(safe_temp_file_name(&key));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&file_path)?;
+            let mut file = crate::platform::open_private_new(&file_path)?;
             file.write_all(&bytes)?;
             env.insert(
                 key,

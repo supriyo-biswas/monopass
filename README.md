@@ -5,7 +5,7 @@ monopass is a local-first password manager and credential storage daemon that st
 ## Key features
 
 * **Bank-grade security:** Secure local data using AES-256-GCM encryption and PBKDF2 key derivation (256,000 iterations).
-* **Single-binary installation:** Run instantly on Linux and macOS with a single, dependency-free executable.
+* **Single-binary installation:** Run on Linux, macOS, and Windows with one executable.
 * **Seamless sharing:** Share credentials effortlessly with other users via `monopass share`.
 * **Built-in TOTP:** Store and generate TOTP codes directly, replacing standalone authenticator apps.
 * **Automatic session caching:** Prevent repeated password prompts. Enter your master password once, and the requesting process chain is trusted for 15 minutes (configurable).

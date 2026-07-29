@@ -42,11 +42,12 @@ fn auth_routes() -> Router<AgentState> {
 
     #[cfg(any(
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     let routes = routes.route("/api/v1/auth/unlock/gui", post(controller::unlock_gui));
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let routes = routes.merge(
         Router::new()
             .route(
@@ -150,7 +151,7 @@ mod tests {
     use base64::engine::general_purpose;
     use http_body_util::BodyExt;
     use serde_json::json;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     use tempfile::NamedTempFile;
     use tower::ServiceExt;
 
@@ -260,7 +261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     async fn unlock_methods_returns_direct_master_password_method_on_non_macos() {
         let state = AgentState::from_database_path("missing.db");
         let router = super::auth_routes().with_state(state);
@@ -287,7 +288,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     #[tokio::test]
     async fn unlock_methods_returns_gui_method_on_macos() {
         let state = AgentState::from_database_path("missing.db");
@@ -365,7 +366,7 @@ mod tests {
         assert_eq!(StatusCode::NOT_FOUND, response.status());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     #[tokio::test]
     async fn unlock_direct_route_is_not_available_on_macos() {
         let state = AgentState::from_database_path("missing.db");
@@ -383,7 +384,7 @@ mod tests {
         assert_eq!(StatusCode::NOT_FOUND, response.status());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[tokio::test]
     async fn unlock_direct_authorizes_hash_for_subsequent_database_route() {
         let file = NamedTempFile::new().unwrap();
@@ -412,7 +413,7 @@ mod tests {
         assert_eq!(StatusCode::OK, response.status());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[tokio::test]
     async fn unlock_direct_settings_scope_authorizes_settings_only() {
         let file = NamedTempFile::new().unwrap();

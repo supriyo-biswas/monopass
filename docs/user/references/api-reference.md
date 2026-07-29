@@ -2,7 +2,7 @@
 
 Base path: `/api/v1`
 
-monopass exposes this API through its local Unix socket. JSON request and response bodies use `Content-Type: application/json` unless an endpoint says otherwise. Timestamps are RFC3339 UTC strings.
+monopass exposes this API through a local Unix socket on Linux and macOS and a per-user named pipe on Windows. JSON request and response bodies use `Content-Type: application/json` unless an endpoint says otherwise. Timestamps are RFC3339 UTC strings.
 
 ## Errors
 

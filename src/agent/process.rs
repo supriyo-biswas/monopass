@@ -1,3 +1,6 @@
+#[cfg(windows)]
+use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +35,26 @@ struct ProcessInstanceIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UserIdentity([u8; 32]);
+
+impl UserIdentity {
+    fn unix(uid: u32) -> Self {
+        let mut value = [0u8; 32];
+        value[..4].copy_from_slice(&uid.to_le_bytes());
+        Self(value)
+    }
+
+    #[cfg(windows)]
+    fn windows(principal: &WindowsPrincipal) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"monopass-windows-principal-v1\0");
+        hasher.update(&principal.user_sid);
+        hasher.update(principal.session_id.to_le_bytes());
+        Self(hasher.finalize().into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExecutableIdentity {
     device: u64,
     inode: u64,
@@ -45,9 +68,16 @@ struct ExecutableIdentity {
 
 impl ExecutableIdentity {
     fn from_path(path: &Path) -> Option<Self> {
-        std::fs::metadata(path)
-            .ok()
-            .map(|metadata| executable_identity(&metadata))
+        #[cfg(unix)]
+        {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| executable_identity(&metadata))
+        }
+        #[cfg(windows)]
+        {
+            windows_executable_identity(path)
+        }
     }
 }
 
@@ -61,7 +91,7 @@ enum StableProcessIdentity {
 struct ProcessInfo {
     instance: ProcessInstanceIdentity,
     parent_pid: i32,
-    uid: u32,
+    uid: UserIdentity,
     executable: Option<ExecutableIdentity>,
     executable_path: Option<PathBuf>,
 }
@@ -76,7 +106,7 @@ impl ProcessInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthorizationScope {
-    uid: u32,
+    uid: UserIdentity,
     anchor: ProcessInstanceIdentity,
     chain: Vec<StableProcessIdentity>,
 }
@@ -86,6 +116,24 @@ pub(crate) struct ResolvedAuthorizationScope {
     pub(crate) hash: ScopeHash,
     pub(crate) display: Option<ProcessDisplay>,
     pub(crate) ultimate: UltimateProcess,
+}
+
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WindowsPrincipal {
+    pub(crate) user_sid: Vec<u8>,
+    pub(crate) session_id: u32,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsPrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WindowsPrincipal")
+            .field("user_sid", &"[redacted]")
+            .field("session_id", &self.session_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +222,7 @@ impl ProcessDisplay {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub(crate) fn presentation_name(&self) -> String {
@@ -187,6 +236,7 @@ impl ProcessDisplay {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub(crate) fn preferred_icon(&self) -> Option<&ProcessIconSource> {
@@ -206,19 +256,36 @@ pub(crate) fn resolve_authorization_scope(
     peer_pid: i32,
     peer_uid: u32,
 ) -> Option<ResolvedAuthorizationScope> {
-    let resolver = PlatformProcessResolver;
-    resolve_authorization_scope_with_resolver(peer_pid, peer_uid, &resolver)
+    let resolver = PlatformProcessResolver::new();
+    resolve_authorization_scope_with_resolver(peer_pid, UserIdentity::unix(peer_uid), &resolver)
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_windows_authorization_scope(
+    peer_pid: i32,
+    principal: &WindowsPrincipal,
+) -> Option<ResolvedAuthorizationScope> {
+    let resolver = PlatformProcessResolver::new();
+    resolve_authorization_scope_with_resolver(peer_pid, UserIdentity::windows(principal), &resolver)
 }
 
 trait ProcessResolver {
     fn process_info(&self, pid: i32) -> Option<ProcessInfo>;
-    fn process_uid(&self, pid: i32) -> Option<u32>;
+    fn process_uid(&self, pid: i32) -> Option<UserIdentity>;
+
+    fn missing_parent_ends_chain(&self, _parent_pid: i32) -> bool {
+        false
+    }
+
+    fn parent_instance_predates_child(&self, _parent: &ProcessInfo, _child: &ProcessInfo) -> bool {
+        true
+    }
 
     fn verified_parent_across_macos_login_boundary(
         &self,
         _child: &ProcessInfo,
         _parent_pid: i32,
-        _peer_uid: u32,
+        _peer_uid: UserIdentity,
     ) -> Option<ProcessInfo> {
         None
     }
@@ -230,12 +297,13 @@ fn resolve_authorization_scope_hash_with_resolver(
     peer_uid: u32,
     resolver: &impl ProcessResolver,
 ) -> Option<ScopeHash> {
-    resolve_authorization_scope_with_resolver(peer_pid, peer_uid, resolver).map(|scope| scope.hash)
+    resolve_authorization_scope_with_resolver(peer_pid, UserIdentity::unix(peer_uid), resolver)
+        .map(|scope| scope.hash)
 }
 
 fn resolve_authorization_scope_with_resolver(
     peer_pid: i32,
-    peer_uid: u32,
+    peer_uid: UserIdentity,
     resolver: &impl ProcessResolver,
 ) -> Option<ResolvedAuthorizationScope> {
     resolve_authorization_scope_with_resolver_and_gui(
@@ -249,7 +317,7 @@ fn resolve_authorization_scope_with_resolver(
 
 fn resolve_authorization_scope_with_resolver_and_gui(
     peer_pid: i32,
-    peer_uid: u32,
+    peer_uid: UserIdentity,
     resolver: &impl ProcessResolver,
     gui_resolver: &impl GuiApplicationResolver,
     agent_executable: Option<ExecutableIdentity>,
@@ -288,7 +356,12 @@ fn resolve_authorization_scope_with_resolver_and_gui(
             return None;
         }
 
-        let parent_uid = resolver.process_uid(parent_pid)?;
+        let Some(parent_uid) = resolver.process_uid(parent_pid) else {
+            if resolver.missing_parent_ends_chain(parent_pid) {
+                break;
+            }
+            return None;
+        };
         if parent_uid != peer_uid {
             if !crossed_macos_login_boundary
                 && let Some(parent) = resolver
@@ -302,8 +375,25 @@ fn resolve_authorization_scope_with_resolver_and_gui(
             break;
         }
 
-        let parent = resolver.process_info(parent_pid)?;
+        let Some(parent) = resolver.process_info(parent_pid) else {
+            if resolver.missing_parent_ends_chain(parent_pid) {
+                break;
+            }
+            return None;
+        };
         if parent.uid != peer_uid {
+            break;
+        }
+        if chain
+            .iter()
+            .any(|element| element.instance.pid == parent.instance.pid)
+        {
+            return None;
+        }
+        // A real parent must have existed before its child. Windows retains a
+        // numeric parent PID after the parent exits, so a later process can
+        // reuse that PID without being part of this lineage.
+        if !resolver.parent_instance_predates_child(&parent, &current) {
             break;
         }
         current = parent;
@@ -513,6 +603,13 @@ impl GuiApplicationResolver for PlatformGuiApplicationResolver {
     }
 }
 
+#[cfg(windows)]
+impl GuiApplicationResolver for PlatformGuiApplicationResolver {
+    fn gui_application(&self, _process: &ProcessInfo) -> Option<GuiApplicationMatch> {
+        None
+    }
+}
+
 fn app_bundle_path(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|ancestor| {
@@ -526,7 +623,7 @@ fn app_bundle_path(path: &Path) -> Option<PathBuf> {
 fn hash_authorization_scope(scope: &AuthorizationScope) -> ScopeHash {
     let mut hasher = Sha256::new();
     hasher.update(b"monopass-authorization-scope-v1\0");
-    hasher.update(scope.uid.to_le_bytes());
+    hasher.update(scope.uid.0);
     hash_instance(&mut hasher, scope.anchor);
     hasher.update((scope.chain.len() as u64).to_le_bytes());
 
@@ -565,6 +662,7 @@ fn hash_instance(hasher: &mut Sha256, instance: ProcessInstanceIdentity) {
     hasher.update(instance.start_time.secondary.to_le_bytes());
 }
 
+#[cfg(unix)]
 fn executable_identity(metadata: &Metadata) -> ExecutableIdentity {
     use std::os::unix::fs::MetadataExt;
 
@@ -578,6 +676,36 @@ fn executable_identity(metadata: &Metadata) -> ExecutableIdentity {
         changed_seconds: metadata.ctime(),
         changed_nanoseconds: metadata.ctime_nsec(),
     }
+}
+
+#[cfg(windows)]
+fn windows_executable_identity(path: &Path) -> Option<ExecutableIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return None;
+    }
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    let modified = (u64::from(info.ftLastWriteTime.dwHighDateTime) << 32)
+        | u64::from(info.ftLastWriteTime.dwLowDateTime);
+    let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+        | u64::from(info.ftCreationTime.dwLowDateTime);
+    Some(ExecutableIdentity {
+        device: u64::from(info.dwVolumeSerialNumber),
+        inode: file_index,
+        generation: None,
+        size,
+        modified_seconds: modified as i64,
+        modified_nanoseconds: 0,
+        changed_seconds: created as i64,
+        changed_nanoseconds: 0,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -617,7 +745,28 @@ fn crosses_macos_login_boundary(peer_uid: u32, evidence: MacosCredentialBoundary
         && evidence.child_has_controlling_terminal
 }
 
+#[cfg(not(windows))]
 struct PlatformProcessResolver;
+
+#[cfg(windows)]
+struct PlatformProcessResolver {
+    parent_pids: HashMap<i32, i32>,
+}
+
+impl PlatformProcessResolver {
+    fn new() -> Self {
+        #[cfg(not(windows))]
+        {
+            Self
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                parent_pids: windows_parent_pids().unwrap_or_default(),
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl ProcessResolver for PlatformProcessResolver {
@@ -642,16 +791,18 @@ impl ProcessResolver for PlatformProcessResolver {
                 },
             },
             parent_pid: stat.parent_pid,
-            uid: process_dir.uid(),
+            uid: UserIdentity::unix(process_dir.uid()),
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
         })
     }
 
-    fn process_uid(&self, pid: i32) -> Option<u32> {
+    fn process_uid(&self, pid: i32) -> Option<UserIdentity> {
         use std::os::unix::fs::MetadataExt;
 
-        Some(std::fs::metadata(format!("/proc/{pid}")).ok()?.uid())
+        Some(UserIdentity::unix(
+            std::fs::metadata(format!("/proc/{pid}")).ok()?.uid(),
+        ))
     }
 }
 
@@ -701,26 +852,27 @@ impl ProcessResolver for PlatformProcessResolver {
                 },
             },
             parent_pid: i32::try_from(info.pbi_ppid).ok()?,
-            uid: info.pbi_uid,
+            uid: UserIdentity::unix(info.pbi_uid),
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
         })
     }
 
-    fn process_uid(&self, pid: i32) -> Option<u32> {
+    fn process_uid(&self, pid: i32) -> Option<UserIdentity> {
         macos_bsd_info(pid)
-            .map(|info| info.pbi_uid)
-            .or_else(|| macos_short_bsd_info(pid).map(|info| info.pbsi_uid))
+            .map(|info| UserIdentity::unix(info.pbi_uid))
+            .or_else(|| macos_short_bsd_info(pid).map(|info| UserIdentity::unix(info.pbsi_uid)))
     }
 
     fn verified_parent_across_macos_login_boundary(
         &self,
         child: &ProcessInfo,
         parent_pid: i32,
-        peer_uid: u32,
+        peer_uid: UserIdentity,
     ) -> Option<ProcessInfo> {
         let child_info = macos_bsd_info(child.instance.pid)?;
-        if child_info.pbi_uid != peer_uid
+        let peer_uid_raw = u32::from_le_bytes(peer_uid.0[..4].try_into().ok()?);
+        if child_info.pbi_uid != peer_uid_raw
             || i32::try_from(child_info.pbi_ppid).ok()? != parent_pid
             || child_info.pbi_start_tvsec != child.instance.start_time.primary
             || child_info.pbi_start_tvusec != child.instance.start_time.secondary
@@ -743,12 +895,14 @@ impl ProcessResolver for PlatformProcessResolver {
             effective_uid: boundary_info.pbsi_uid,
             real_uid: boundary_info.pbsi_ruid,
             saved_uid: boundary_info.pbsi_svuid,
-            parent_uid: self.process_uid(boundary_parent_pid),
+            parent_uid: self
+                .process_uid(boundary_parent_pid)
+                .map(|uid| u32::from_le_bytes(uid.0[..4].try_into().unwrap())),
             command_is_login: macos_short_process_name_is(&boundary_info, b"login"),
             child_session_id: macos_session_id(child.instance.pid),
             child_has_controlling_terminal: child_info.e_tdev != MACOS_NODEV,
         };
-        if !crosses_macos_login_boundary(peer_uid, evidence) {
+        if !crosses_macos_login_boundary(peer_uid_raw, evidence) {
             return None;
         }
 
@@ -767,6 +921,203 @@ impl ProcessResolver for PlatformProcessResolver {
         }
         Some(parent)
     }
+}
+
+#[cfg(windows)]
+impl ProcessResolver for PlatformProcessResolver {
+    fn process_info(&self, pid: i32) -> Option<ProcessInfo> {
+        let process = WindowsProcessHandle::open(pid)?;
+        let principal = windows_principal_from_handle(process.0, pid)?;
+        let creation_time = process.creation_time()?;
+        let executable_path = process.executable_path();
+        let executable = executable_path
+            .as_ref()
+            .and_then(|path| ExecutableIdentity::from_path(path));
+        Some(ProcessInfo {
+            instance: ProcessInstanceIdentity {
+                pid,
+                start_time: ProcessStartTime {
+                    primary: creation_time,
+                    secondary: 0,
+                },
+            },
+            parent_pid: *self.parent_pids.get(&pid)?,
+            uid: UserIdentity::windows(&principal),
+            executable,
+            executable_path,
+        })
+    }
+
+    fn process_uid(&self, pid: i32) -> Option<UserIdentity> {
+        windows_process_principal(pid).map(|principal| UserIdentity::windows(&principal))
+    }
+
+    fn missing_parent_ends_chain(&self, parent_pid: i32) -> bool {
+        // Toolhelp snapshots contain every live process, including processes
+        // whose handles this user cannot open. Re-snapshot so an ancestor that
+        // exits during traversal can safely end the verified lineage, while an
+        // inaccessible live ancestor still fails closed.
+        windows_parent_pids().is_some_and(|parents| !parents.contains_key(&parent_pid))
+    }
+
+    fn parent_instance_predates_child(&self, parent: &ProcessInfo, child: &ProcessInfo) -> bool {
+        parent.instance.start_time.primary < child.instance.start_time.primary
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn current_windows_principal() -> Option<WindowsPrincipal> {
+    windows_process_principal(std::process::id() as i32)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_process_principal(pid: i32) -> Option<WindowsPrincipal> {
+    let process = WindowsProcessHandle::open(pid)?;
+    windows_principal_from_handle(process.0, pid)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_process_executable_path(pid: i32) -> Option<PathBuf> {
+    WindowsProcessHandle::open(pid)?.executable_path()
+}
+
+#[cfg(windows)]
+struct WindowsProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsProcessHandle {
+    fn open(pid: i32) -> Option<Self> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let pid = u32::try_from(pid).ok()?;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        (!handle.is_null()).then_some(Self(handle))
+    }
+
+    fn creation_time(&self) -> Option<u64> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if unsafe { GetProcessTimes(self.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
+        {
+            return None;
+        }
+        Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+    }
+
+    fn executable_path(&self) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+        let mut buffer = vec![0u16; 32_768];
+        let mut len = buffer.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(self.0, 0, buffer.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        buffer.truncate(len as usize);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn windows_principal_from_handle(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    pid: i32,
+) -> Option<WindowsPrincipal> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        CopySid, GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut required = 0u32;
+    unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut required) };
+    if required == 0 {
+        unsafe { CloseHandle(token) };
+        return None;
+    }
+    let mut buffer = vec![0u8; required as usize];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        unsafe { CloseHandle(token) };
+        return None;
+    }
+    let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    if user.User.Sid.is_null() || unsafe { IsValidSid(user.User.Sid) } == 0 {
+        unsafe { CloseHandle(token) };
+        return None;
+    }
+    let sid_len = unsafe { GetLengthSid(user.User.Sid) };
+    let mut user_sid = vec![0u8; sid_len as usize];
+    if unsafe { CopySid(sid_len, user_sid.as_mut_ptr().cast(), user.User.Sid) } == 0 {
+        unsafe { CloseHandle(token) };
+        return None;
+    }
+    unsafe { CloseHandle(token) };
+    let mut session_id = 0u32;
+    if unsafe { ProcessIdToSessionId(u32::try_from(pid).ok()?, &mut session_id) } == 0 {
+        return None;
+    }
+    Some(WindowsPrincipal {
+        user_sid,
+        session_id,
+    })
+}
+
+#[cfg(windows)]
+fn windows_parent_pids() -> Option<HashMap<i32, i32>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W::default();
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut parent_pids = HashMap::new();
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while ok != 0 {
+        if let (Ok(pid), Ok(parent_pid)) = (
+            i32::try_from(entry.th32ProcessID),
+            i32::try_from(entry.th32ParentProcessID),
+        ) {
+            parent_pids.insert(pid, parent_pid);
+        }
+        ok = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    unsafe { CloseHandle(snapshot) };
+    Some(parent_pids)
 }
 
 #[cfg(target_os = "macos")]
@@ -886,17 +1237,18 @@ fn macos_short_bsd_info(pid: i32) -> Option<ProcBsdShortInfo> {
     (result == size).then(|| unsafe { info.assume_init() })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("process-lineage authorization is supported only on Linux and macOS");
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("process-lineage authorization is unsupported on this platform");
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use super::{
-        ExecutableIdentity, ProcessInfo, ProcessInstanceIdentity, ProcessResolver, ProcessStartTime,
+        ExecutableIdentity, ProcessInfo, ProcessInstanceIdentity, ProcessResolver,
+        ProcessStartTime, UserIdentity,
     };
 
     const UID: u32 = 501;
@@ -904,6 +1256,7 @@ mod tests {
     struct FakeResolver {
         processes: HashMap<i32, ProcessInfo>,
         visible_uids: HashMap<i32, u32>,
+        absent_parents: HashSet<i32>,
         verified_macos_login_bridges: HashMap<(i32, i32), i32>,
     }
 
@@ -935,6 +1288,11 @@ mod tests {
             self
         }
 
+        fn with_absent_parent(mut self, pid: i32) -> Self {
+            self.absent_parents.insert(pid);
+            self
+        }
+
         fn with_verified_macos_login_bridge(
             mut self,
             child_pid: i32,
@@ -952,15 +1310,29 @@ mod tests {
             self.processes.get(&pid).cloned()
         }
 
-        fn process_uid(&self, pid: i32) -> Option<u32> {
-            self.visible_uids.get(&pid).copied()
+        fn process_uid(&self, pid: i32) -> Option<UserIdentity> {
+            self.visible_uids.get(&pid).copied().map(UserIdentity::unix)
+        }
+
+        fn missing_parent_ends_chain(&self, parent_pid: i32) -> bool {
+            self.absent_parents.contains(&parent_pid)
+        }
+
+        fn parent_instance_predates_child(
+            &self,
+            parent: &ProcessInfo,
+            child: &ProcessInfo,
+        ) -> bool {
+            parent.instance.start_time.primary < child.instance.start_time.primary
+                || (parent.instance.start_time.primary == child.instance.start_time.primary
+                    && parent.instance.start_time.secondary < child.instance.start_time.secondary)
         }
 
         fn verified_parent_across_macos_login_boundary(
             &self,
             child: &ProcessInfo,
             parent_pid: i32,
-            peer_uid: u32,
+            peer_uid: UserIdentity,
         ) -> Option<ProcessInfo> {
             let verified_parent_pid = self
                 .verified_macos_login_bridges
@@ -1120,7 +1492,7 @@ mod tests {
 
         let scope = super::resolve_authorization_scope_with_resolver_and_gui(
             12,
-            UID,
+            UserIdentity::unix(UID),
             &first,
             &gui,
             Some(test_executable(4)),
@@ -1171,7 +1543,7 @@ mod tests {
 
         let scope = super::resolve_authorization_scope_with_resolver_and_gui(
             12,
-            UID,
+            UserIdentity::unix(UID),
             &first,
             &gui,
             Some(test_executable(4)),
@@ -1224,7 +1596,7 @@ mod tests {
 
         let scope = super::resolve_authorization_scope_with_resolver_and_gui(
             12,
-            UID,
+            UserIdentity::unix(UID),
             &first,
             &gui,
             Some(test_executable(4)),
@@ -1340,7 +1712,7 @@ mod tests {
 
         let scope = super::resolve_authorization_scope_with_resolver_and_gui(
             12,
-            UID,
+            UserIdentity::unix(UID),
             &resolver,
             &gui,
             Some(test_executable(4)),
@@ -1430,11 +1802,52 @@ mod tests {
     }
 
     #[test]
+    fn parent_exiting_after_uid_lookup_ends_verified_chain() {
+        let resolver = FakeResolver::default()
+            .with(10, 9, UID, 1)
+            .with_uid_only(9, UID)
+            .with_absent_parent(9);
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_some()
+        );
+    }
+
+    #[test]
     fn missing_parent_uid_is_rejected() {
         let resolver = FakeResolver::default().with(10, 9, UID, 1);
 
         assert!(
             super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_none()
+        );
+    }
+
+    #[test]
+    fn definitively_exited_parent_ends_verified_chain() {
+        let resolver = FakeResolver::default()
+            .with(10, 9, UID, 1)
+            .with_absent_parent(9);
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_some()
+        );
+    }
+
+    #[test]
+    fn reused_parent_pid_ends_verified_chain() {
+        let mut resolver = FakeResolver::default()
+            .with(10, 9, UID, 1)
+            .with(9, 0, UID, 9);
+        resolver
+            .processes
+            .get_mut(&9)
+            .unwrap()
+            .instance
+            .start_time
+            .primary = 101;
+
+        assert!(
+            super::resolve_authorization_scope_hash_with_resolver(10, UID, &resolver).is_some()
         );
     }
 
@@ -1475,6 +1888,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn platform_resolver_hashes_current_process_scope() {
         assert!(
             super::resolve_authorization_scope_hash(std::process::id() as i32, unsafe {
@@ -1498,7 +1912,12 @@ mod tests {
             .with_path(10, 1, UID, 1, "/bin/bash")
             .with_uid_only(1, 0);
 
-        let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
+        let scope = super::resolve_authorization_scope_with_resolver(
+            12,
+            UserIdentity::unix(UID),
+            &resolver,
+        )
+        .unwrap();
         let display = scope.display.unwrap();
 
         assert_eq!("Google Chrome", display.name);
@@ -1527,7 +1946,12 @@ mod tests {
             )
             .with_path(10, 1, UID, 1, "/bin/bash")
             .with_uid_only(1, 0);
-        let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
+        let scope = super::resolve_authorization_scope_with_resolver(
+            12,
+            UserIdentity::unix(UID),
+            &resolver,
+        )
+        .unwrap();
         let display = super::process_display_from_chain_with_agent(
             &chain(&resolver, &[10, 11, 12]),
             Some(test_executable(3)),
@@ -1753,7 +2177,12 @@ mod tests {
             .with_path(12, 11, UID, 3, "/usr/local/bin/example-tool")
             .with_uid_only(11, 0);
 
-        let scope = super::resolve_authorization_scope_with_resolver(12, UID, &resolver).unwrap();
+        let scope = super::resolve_authorization_scope_with_resolver(
+            12,
+            UserIdentity::unix(UID),
+            &resolver,
+        )
+        .unwrap();
         let display = scope.display.unwrap();
 
         assert_eq!("example-tool", display.name);
@@ -1771,7 +2200,7 @@ mod tests {
                 },
             },
             parent_pid,
-            uid,
+            uid: UserIdentity::unix(uid),
             executable: executable.map(test_executable),
             executable_path: executable.map(|inode| PathBuf::from(format!("/bin/test-{inode}"))),
         }

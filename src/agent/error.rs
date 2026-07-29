@@ -27,6 +27,7 @@ pub enum ApiErrorCode {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     TemporaryLockout,
@@ -57,6 +58,7 @@ impl ApiError {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub fn temporary_lockout() -> Self {

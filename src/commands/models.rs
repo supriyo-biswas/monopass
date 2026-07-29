@@ -39,6 +39,7 @@ pub struct ShellCompletionsResponse {
 #[cfg(any(
     test,
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

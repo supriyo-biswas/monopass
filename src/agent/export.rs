@@ -1,6 +1,4 @@
-use std::fs::OpenOptions;
 use std::io::{Cursor, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -12,9 +10,6 @@ use zip::write::SimpleFileOptions;
 
 use super::state::{DbError, DbHandle, ReferenceBody};
 use crate::agent::models::{FieldEntry, ItemResponse};
-
-const PRIVATE_DIR_MODE: u32 = 0o700;
-const PRIVATE_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportJobError {
@@ -219,27 +214,17 @@ fn write_job_output(
     item_name: &str,
     encrypted: &[u8],
 ) -> Result<PathBuf, ExportJobError> {
-    std::fs::create_dir_all(job_store_path)
+    crate::platform::create_private_dir_all(job_store_path)
         .map_err(|error| ExportJobError::io_failed(error.to_string()))?;
-    std::fs::set_permissions(
-        job_store_path,
-        std::fs::Permissions::from_mode(PRIVATE_DIR_MODE),
-    )
-    .map_err(|error| ExportJobError::io_failed(error.to_string()))?;
 
     let job_dir = job_store_path.join(job_id);
-    std::fs::create_dir(&job_dir).map_err(|error| ExportJobError::io_failed(error.to_string()))?;
-    std::fs::set_permissions(&job_dir, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+    crate::platform::create_private_dir(&job_dir)
         .map_err(|error| ExportJobError::io_failed(error.to_string()))?;
 
     let file_name = format!("{contact_name}_{item_name}.export");
     let final_path = job_dir.join(file_name);
     let temp_path = job_dir.join("output.tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        .open(&temp_path)
+    let mut file = crate::platform::open_private_new(&temp_path)
         .map_err(|error| ExportJobError::io_failed(error.to_string()))?;
     file.write_all(encrypted)
         .and_then(|()| file.flush())
@@ -268,6 +253,7 @@ struct ExportFile {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use age::Decryptor;
@@ -330,6 +316,7 @@ mod tests {
         .await
         .unwrap();
 
+        #[cfg(unix)]
         assert_eq!(
             0o600,
             output_path.metadata().unwrap().permissions().mode() & 0o777

@@ -1,6 +1,8 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(windows)]
+use crate::agent::windows_pipe::NamedPipeListener;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::Path;
 use axum::extract::Request;
@@ -11,6 +13,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::IncomingStream;
 use http_body::{Frame, SizeHint};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 
 use super::error::ApiError;
@@ -23,9 +26,32 @@ pub struct PeerConnectInfo {
     scope: Option<ResolvedAuthorizationScope>,
 }
 
+#[cfg(unix)]
 impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
     fn connect_info(stream: IncomingStream<'_, UnixListener>) -> Self {
         Self::from_peer_credentials(stream.io().peer_cred().ok().map(PeerCredentials::from))
+    }
+}
+
+#[cfg(windows)]
+impl Connected<IncomingStream<'_, NamedPipeListener>> for PeerConnectInfo {
+    fn connect_info(stream: IncomingStream<'_, NamedPipeListener>) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+
+        let mut pid = 0u32;
+        let ok =
+            unsafe { GetNamedPipeClientProcessId(stream.io().as_raw_handle().cast(), &mut pid) };
+        let credentials = (ok != 0)
+            .then(|| i32::try_from(pid).ok())
+            .flatten()
+            .and_then(|pid| {
+                super::process::windows_process_principal(pid).map(|principal| PeerCredentials {
+                    pid: Some(pid),
+                    principal,
+                })
+            });
+        Self::from_peer_credentials(credentials)
     }
 }
 
@@ -52,10 +78,15 @@ impl PeerConnectInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PeerCredentials {
     pid: Option<i32>,
+    #[cfg(unix)]
     uid: u32,
+    #[cfg(unix)]
     gid: u32,
+    #[cfg(windows)]
+    principal: super::process::WindowsPrincipal,
 }
 
+#[cfg(unix)]
 impl From<tokio::net::unix::UCred> for PeerCredentials {
     fn from(credentials: tokio::net::unix::UCred) -> Self {
         Self {
@@ -85,7 +116,7 @@ pub async fn require_same_uid_and_gid(
     }
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
 pub async fn require_direct_unlock_caller(
     mut request: Request,
     next: Next,
@@ -215,28 +246,53 @@ fn authorized_peer_scope(
         return None;
     }
 
-    super::process::resolve_authorization_scope(credentials.pid?, credentials.uid)
+    #[cfg(unix)]
+    {
+        super::process::resolve_authorization_scope(credentials.pid?, credentials.uid)
+    }
+    #[cfg(windows)]
+    {
+        super::process::resolve_windows_authorization_scope(
+            credentials.pid?,
+            &credentials.principal,
+        )
+    }
 }
 
 fn peer_credentials_are_authorized(credentials: Option<&PeerCredentials>) -> bool {
-    matches!(
-        credentials,
-        Some(credentials)
-            if credentials.uid == current_process_uid()
-                && credentials.gid == current_process_gid()
-                && credentials.pid.is_some()
-    )
+    #[cfg(unix)]
+    {
+        matches!(
+            credentials,
+            Some(credentials)
+                if credentials.uid == current_process_uid()
+                    && credentials.gid == current_process_gid()
+                    && credentials.pid.is_some()
+        )
+    }
+    #[cfg(windows)]
+    {
+        matches!(
+            credentials,
+            Some(credentials)
+                if credentials.pid.is_some()
+                    && super::process::current_windows_principal()
+                        .is_some_and(|current| current == credentials.principal)
+        )
+    }
 }
 
+#[cfg(unix)]
 fn current_process_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+#[cfg(unix)]
 fn current_process_gid() -> u32 {
     unsafe { libc::getegid() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use axum::Router;
     use axum::body::Body;
@@ -477,5 +533,29 @@ mod tests {
         let mut request = Request::get("/").body(Body::empty()).unwrap();
         request.extensions_mut().insert(ConnectInfo(connect_info));
         request
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{PeerCredentials, peer_credentials_are_authorized};
+
+    #[test]
+    fn matching_windows_principal_is_authorized() {
+        let principal = crate::agent::process::current_windows_principal().unwrap();
+        assert!(peer_credentials_are_authorized(Some(&PeerCredentials {
+            pid: Some(std::process::id() as i32),
+            principal,
+        })));
+    }
+
+    #[test]
+    fn different_windows_session_is_rejected() {
+        let mut principal = crate::agent::process::current_windows_principal().unwrap();
+        principal.session_id = principal.session_id.wrapping_add(1);
+        assert!(!peer_credentials_are_authorized(Some(&PeerCredentials {
+            pid: Some(std::process::id() as i32),
+            principal,
+        })));
     }
 }

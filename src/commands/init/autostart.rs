@@ -1,9 +1,12 @@
 use std::env;
+#[cfg(unix)]
 use std::fs;
 use std::io;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
@@ -66,12 +69,49 @@ fn enable_agent_with_exe(exe: &Path, listen_path: &Path) -> io::Result<()> {
     run_command("launchctl", ["kickstart", "-k", &service_target])
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn enable_agent_with_exe(exe: &Path, _listen_path: &Path) -> io::Result<()> {
+    let command = format!("\"{}\" agent", exe.display());
+    let output = Command::new("reg.exe")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "monopass-agent",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &command,
+            "/f",
+        ])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error_windows(
+            "reg.exe",
+            output.status,
+            &output.stderr,
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn enable_agent_with_exe(_exe: &Path, _listen_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "agent auto-start is only supported on Linux and macOS",
     ))
+}
+
+#[cfg(windows)]
+fn command_error_windows(
+    program: &str,
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> io::Error {
+    let stderr = String::from_utf8_lossy(stderr);
+    io::Error::other(format!("{program} failed with {status}: {stderr}"))
 }
 
 #[cfg(target_os = "linux")]

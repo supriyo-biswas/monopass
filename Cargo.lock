@@ -2021,6 +2021,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "url",
+ "windows-sys 0.61.2",
  "xdg",
  "zeroize",
  "zip",

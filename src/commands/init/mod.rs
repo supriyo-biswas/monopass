@@ -1,5 +1,4 @@
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 
 use clap::{Args as ClapArgs, ValueEnum};
 
@@ -8,8 +7,6 @@ use crate::config::Config;
 use crate::{AppResult, db};
 
 mod autostart;
-
-const PRIVATE_DIR_MODE: u32 = 0o700;
 
 #[derive(Debug, Clone, ClapArgs)]
 pub struct Args {
@@ -77,8 +74,7 @@ pub fn run(config: &Config, args: Args) -> AppResult {
 }
 
 fn create_private_dir(path: &std::path::Path) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+    crate::platform::create_private_dir_all(path)
 }
 
 fn should_configure_auto_start(auto_start: Option<AutoStart>) -> io::Result<bool> {

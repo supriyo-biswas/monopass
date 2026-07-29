@@ -13,7 +13,7 @@ The currently empty `vault` and `item` command placeholders will be replaced by
 top-level subcommands matching this spec. Keep `src/commands/mod.rs` to CLI
 wiring only and put implementation in focused modules, for example:
 
-- `src/commands/client.rs`: Unix-socket HTTP client, auth retry, API error
+- `src/commands/client.rs`: local socket/named-pipe HTTP client, auth retry, API error
   handling, pagination helpers.
 - `src/commands/path.rs`: parsing `pass://`, `op://`, `<dir>/<item>`, and
   `<dir>/<item>/<fieldOrFile>` references.
@@ -24,8 +24,10 @@ wiring only and put implementation in focused modules, for example:
   decoding. Add CLI dependencies such as `image` for image loading and `rqrr`
   for QR detection/decoding.
 
-Implement a small blocking HTTP client over the Unix socket at
-`Config::listen_path()`. The client should decode structured API errors and
+Implement a small blocking HTTP client over the Unix socket or Windows named
+pipe at `Config::listen_path()`. Windows clients verify the server process SID,
+session, and executable before exchanging data, and may start the current
+binary's agent on demand when no pipe exists. The client should decode structured API errors and
 preserve status codes for command-specific handling. On any auth-required
 request that returns `403 access_denied`, select the first advertised unlock
 method through the discovery flow in
@@ -43,6 +45,27 @@ original request once after a successful unlock method call. Treat
 `403 unlock_failed`, `502 migration_needed`, and a second `403 access_denied`
 as command failure. A `migration_needed` response is passed through unchanged
 so the user sees the instruction to run `monopass migrate`.
+
+Each `Client` connects lazily and reuses one verified HTTP/1.1 Unix-socket or
+Windows named-pipe transport for its lifetime. This includes the original
+request, unlock-method discovery, GUI or direct unlock, the one intentional
+auth retry, pagination, and job polling. Cloning a client does not clone or
+share its active transport; the clone begins disconnected. Connections are not
+pooled between clients or CLI commands.
+
+Requests advertise `Connection: keep-alive`. The client frames each response
+without waiting for EOF: response headers are limited to 64 KiB,
+`Content-Length` bodies are read exactly, and chunked bodies are decoded through
+the terminating chunk with all trailers consumed. HEAD responses and bodyless
+status codes have no response body. A response without a framing length is read
+through EOF as a close-delimited body.
+
+Discard the retained transport after `Connection: close`, a close-delimited
+response, EOF, malformed framing, or any read/write error. A failed in-progress
+request is never replayed automatically, including GET requests. Return the
+error to the caller; only the next explicit request may establish a new
+connection.
+
 If the user explicitly denies GUI access, or that denial is already cached for
 the caller's process lineage, the GUI unlock method returns
 `403 temporary_lockout` with message `temporarily locked out after denial`.
@@ -133,6 +156,8 @@ deny debugger attachment: macOS uses `PT_DENY_ATTACH`, while Linux marks the
 process non-dumpable with `PR_SET_DUMPABLE` and refuses startup when
 `/proc/self/status` reports a nonzero `TracerPid`. Linux startup fails closed if
 the tracer status cannot be read or parsed.
+Windows refuses startup under a debugger and suppresses Windows Error Reporting
+heap capture and UI before creating the named pipe.
 
 ## lock command
 
@@ -224,6 +249,11 @@ the current process and `LISTEN_FDS=1`; without socket activation environment
 variables, direct `monopass agent` startup falls back to binding the configured
 socket path itself.
 
+On Windows, persistent data is stored under the user's Local AppData
+`monopass` directory with restrictive ACLs. The endpoint is a per-user named
+pipe. Auto-start registers `"monopass.exe" agent` in the current user's Run
+key; clients also provide on-demand activation.
+
 On macOS, auto-start is configured with a user LaunchAgent at
 `~/Library/LaunchAgents/com.monopass.agent.plist`. The plist uses a `Sockets`
 entry named `monopass-agent` with `SockPathName` set to `Config::listen_path()`.
@@ -267,6 +297,7 @@ Options:
 
 - `-o/--out-file`: Write to the given file instead of stdout, or `-` for stdout.
 - `--file-mode`: File mode to use if writing to a file. Defaults to `0600`.
+  Windows uses a current-user-plus-System ACL instead of POSIX mode bits.
 - `-f/--force`: Overwrite an existing output file.
 
 When writing to a regular file, fail if the target exists unless `--force` is
@@ -286,8 +317,8 @@ Copy a field or file value to the system clipboard. The reference syntax,
 field/file precedence, TOTP behavior, checksum verification, and unlock retry
 behavior are the same as for `read`.
 
-This command is present only in macOS builds and Linux builds using the `gtk`
-or `qt` feature. The reference value must be valid UTF-8. The command writes it
+This command is present in Windows and macOS builds and Linux builds using the
+`gtk` or `qt` feature. The reference value must be valid UTF-8. The command writes it
 through the native clipboard API and fails without changing the clipboard when
 the value is not UTF-8 or the current display does not support clipboard
 access. Linux builds request the standard password-manager clipboard-history

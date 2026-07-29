@@ -1,8 +1,8 @@
 # Use the local agent API
 
-Some applications may want to seek a deeper level of integration than what is possible with the `monopass` command. In such cases, you may want to directly interact with the monopass agent Unix socket, which provides an HTTP API for querying directories, items, and files. In fact, the monopass CLI commands such as `mv`, `cp`, and `show` also consume the same API.
+Some applications may want to seek a deeper level of integration than what is possible with the `monopass` command. In such cases, you may want to directly interact with the monopass agent's local HTTP transport: a Unix socket on Linux and macOS, or a named pipe on Windows. It provides an API for querying directories, items, and files. In fact, the monopass CLI commands such as `mv`, `cp`, and `show` also consume the same API.
 
-The example uses Python and HTTPX. HTTPX supports Unix-domain sockets through [`httpx.HTTPTransport(uds=...)`](https://www.python-httpx.org/advanced/transports/). Make sure to also refer to the [API reference](../references/api-reference.md).
+The example uses Python and HTTPX on Unix. HTTPX supports Unix-domain sockets through [`httpx.HTTPTransport(uds=...)`](https://www.python-httpx.org/advanced/transports/). Windows integrations need a named-pipe HTTP client and are subject to the same peer-process and lineage checks. Make sure to also refer to the [API reference](../references/api-reference.md).
 
 You may like to review the code example directly, in which case you should skip to [set up the project](#set-up-the-project).
 

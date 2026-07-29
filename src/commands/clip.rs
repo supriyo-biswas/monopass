@@ -98,7 +98,7 @@ impl ClipboardBackend for NativeClipboard {
                 .text(text)
                 .map_err(Into::into)
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             Ok(self.inner.set_text(text)?)
         }

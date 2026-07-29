@@ -1,10 +1,15 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug)]
@@ -21,37 +26,66 @@ pub enum AgentLockError {
 impl AgentLockGuard {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, AgentLockError> {
         let path = path.as_ref();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(PRIVATE_FILE_MODE)
-            .open(path)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(PRIVATE_FILE_MODE);
+        #[cfg(windows)]
+        options.share_mode(0);
+        let file = match options.open(path) {
+            Ok(file) => file,
+            #[cfg(windows)]
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || matches!(
+                        error.raw_os_error(),
+                        Some(code)
+                            if code
+                                == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
+                                || code
+                                    == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+                    ) =>
+            {
+                return Err(AgentLockError::Running {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(error) => return Err(AgentLockError::Io(error)),
+        };
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
             .map_err(AgentLockError::Io)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-            .map_err(AgentLockError::Io)?;
+        #[cfg(windows)]
+        crate::platform::windows::apply_private_dacl(path).map_err(AgentLockError::Io)?;
 
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 {
-            return Ok(Self { file });
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            ) {
+                Err(AgentLockError::Running {
+                    path: path.to_path_buf(),
+                })
+            } else {
+                Err(AgentLockError::Io(error))
+            }
         }
 
-        let error = io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error(),
-            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
-        ) {
-            Err(AgentLockError::Running {
-                path: path.to_path_buf(),
-            })
-        } else {
-            Err(AgentLockError::Io(error))
-        }
+        #[cfg(windows)]
+        Ok(Self { file })
     }
 }
 
 impl Drop for AgentLockGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }

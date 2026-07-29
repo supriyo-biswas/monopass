@@ -1,6 +1,5 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
@@ -83,6 +82,8 @@ fn write_stdout(bytes: &[u8]) -> AppResult {
 }
 
 fn write_file(path: PathBuf, bytes: &[u8], mode: u32, force: bool) -> AppResult {
+    #[cfg(windows)]
+    let _ = mode;
     if path.exists() && !force {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -96,11 +97,18 @@ fn write_file(path: PathBuf, bytes: &[u8], mode: u32, force: bool) -> AppResult 
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output path"))?
         .to_string_lossy();
     let tmp_path = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp_path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(windows)]
+    crate::platform::configure_private_options(&mut options);
+    let mut file = options.open(&tmp_path)?;
+    #[cfg(windows)]
+    crate::platform::windows::apply_private_dacl(&tmp_path)?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&tmp_path);
         return Err(error.into());

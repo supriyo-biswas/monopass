@@ -60,8 +60,10 @@ access accounting are identical to other database-backed operations.
 
 ## Auth
 
-The agent derives an authorization scope from the Unix peer credentials and the
-peer's process lineage. A scope contains the caller UID, the PID and start time
+The agent derives an authorization scope from authenticated local transport
+credentials and the peer's process lineage. On Unix this uses socket peer
+credentials; on Windows it uses the named-pipe client PID plus the process
+account SID and session. A scope contains the caller identity, the PID and start time
 of the oldest accessible same-user process, and the ordered identity of every
 process from that anchor through the direct client. The direct `monopass`
 process is included. POSIX session IDs do not limit traversal or contribute to
@@ -81,6 +83,11 @@ process group, controlling terminal and session, parent relationship, and stable
 process observations all corroborate the boundary. The `login` process itself
 is excluded from the scope. If any evidence is missing or inconsistent,
 traversal stops at the boundary and preserves the narrower per-shell scope.
+On Windows, the pipe DACL admits only the current user and LocalSystem, remote
+clients are rejected, and the peer account SID and session must match the agent.
+Lineage uses process creation time, parent PID, token identity, executable path,
+volume serial, and file ID. Missing or inconsistent process/token information
+fails closed.
 
 Authorization is recorded independently for the `items` and `settings` access
 scopes. Auth endpoints that accept `scope` default to `items` when it is omitted.
@@ -118,6 +125,10 @@ macOS response:
 }
 ```
 
+Windows returns the same GUI-only response. Its GUI method uses Windows
+Credential UI with `CREDUIWIN_SECURE_PROMPT`; it never advertises direct bearer
+password unlock.
+
 Linux direct response:
 
 ```json
@@ -144,7 +155,7 @@ Linux GUI-capable response with `x-session` or `wayland-session` capability:
 }
 ```
 
-On macOS and Linux GUI-capable builds, the GUI method is:
+On macOS, Windows, and Linux GUI-capable builds, the GUI method is:
 
 ```http
 POST /api/v1/auth/unlock/gui?scope={items|settings}
@@ -180,7 +191,10 @@ or direct-unlock trust evaluation. Linux GUI unlock requires an accepted GUI
 session capability (`x-session` or `wayland-session`) and uses in-process GTK4
 or Qt Quick/QML SDK dialogs with forced X11 backend usage. A wrong password,
 cancelled dialog, or closed dialog denies the request. Concurrent GUI unlock
-requests are displayed as separate dialogs.
+requests are displayed as separate dialogs. Windows serializes prompt requests
+and displays the requesting executable and scope through Credential UI on the
+secure desktop. Icons are currently omitted. Cancel records the same temporary
+denial as an explicit Deny action.
 
 Clicking the explicit **Deny** button records a denial for the requesting
 process-lineage and access-scope pair. Until `agent.denialTtlSeconds` expires,

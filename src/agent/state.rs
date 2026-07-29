@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,7 +31,7 @@ use super::models::{
     ShellCompletionKind, ShellCompletionsResponse, UpdateContactRequest, UpdateDirRequest,
     UpdateFieldEntry, UpdateFileEntry, UpdateItemRequest,
 };
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
 use super::process::DirectUnlockCaller;
 use super::process::ScopeHash;
 use crate::conceal::inferred_concealed;
@@ -51,7 +50,9 @@ pub(crate) const DATABASE_READER_WORKERS: usize = 8;
 const FILE_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const FILE_ID_BYTES: usize = 16;
 const FILE_KEY_BYTES: usize = 32;
+#[cfg(all(test, unix))]
 const PRIVATE_DIR_MODE: u32 = 0o700;
+#[cfg(all(test, unix))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const AES_GCM_NONCE_BYTES: usize = 12;
 const FILE_NONCE_PREFIX_BYTES: usize = 8;
@@ -177,6 +178,7 @@ impl AgentState {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub async fn unlock_for_scope(
@@ -189,7 +191,7 @@ impl AgentState {
             .await
     }
 
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
     pub async fn unlock_direct_for_scope(
         &self,
         password: Zeroizing<String>,
@@ -404,6 +406,7 @@ impl AgentState {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub async fn deny_scope_hash_for_scope(
@@ -430,6 +433,7 @@ impl AgentState {
     #[cfg(any(
         test,
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     pub async fn is_scope_denied_for_scope(
@@ -3325,6 +3329,7 @@ impl DatabaseWorker {
         if let Some(parent) = final_path.parent() {
             create_private_dir_all(parent)?;
         }
+        let _temp_cleanup = RemoveFileOnDrop(temp_path.clone());
         let mut temp_file = create_private_blob_file(&temp_path)?;
         let mut sha256 = Sha256::new();
         let mut size = 0_u64;
@@ -5053,19 +5058,19 @@ fn write_temp_path(file_store_path: &Path, id_hex: &str) -> Result<PathBuf, DbEr
 }
 
 fn create_private_dir_all(path: &Path) -> Result<(), DbError> {
-    fs::create_dir_all(path).map_err(|_| DbError::Internal)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE))
-        .map_err(|_| DbError::Internal)
+    crate::platform::create_private_dir_all(path).map_err(|_| DbError::Internal)
 }
 
 fn create_private_blob_file(path: &Path) -> Result<fs::File, DbError> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(PRIVATE_FILE_MODE)
-        .open(path)
-        .map_err(|_| DbError::Internal)
+    crate::platform::open_private_truncate(path).map_err(|_| DbError::Internal)
+}
+
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn decode_file_key(key_hex: &str) -> Result<Zeroizing<[u8; FILE_KEY_BYTES]>, DbError> {
@@ -5843,6 +5848,7 @@ fn sqlite_error_code(error: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -5856,10 +5862,11 @@ mod tests {
     use super::{
         AccessScope, AgentState, AuthCache, CreateContactRequest, CreateItemRequest,
         DATABASE_READER_WORKERS, DbError, DbHandle, FILE_RECORD_PLAINTEXT_BYTES, ItemListRequest,
-        ListDirection, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PRIVATE_DIR_MODE,
-        PRIVATE_FILE_MODE, PageRequest, ShellCompletionKind, UnlockError, UpdateContactRequest,
-        UpdateItemRequest,
+        ListDirection, MAX_FILE_RECORDS, MAX_FILE_UPLOAD_BYTES, PageRequest, ShellCompletionKind,
+        UnlockError, UpdateContactRequest, UpdateItemRequest,
     };
+    #[cfg(unix)]
+    use super::{PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
     use crate::agent::clock::{SuspendAwareInstant as Instant, TestSuspendAwareClock};
     use crate::agent::process::{DirectUnlockCaller, ScopeHash};
 
@@ -9809,30 +9816,33 @@ mod tests {
         let encrypted = std::fs::read(&encrypted_path).unwrap();
 
         assert_ne!(b"secret notes".as_slice(), encrypted.as_slice());
-        assert_eq!(
-            PRIVATE_FILE_MODE,
-            std::fs::metadata(&encrypted_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777
-        );
-        assert_eq!(
-            PRIVATE_DIR_MODE,
-            std::fs::metadata(encrypted_path.parent().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777
-        );
-        assert_eq!(
-            PRIVATE_DIR_MODE,
-            std::fs::metadata(database.pool.file_store_path.join("tmp"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                PRIVATE_FILE_MODE,
+                std::fs::metadata(&encrypted_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            );
+            assert_eq!(
+                PRIVATE_DIR_MODE,
+                std::fs::metadata(encrypted_path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            );
+            assert_eq!(
+                PRIVATE_DIR_MODE,
+                std::fs::metadata(database.pool.file_store_path.join("tmp"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            );
+        }
 
         database.create_dir("dir".to_owned()).await.unwrap();
         database

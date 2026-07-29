@@ -110,7 +110,13 @@ fn system_suspend_aware_now() -> Option<SuspendAwareInstant> {
     Some(SuspendAwareInstant(Duration::new(seconds, subsecond_nanos)))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn system_suspend_aware_now() -> Option<SuspendAwareInstant> {
+    let millis = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    Some(SuspendAwareInstant(Duration::from_millis(millis)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn system_suspend_aware_now() -> Option<SuspendAwareInstant> {
     None
 }
@@ -171,7 +177,7 @@ impl SuspendAwareClock for TestSuspendAwareClock {
 mod tests {
     use super::{SuspendAwareClock, SystemSuspendAwareClock};
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn system_clock_is_available_and_advances() {
         let clock = SystemSuspendAwareClock;

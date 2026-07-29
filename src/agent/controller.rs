@@ -13,7 +13,6 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,6 +21,7 @@ use zeroize::Zeroizing;
 use super::error::ApiError;
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 use super::gui_auth::PromptOutcome;
@@ -32,10 +32,11 @@ use super::models::{
     SettingResponse, ShellCompletionKind, ShellCompletionsQuery, ShellCompletionsResponse,
     UpdateContactRequest, UpdateDirRequest, UpdateItemRequest, UpdateSettingRequest,
 };
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
 use super::process::DirectUnlockCaller;
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 use super::process::ProcessDisplay;
@@ -47,7 +48,6 @@ use super::state::{
 
 const DEFAULT_PAGE_COUNT: u64 = 50;
 const MAX_PAGE_COUNT: u64 = 200;
-const PRIVATE_FILE_MODE: u32 = 0o600;
 
 #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
 const CLIENT_CAPABILITIES_HEADER: &str = "x-client-capabilities";
@@ -153,6 +153,11 @@ fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
     true
 }
 
+#[cfg(windows)]
+fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
+    true
+}
+
 #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
 fn should_advertise_gui_unlock(headers: &HeaderMap) -> bool {
     headers
@@ -166,7 +171,7 @@ fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
     false
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn should_advertise_gui_unlock(_headers: &HeaderMap) -> bool {
     false
 }
@@ -183,7 +188,7 @@ fn client_capabilities_include_gui_session(value: &str) -> bool {
     })
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
 pub async fn unlock_direct(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
@@ -209,6 +214,7 @@ pub async fn unlock_direct(
 
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 pub async fn unlock_gui(
@@ -231,6 +237,7 @@ pub async fn unlock_gui(
 
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 async fn unlock_gui_with_prompt<F, Fut>(
@@ -282,6 +289,11 @@ where
 }
 
 #[cfg(target_os = "macos")]
+fn gui_unlock_request_allowed(_headers: &HeaderMap) -> bool {
+    true
+}
+
+#[cfg(windows)]
 fn gui_unlock_request_allowed(_headers: &HeaderMap) -> bool {
     true
 }
@@ -771,12 +783,8 @@ async fn spool_import_body(body: &mut Body) -> Result<PathBuf, ApiError> {
     std::fs::create_dir_all(&dir).map_err(|_| ApiError::internal_error())?;
     let mut path = dir.join(random_job_id().map_err(|_| ApiError::internal_error())?);
     path.set_extension("export");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
-        .open(&path)
-        .map_err(|_| ApiError::internal_error())?;
+    let mut file =
+        crate::platform::open_private_new(&path).map_err(|_| ApiError::internal_error())?;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| {
             let _ = std::fs::remove_file(&path);
@@ -1159,7 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     async fn unlock_methods_returns_direct_method() {
         let response = unlock_methods(HeaderMap::new(), default_scope_query())
             .await

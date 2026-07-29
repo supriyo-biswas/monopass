@@ -26,6 +26,7 @@ Changing the master password needs exclusive access to the encrypted database. F
 
 * **Linux:** `systemctl --user stop monopass-agent.socket monopass-agent.service`
 * **macOS:** `launchctl bootout gui/$(id -u)/com.monopass.agent`
+* **Windows PowerShell:** `Get-Process monopass | Stop-Process`
 
 Then, run:
 
@@ -37,6 +38,8 @@ Enter your old master password and new password to set the new password. Once th
 
 * **Linux:** `systemctl --user start monopass-agent.socket monopass-agent.service`
 * **macOS:** `launchctl kickstart -k gui/$(id -u)/com.monopass.agent`
+* **Windows:** run any monopass client command; it starts the verified per-user
+  named-pipe agent on demand.
 
 | Previous chapter | Next chapter |
 | --- | --- |

@@ -4,6 +4,7 @@ pub mod conceal;
 pub mod config;
 pub mod db;
 pub mod lock;
+pub(crate) mod platform;
 pub mod secret;
 pub mod settings;
 

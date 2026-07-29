@@ -7,6 +7,7 @@ mod agent;
 mod client;
 #[cfg(any(
     target_os = "macos",
+    windows,
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
 mod clip;
@@ -62,6 +63,7 @@ pub enum Command {
     Read(read::Args),
     #[cfg(any(
         target_os = "macos",
+        windows,
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
     #[command(about = "Copy a field or file reference to the clipboard")]
@@ -125,6 +127,7 @@ pub fn run(config: &Config, command: Command) -> AppResult {
         Command::Read(args) => read::run(config, args),
         #[cfg(any(
             target_os = "macos",
+            windows,
             all(target_os = "linux", any(feature = "gtk", feature = "qt"))
         ))]
         Command::Clip(args) => clip::run(config, args),

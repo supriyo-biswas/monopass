@@ -65,6 +65,8 @@ fn current_platform() -> StopAgentPlatform {
         StopAgentPlatform::Linux
     } else if cfg!(target_os = "macos") {
         StopAgentPlatform::Macos
+    } else if cfg!(windows) {
+        StopAgentPlatform::Windows
     } else {
         StopAgentPlatform::OtherUnix
     }
@@ -74,6 +76,7 @@ fn current_platform() -> StopAgentPlatform {
 enum StopAgentPlatform {
     Linux,
     Macos,
+    Windows,
     OtherUnix,
 }
 
@@ -84,6 +87,9 @@ fn stop_agent_instructions_for(platform: StopAgentPlatform) -> &'static str {
         }
         StopAgentPlatform::Macos => {
             "monopass agent is running. Stop it with `launchctl bootout gui/$(id -u)/com.monopass.agent`, then retry `monopass passwd`."
+        }
+        StopAgentPlatform::Windows => {
+            "monopass agent is running. Stop it from Task Manager or with `Get-Process monopass | Stop-Process`, then retry `monopass passwd`."
         }
         StopAgentPlatform::OtherUnix => {
             "monopass agent is running. Stop any running `monopass agent` process, then retry `monopass passwd`."
@@ -99,6 +105,7 @@ fn restart_agent_instructions_for(platform: StopAgentPlatform) -> &'static str {
         StopAgentPlatform::Macos => {
             "Start monopass again with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.monopass.agent.plist`, then `launchctl enable gui/$(id -u)/com.monopass.agent`, then `launchctl kickstart -k gui/$(id -u)/com.monopass.agent`."
         }
+        StopAgentPlatform::Windows => "Run any monopass client command to start the agent again.",
         StopAgentPlatform::OtherUnix => {
             "Start monopass again by starting `monopass agent` with your normal process manager."
         }
