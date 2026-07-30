@@ -97,7 +97,7 @@ fn restart_agent_instructions_for(platform: StopAgentPlatform) -> &'static str {
             "Start monopass again with `systemctl --user start monopass-agent.socket`."
         }
         StopAgentPlatform::Macos => {
-            "Start monopass again with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.monopass.agent.plist`, then `launchctl enable gui/$(id -u)/com.monopass.agent`, then `launchctl kickstart -k gui/$(id -u)/com.monopass.agent`."
+            "Start monopass again with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.monopass.agent.plist`."
         }
         StopAgentPlatform::OtherUnix => {
             "Start monopass again by starting `monopass agent` with your normal process manager."
@@ -148,14 +148,14 @@ mod tests {
     }
 
     #[test]
-    fn macos_restart_instructions_bootstrap_enable_and_kickstart_launch_agent() {
+    fn macos_restart_instructions_bootstrap_socket_activated_launch_agent() {
         let instructions = restart_agent_instructions_for(StopAgentPlatform::Macos);
 
         assert!(instructions.contains(
             "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.monopass.agent.plist"
         ));
-        assert!(instructions.contains("launchctl enable gui/$(id -u)/com.monopass.agent"));
-        assert!(instructions.contains("launchctl kickstart -k gui/$(id -u)/com.monopass.agent"));
+        assert!(!instructions.contains("launchctl enable"));
+        assert!(!instructions.contains("launchctl kickstart"));
     }
 
     #[test]

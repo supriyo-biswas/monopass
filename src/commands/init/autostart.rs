@@ -62,8 +62,7 @@ fn enable_agent_with_exe(exe: &Path, listen_path: &Path) -> io::Result<()> {
 
     let plist = plist_path.to_string_lossy().into_owned();
     run_command("launchctl", ["bootstrap", &domain_label, &plist])?;
-    run_command("launchctl", ["enable", &service_target])?;
-    run_command("launchctl", ["kickstart", "-k", &service_target])
+    run_command("launchctl", ["enable", &service_target])
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

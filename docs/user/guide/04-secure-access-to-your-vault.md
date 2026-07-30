@@ -36,7 +36,7 @@ monopass passwd
 Enter your old master password and new password to set the new password. Once that is done, restart the agent again with:
 
 * **Linux:** `systemctl --user start monopass-agent.socket monopass-agent.service`
-* **macOS:** `launchctl kickstart -k gui/$(id -u)/com.monopass.agent`
+* **macOS:** `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.monopass.agent.plist`
 
 | Previous chapter | Next chapter |
 | --- | --- |

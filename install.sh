@@ -248,7 +248,6 @@ restart_existing_agent() {
       launchctl bootout "$service_target" >/dev/null 2>&1 || true
       launchctl bootstrap "$domain_label" "$plist" >/dev/null 2>&1 || true
       launchctl enable "$service_target" >/dev/null 2>&1 || true
-      launchctl kickstart -k "$service_target" >/dev/null 2>&1 || true
       ;;
   esac
 }
