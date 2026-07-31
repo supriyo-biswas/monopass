@@ -8,9 +8,13 @@ An approval applies to the requesting command and its process tree. A request fr
 
 ![Unlock prompt](../../images/unlock.png)
 
-Successful item approval lasts 15 minutes by default for that process tree.
+Successful item approval lasts 15 minutes by default for that process tree. The Linux CLI variant also remembers process trees, but it does not show them in the inline `Enter master password:` prompt.
 
-The Linux CLI variant also remembers process trees, but it does not show them in the inline `Enter master password:` prompt.
+To change the duration for which approval lasts, update the `agent.authTtlSeconds` setting, for example to increase this period to 1 hour, you would use:
+
+```sh
+monopass write-setting agent.authTtlSeconds 3600
+```
 
 ## Locking the database
 
