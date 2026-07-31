@@ -14,6 +14,10 @@ use super::models::{ShellCompletionKind, ShellCompletionsResponse};
 use crate::AppResult;
 use crate::config::Config;
 
+const MASTER_PASSWORD_PROMPT: &str = "[monopass] Enter master password: ";
+const INCORRECT_PASSWORD_MESSAGE: &str = "Password incorrect.";
+const MAX_PASSWORD_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
@@ -316,7 +320,7 @@ impl<'a> Client<'a> {
         prompt: F,
     ) -> AppResult<Response>
     where
-        F: FnOnce() -> io::Result<Zeroizing<String>>,
+        F: FnMut() -> io::Result<Zeroizing<String>>,
     {
         self.request_with_unlock_prompt_for_scope(
             method,
@@ -337,18 +341,17 @@ impl<'a> Client<'a> {
         content_type: Option<&str>,
         auth_mode: AuthMode,
         access_scope: AccessScope,
-        prompt: F,
+        mut prompt: F,
     ) -> AppResult<Response>
     where
-        F: FnOnce() -> io::Result<Zeroizing<String>>,
+        F: FnMut() -> io::Result<Zeroizing<String>>,
     {
         let mut password: Option<Zeroizing<String>> = None;
         let mut response = self.request(method, path, &body, content_type, None)?;
         if is_access_denied(&response) {
             let unlock_method = self.first_unlock_method(access_scope)?;
             if unlock_method.accepts_master_password {
-                let prompted = prompt()?;
-                self.unlock(&unlock_method, Some(&prompted))?;
+                let prompted = self.unlock_with_password_prompt(&unlock_method, &mut prompt)?;
                 password = Some(prompted);
             } else {
                 self.unlock(&unlock_method, None)?;
@@ -389,11 +392,11 @@ impl<'a> Client<'a> {
         content_length: u64,
         content_type: Option<&str>,
         auth_mode: AuthMode,
-        prompt: F,
+        mut prompt: F,
     ) -> AppResult<Response>
     where
         R: Read + Seek,
-        F: FnOnce() -> io::Result<Zeroizing<String>>,
+        F: FnMut() -> io::Result<Zeroizing<String>>,
     {
         let mut password: Option<Zeroizing<String>> = None;
         body.seek(SeekFrom::Start(0))?;
@@ -402,8 +405,7 @@ impl<'a> Client<'a> {
         if is_access_denied(&response) {
             let unlock_method = self.first_unlock_method(AccessScope::for_api_path(path))?;
             if unlock_method.accepts_master_password {
-                let prompted = prompt()?;
-                self.unlock(&unlock_method, Some(&prompted))?;
+                let prompted = self.unlock_with_password_prompt(&unlock_method, &mut prompt)?;
                 password = Some(prompted);
             } else {
                 self.unlock(&unlock_method, None)?;
@@ -474,6 +476,31 @@ impl<'a> Client<'a> {
             return Ok(());
         }
         Err(api_error(response).into())
+    }
+
+    fn unlock_with_password_prompt<F>(
+        &self,
+        method: &AuthUnlockMethod,
+        prompt: &mut F,
+    ) -> AppResult<Zeroizing<String>>
+    where
+        F: FnMut() -> io::Result<Zeroizing<String>>,
+    {
+        for attempt in 0..MAX_PASSWORD_ATTEMPTS {
+            let password = prompt()?;
+            match self.unlock(method, Some(&password)) {
+                Ok(()) => return Ok(password),
+                Err(error) if is_retryable_unlock_error(error.as_ref()) => {
+                    eprintln!("{INCORRECT_PASSWORD_MESSAGE}");
+                    if attempt + 1 == MAX_PASSWORD_ATTEMPTS {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("password attempt loop always returns")
     }
 
     fn request(
@@ -661,7 +688,13 @@ where
 }
 
 pub fn prompt_master_password() -> io::Result<Zeroizing<String>> {
-    rpassword::prompt_password("Enter master password: ").map(Zeroizing::new)
+    rpassword::prompt_password(MASTER_PASSWORD_PROMPT).map(Zeroizing::new)
+}
+
+fn is_retryable_unlock_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<ApiError>().is_some_and(|error| {
+        error.status == 403 && matches!(error.code.as_str(), "access_denied" | "unlock_failed")
+    })
 }
 
 pub fn api_path(path: &str) -> String {
@@ -1314,6 +1347,136 @@ mod tests {
 
         assert_eq!(200, response.status);
         server.join();
+    }
+
+    #[test]
+    fn direct_unlock_allows_three_total_password_attempts() {
+        let server = TestServer::new(vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer("wrong-1")),
+                client_capabilities: None,
+                response: http_response(
+                    403,
+                    r#"{"error":{"code":"unlock_failed","message":"failed to unlock database"}}"#,
+                ),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer("wrong-2")),
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer("correct")),
+                client_capabilities: None,
+                response: ok_empty_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response("{}"),
+            },
+        ]);
+        let config = test_config(server.listen_path());
+        let mut passwords = ["wrong-1", "wrong-2", "correct"].into_iter();
+
+        let response = Client::with_capabilities(&config, None)
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/dirs",
+                Zeroizing::new(Vec::new()),
+                None,
+                AuthMode::ProcessOnly,
+                || Ok(Zeroizing::new(passwords.next().unwrap().to_owned())),
+            )
+            .unwrap();
+
+        assert_eq!(200, response.status);
+        assert_eq!(None, passwords.next());
+        server.join();
+    }
+
+    #[test]
+    fn direct_unlock_stops_after_third_rejected_password() {
+        let mut requests = vec![
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/dirs",
+                authorization: None,
+                client_capabilities: None,
+                response: access_denied_response(),
+            },
+            ExpectedRequest {
+                method: "GET",
+                path: "/api/v1/auth/unlock/methods",
+                authorization: None,
+                client_capabilities: None,
+                response: ok_json_response(
+                    r#"{"methods":[{"url":"/api/v1/auth/unlock/direct","accepts_master_password":true}]}"#,
+                ),
+            },
+        ];
+        for password in ["wrong-1", "wrong-2", "wrong-3"] {
+            requests.push(ExpectedRequest {
+                method: "POST",
+                path: "/api/v1/auth/unlock/direct",
+                authorization: Some(bearer(password)),
+                client_capabilities: None,
+                response: access_denied_response(),
+            });
+        }
+        let server = TestServer::new(requests);
+        let config = test_config(server.listen_path());
+        let mut passwords = ["wrong-1", "wrong-2", "wrong-3"].into_iter();
+
+        let error = Client::with_capabilities(&config, None)
+            .request_with_unlock_prompt(
+                "GET",
+                "/api/v1/dirs",
+                Zeroizing::new(Vec::new()),
+                None,
+                AuthMode::ProcessOnly,
+                || Ok(Zeroizing::new(passwords.next().unwrap().to_owned())),
+            )
+            .unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+
+        assert_eq!(403, error.status);
+        assert_eq!("access_denied", error.code);
+        assert_eq!(None, passwords.next());
+        server.join();
+    }
+
+    #[test]
+    fn direct_password_prompt_uses_monopass_verbiage() {
+        assert_eq!(
+            "[monopass] Enter master password: ",
+            super::MASTER_PASSWORD_PROMPT
+        );
+        assert_eq!("Password incorrect.", super::INCORRECT_PASSWORD_MESSAGE);
     }
 
     #[test]

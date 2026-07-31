@@ -70,17 +70,41 @@ fn gui_unlock_deny_is_remembered_for_process_lineage() {
 
 #[test]
 #[ignore = "requires a real macOS GUI session and Accessibility permission for System Events"]
-fn gui_unlock_wrong_password_does_not_retry() {
+fn gui_unlock_wrong_password_retries_in_same_dialog() {
     let env = TestEnv::new();
     env.init_vault();
     let mut agent = env.start_agent();
 
     let mut wrong = env.client("ls");
     wait_for_prompt_count(1, &mut [&mut wrong]);
-    submit_prompt("wrong password", PromptAction::Allow);
-    assert_child_failure(&mut wrong);
+    submit_prompt("wrong-1", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt("wrong-2", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt(PASSWORD, PromptAction::Allow);
+    assert_child_success(&mut wrong);
     assert_prompt_count(0);
 
+    agent.stop();
+}
+
+#[test]
+#[ignore = "requires a real macOS GUI session and Accessibility permission for System Events"]
+fn gui_unlock_fails_after_three_wrong_passwords() {
+    let env = TestEnv::new();
+    env.init_vault();
+    let mut agent = env.start_agent();
+    let mut client = env.client("ls");
+
+    wait_for_prompt_count(1, &mut [&mut client]);
+    submit_prompt("wrong-1", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt("wrong-2", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt("wrong-3", PromptAction::Allow);
+
+    assert_child_failure(&mut client);
+    assert_prompt_count(0);
     agent.stop();
 }
 

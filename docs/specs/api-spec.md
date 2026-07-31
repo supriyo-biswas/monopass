@@ -154,7 +154,7 @@ HTTP/1.1 200 OK
 ```
 
 The agent displays a scope-specific password dialog for the requesting
-application and accepts one submitted password for the request. The nearest
+application and accepts at most three submitted passwords for the request. The nearest
 confidently recognized GUI application in the parent ancestry is used as
 presentation context. Same-user terminal hosts such as Visual Studio Code and
 GNOME Terminal are part of the verified lineage even when a child terminal
@@ -178,9 +178,12 @@ briefly throttled. Dialogs do not display executable modification timestamps.
 This GUI metadata is presentation-only and is not part of process authorization
 or direct-unlock trust evaluation. Linux GUI unlock requires an accepted GUI
 session capability (`x-session` or `wayland-session`) and uses in-process GTK4
-or Qt Quick/QML SDK dialogs with forced X11 backend usage. A wrong password,
-cancelled dialog, or closed dialog denies the request. Concurrent GUI unlock
-requests are displayed as separate dialogs.
+or Qt Quick/QML SDK dialogs with forced X11 backend usage. After the first or
+second wrong password, the same dialog displays `Password incorrect`, clears
+and refocuses the password field, and accepts another submission. The third
+wrong password closes the dialog and denies the request. A cancelled or closed
+dialog denies immediately. Concurrent GUI unlock requests are displayed as
+separate dialogs.
 
 Clicking the explicit **Deny** button records a denial for the requesting
 process-lineage and access-scope pair. Until `agent.denialTtlSeconds` expires,

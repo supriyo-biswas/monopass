@@ -60,7 +60,7 @@ fn gui_unlock_concurrent_requests_use_independent_windows() {
 
 #[test]
 #[ignore = "requires an X11 DISPLAY and xdotool"]
-fn gui_unlock_cancel_or_wrong_password_does_not_retry() {
+fn gui_unlock_cancel_or_wrong_password_retries_in_same_dialog() {
     let _guard = gui_test_lock();
     if !linux_gui_available() {
         return;
@@ -79,9 +79,38 @@ fn gui_unlock_cancel_or_wrong_password_does_not_retry() {
     let mut wrong = env.client("ls");
     wait_for_prompt_count(1, &mut [&mut wrong], &mut agent);
     submit_prompt("wrong password", PromptAction::Allow);
-    assert_child_failure(&mut wrong);
+    wait_for_exact_prompt_count(1);
+    submit_prompt("still wrong", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt(PASSWORD, PromptAction::Allow);
+    assert_child_success(&mut wrong);
     assert_prompt_count(0);
 
+    agent.stop();
+}
+
+#[test]
+#[ignore = "requires an X11 DISPLAY and xdotool"]
+fn gui_unlock_fails_after_three_wrong_passwords() {
+    let _guard = gui_test_lock();
+    if !linux_gui_available() {
+        return;
+    }
+
+    let env = TestEnv::new();
+    env.init_vault();
+    let mut agent = env.start_agent();
+    let mut client = env.client("ls");
+
+    wait_for_prompt_count(1, &mut [&mut client], &mut agent);
+    submit_prompt("wrong-1", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt("wrong-2", PromptAction::Allow);
+    wait_for_exact_prompt_count(1);
+    submit_prompt("wrong-3", PromptAction::Allow);
+
+    assert_child_failure(&mut client);
+    assert_prompt_count(0);
     agent.stop();
 }
 

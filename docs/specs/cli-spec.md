@@ -40,15 +40,20 @@ advertised unlock method through the discovery flow in
 `X-Client-Capabilities: x-session=<DISPLAY>` on method discovery and GUI unlock
 requests. When `DISPLAY` is unset and `WAYLAND_DISPLAY` is set, send
 `X-Client-Capabilities: wayland-session=<WAYLAND_DISPLAY>` on method discovery
-and GUI unlock requests. Prompt for the master password
-with hidden terminal input only when the selected method has
-`accepts_master_password: true`; standard-base64 encode the UTF-8 password
-bytes, call the selected unlock method with that bearer value, then zeroize the
-password buffer. When the selected method has `accepts_master_password: false`,
+and GUI unlock requests. Prompt for the master password as `[monopass] Enter
+master password: ` with hidden terminal input only when the selected method has
+`accepts_master_password: true`. Allow at most three total password submissions
+for the selected unlock method. After either `403 unlock_failed` or `403
+access_denied`, print `Password incorrect.` and zeroize the rejected password.
+Prompt again after the first and second rejection; after the third, report the
+existing API failure. Standard-base64 encode the UTF-8 password bytes, call the
+selected unlock method with that bearer value, then zeroize the password
+buffer. When the selected method has `accepts_master_password: false`,
 call it without prompting locally or sending a bearer password. Retry the
 original request once after a successful unlock method call. Treat
-`403 unlock_failed`, `502 migration_needed`, and a second `403 access_denied`
-as command failure. A `migration_needed` response is passed through unchanged
+exhausted password attempts, `502 migration_needed`, and a second `403
+access_denied` from the retried original request as command failure. A
+`migration_needed` response is passed through unchanged
 so the user sees the instruction to run `monopass migrate`.
 If the user explicitly denies GUI access, or that denial is already cached for
 the caller's process lineage, the GUI unlock method returns

@@ -130,9 +130,12 @@ The agent clears native password fields when supported by the backend and keeps
 Rust-owned password material in zeroizing buffers. Native UI toolkit internals
 may still hold temporary copies outside Rust zeroization control.
 
-The agent prompts once per unlock request. A wrong password, cancelled dialog,
-or closed dialog denies the unlock request without showing a retry prompt.
-Concurrent GUI unlock requests are shown as separate dialogs.
+The agent allows three total password submissions in one dialog per unlock
+request. After the first or second wrong password, the dialog displays
+`Password incorrect`, clears and refocuses the password field, and accepts
+another submission. A third wrong password closes the dialog and denies the
+request. A cancelled or closed dialog denies immediately. Concurrent GUI unlock
+requests are shown as separate dialogs.
 
 Clicking the explicit **Deny** button returns `403 temporary_lockout` and caches
 that result for the process-lineage and access-scope pair for

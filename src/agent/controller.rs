@@ -24,7 +24,7 @@ use super::error::ApiError;
     target_os = "macos",
     all(target_os = "linux", any(feature = "gtk", feature = "qt"))
 ))]
-use super::gui_auth::PromptOutcome;
+use super::gui_auth::{PromptFeedback, PromptOutcome, PromptSession};
 use super::models::{
     AccessScope, AuthScopeQuery, AuthStatusResponse, AuthUnlockMethod, AuthUnlockMethodsResponse,
     ContactResponse, CreateContactRequest, CreateFileResponse, CreateItemRequest,
@@ -48,6 +48,12 @@ use super::state::{
 const DEFAULT_PAGE_COUNT: u64 = 50;
 const MAX_PAGE_COUNT: u64 = 200;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+))]
+const MAX_GUI_PASSWORD_ATTEMPTS: usize = 3;
 
 #[cfg(all(target_os = "linux", any(feature = "gtk", feature = "qt")))]
 const CLIENT_CAPABILITIES_HEADER: &str = "x-client-capabilities";
@@ -243,7 +249,7 @@ async fn unlock_gui_with_prompt<F, Fut>(
 ) -> Result<StatusCode, ApiError>
 where
     F: Fn(Option<ProcessDisplay>, AccessScope) -> Fut,
-    Fut: std::future::Future<Output = PromptOutcome>,
+    Fut: std::future::Future<Output = PromptSession>,
 {
     let Extension(scope_hash) = scope_hash.ok_or_else(ApiError::access_denied)?;
     let access_scope = auth_scope_query(query)?.access_scope();
@@ -258,27 +264,48 @@ where
     }
     let display = display.map(|Extension(display)| display);
 
-    let password = match prompt(display, access_scope).await {
-        PromptOutcome::Allowed(password) => password,
-        PromptOutcome::Denied => {
-            state
-                .deny_scope_hash_for_scope(scope_hash, access_scope)
-                .await;
-            return Err(ApiError::temporary_lockout());
-        }
-        PromptOutcome::Dismissed => return Err(ApiError::access_denied()),
-    };
-
-    state
-        .unlock_for_scope(password, scope_hash, access_scope)
-        .await
-        .map(|()| StatusCode::OK)
-        .map_err(|error| match error {
-            super::state::UnlockError::MigrationNeeded => ApiError::migration_needed(),
-            super::state::UnlockError::AccessDenied | super::state::UnlockError::UnlockFailed => {
-                ApiError::access_denied()
+    let mut prompt = prompt(display, access_scope).await;
+    for attempt in 0..MAX_GUI_PASSWORD_ATTEMPTS {
+        match prompt.next().await {
+            PromptOutcome::Allowed { password, feedback } => {
+                match state
+                    .unlock_for_scope(password, scope_hash.clone(), access_scope)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = feedback.send(PromptFeedback::Complete);
+                        return Ok(StatusCode::OK);
+                    }
+                    Err(super::state::UnlockError::MigrationNeeded) => {
+                        let _ = feedback.send(PromptFeedback::Complete);
+                        return Err(ApiError::migration_needed());
+                    }
+                    Err(
+                        super::state::UnlockError::AccessDenied
+                        | super::state::UnlockError::UnlockFailed,
+                    ) if attempt + 1 < MAX_GUI_PASSWORD_ATTEMPTS => {
+                        let _ = feedback.send(PromptFeedback::Incorrect);
+                    }
+                    Err(
+                        super::state::UnlockError::AccessDenied
+                        | super::state::UnlockError::UnlockFailed,
+                    ) => {
+                        let _ = feedback.send(PromptFeedback::Complete);
+                        return Err(ApiError::access_denied());
+                    }
+                }
             }
-        })
+            PromptOutcome::Denied => {
+                state
+                    .deny_scope_hash_for_scope(scope_hash, access_scope)
+                    .await;
+                return Err(ApiError::temporary_lockout());
+            }
+            PromptOutcome::Dismissed => return Err(ApiError::access_denied()),
+        }
+    }
+
+    Err(ApiError::access_denied())
 }
 
 #[cfg(target_os = "macos")]
@@ -1097,12 +1124,32 @@ mod tests {
         bearer_password, export_item, import_item, lock, parse_completion_kinds,
         send_upload_body_bytes, status, unlock_methods, validate_completion_prefix,
     };
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    fn prompt_session(outcomes: impl IntoIterator<Item = PromptOutcome>) -> PromptSession {
+        PromptSession::from_outcomes(outcomes)
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    fn allowed(password: &str) -> PromptOutcome {
+        let (feedback, _receiver) = tokio::sync::oneshot::channel();
+        PromptOutcome::Allowed {
+            password: Zeroizing::new(password.to_owned()),
+            feedback,
+        }
+    }
     use crate::agent::clock::{SuspendAwareInstant as Instant, TestSuspendAwareClock};
     #[cfg(any(
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
-    use crate::agent::gui_auth::PromptOutcome;
+    use crate::agent::gui_auth::{PromptFeedback, PromptOutcome, PromptSession};
     use crate::agent::models::{
         AccessScope, AuthScopeQuery, CreateContactRequest, CreateItemRequest, ShellCompletionKind,
     };
@@ -1404,7 +1451,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
+                    prompt_session([allowed("correct")])
                 }
             }
         };
@@ -1443,7 +1490,7 @@ mod tests {
             scope_query(AccessScope::Settings),
             |_display, access_scope| async move {
                 assert_eq!(AccessScope::Settings, access_scope);
-                PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
+                prompt_session([allowed("correct")])
             },
         )
         .await
@@ -1462,7 +1509,7 @@ mod tests {
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
-    async fn unlock_gui_wrong_password_returns_access_denied_without_retry() {
+    async fn unlock_gui_stops_after_three_rejected_passwords() {
         let file = NamedTempFile::new().unwrap();
         create_encrypted_database(file.path(), "correct");
 
@@ -1474,7 +1521,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    PromptOutcome::Allowed(Zeroizing::new("wrong".to_owned()))
+                    prompt_session([allowed("wrong"), allowed("wrong"), allowed("wrong")])
                 }
             }
         };
@@ -1501,6 +1548,55 @@ mod tests {
         target_os = "macos",
         all(target_os = "linux", any(feature = "gtk", feature = "qt"))
     ))]
+    async fn unlock_gui_allows_success_on_third_password_submission() {
+        let file = NamedTempFile::new().unwrap();
+        create_encrypted_database(file.path(), "correct");
+        let state = AgentState::from_database_path(file.path());
+        let (first_feedback, first_result) = tokio::sync::oneshot::channel();
+        let (second_feedback, second_result) = tokio::sync::oneshot::channel();
+        let (third_feedback, third_result) = tokio::sync::oneshot::channel();
+        let submissions = Arc::new(Mutex::new(Some([
+            ("wrong-1", first_feedback),
+            ("wrong-2", second_feedback),
+            ("correct", third_feedback),
+        ])));
+
+        let response = super::unlock_gui_with_prompt(
+            axum::extract::State(state.clone()),
+            Some(axum::Extension(ScopeHash::test(1))),
+            None,
+            gui_unlock_headers(),
+            default_scope_query(),
+            {
+                let submissions = Arc::clone(&submissions);
+                move |_display, _access_scope| {
+                    let submissions = Arc::clone(&submissions);
+                    async move {
+                        prompt_session(submissions.lock().unwrap().take().unwrap().map(
+                            |(password, feedback)| PromptOutcome::Allowed {
+                                password: Zeroizing::new(password.to_owned()),
+                                feedback,
+                            },
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(StatusCode::OK, response);
+        assert!(state.is_authorized(&ScopeHash::test(1)).await);
+        assert_eq!(PromptFeedback::Incorrect, first_result.await.unwrap());
+        assert_eq!(PromptFeedback::Incorrect, second_result.await.unwrap());
+        assert_eq!(PromptFeedback::Complete, third_result.await.unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
     async fn unlock_gui_cancel_returns_access_denied() {
         let state = AgentState::from_database_path("missing.db");
         let error = super::unlock_gui_with_prompt(
@@ -1509,7 +1605,7 @@ mod tests {
             None,
             gui_unlock_headers(),
             default_scope_query(),
-            |_display, _access_scope| async { PromptOutcome::Dismissed },
+            |_display, _access_scope| async { prompt_session([PromptOutcome::Dismissed]) },
         )
         .await
         .unwrap_err();
@@ -1531,7 +1627,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    PromptOutcome::Denied
+                    prompt_session([PromptOutcome::Denied])
                 }
             }
         };
@@ -1567,7 +1663,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    PromptOutcome::Denied
+                    prompt_session([PromptOutcome::Denied])
                 }
             }
         };
@@ -1607,7 +1703,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    PromptOutcome::Dismissed
+                    prompt_session([PromptOutcome::Dismissed])
                 }
             }
         };
@@ -1640,7 +1736,7 @@ mod tests {
                 let prompts = Arc::clone(&prompts);
                 async move {
                     *prompts.lock().unwrap() += 1;
-                    PromptOutcome::Allowed(Zeroizing::new("correct".to_owned()))
+                    prompt_session([allowed("correct")])
                 }
             }
         };
