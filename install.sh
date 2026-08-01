@@ -242,10 +242,11 @@ restart_existing_agent() {
       service_target="$domain_label/com.monopass.agent"
       plist="$HOME/Library/LaunchAgents/com.monopass.agent.plist"
 
-      launchctl print "$service_target" >/dev/null 2>&1 || return 0
       [ -f "$plist" ] || return 0
 
-      launchctl bootout "$service_target" >/dev/null 2>&1 || true
+      if launchctl print "$service_target" >/dev/null 2>&1; then
+        launchctl bootout "$service_target" >/dev/null 2>&1 || true
+      fi
       launchctl bootstrap "$domain_label" "$plist" >/dev/null 2>&1 || true
       launchctl enable "$service_target" >/dev/null 2>&1 || true
       ;;
