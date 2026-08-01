@@ -153,6 +153,10 @@ pub(crate) struct GuiApplication {
 )]
 pub(crate) enum GuiApplicationMatchKind {
     Process,
+    #[cfg_attr(
+        not(all(target_os = "linux", any(feature = "gtk", feature = "qt"))),
+        allow(dead_code)
+    )]
     Context,
 }
 

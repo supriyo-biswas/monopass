@@ -183,6 +183,7 @@ enum ShowFormat {
 pub fn add(config: &Config, args: AddArgs) -> AppResult {
     let item_path = parse_item_path(&args.path)?;
     let client = Client::new(config);
+    ensure_item_missing(&client, &item_path)?;
     let request = build_create_request(
         &client,
         ItemInput {
@@ -210,18 +211,23 @@ pub fn add(config: &Config, args: AddArgs) -> AppResult {
 pub fn edit(config: &Config, args: EditArgs) -> AppResult {
     let item_path = parse_item_path(&args.path)?;
     let client = Client::new(config);
-    let mut request = build_update_request(
-        &client,
-        ItemInput {
-            username: args.username,
-            email: args.email,
-            website: args.website,
-            password: args.password,
-            generate_password: args.generate_password,
-            totp: args.totp,
-            fields: args.fields,
-            concealed_fields: args.concealed_fields,
-            files: args.files,
+    let mut request = with_existing_item(
+        item_metadata(&client, &item_path.dir, &item_path.item),
+        || {
+            build_update_request(
+                &client,
+                ItemInput {
+                    username: args.username,
+                    email: args.email,
+                    website: args.website,
+                    password: args.password,
+                    generate_password: args.generate_password,
+                    totp: args.totp,
+                    fields: args.fields,
+                    concealed_fields: args.concealed_fields,
+                    files: args.files,
+                },
+            )
         },
     )?;
     for name in args.remove_fields {
@@ -476,6 +482,37 @@ fn item_metadata(client: &Client<'_>, dir: &str, item: &str) -> AppResult<ItemRe
         path_component(dir),
         path_component(item)
     )))
+}
+
+fn ensure_item_missing(client: &Client<'_>, item_path: &ItemPath) -> AppResult {
+    classify_item_preflight(item_metadata(client, &item_path.dir, &item_path.item))
+}
+
+fn with_existing_item<T>(
+    metadata: AppResult<ItemResponse>,
+    operation: impl FnOnce() -> AppResult<T>,
+) -> AppResult<T> {
+    metadata?;
+    operation()
+}
+
+fn classify_item_preflight(result: AppResult<ItemResponse>) -> AppResult {
+    match result {
+        Ok(_) => Err(ApiError {
+            status: 409,
+            code: "conflict".to_owned(),
+            message: "item already exists".to_owned(),
+        }
+        .into()),
+        Err(error) if is_not_found(error.as_ref()) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<ApiError>()
+        .is_some_and(|error| error.status == 404 && error.code == "not_found")
 }
 
 fn move_item_to_trash(
@@ -928,10 +965,11 @@ mod tests {
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
-        FieldType, RemovalPlan, build_fields, human_size, is_item_exists_conflict,
-        next_trash_number, parse_file_inputs, plan_removal, read_prompted_field_value,
-        remove_item_is_permanent_delete, trash_fallback_name, trash_number, trash_numbered_glob,
-        validate_field_and_file_name_overlap, write_human_item,
+        FieldType, RemovalPlan, build_fields, classify_item_preflight, human_size,
+        is_item_exists_conflict, next_trash_number, parse_file_inputs, plan_removal,
+        read_prompted_field_value, remove_item_is_permanent_delete, trash_fallback_name,
+        trash_number, trash_numbered_glob, validate_field_and_file_name_overlap,
+        with_existing_item, write_human_item,
     };
     use crate::secret::SecretString;
 
@@ -1038,6 +1076,89 @@ mod tests {
         };
 
         assert!(is_item_exists_conflict(&error));
+    }
+
+    #[test]
+    fn add_preflight_rejects_an_existing_item_as_a_conflict() {
+        let error = classify_item_preflight(Ok(ItemResponse {
+            name: "existing".to_owned(),
+            created_at: "2026-06-07T01:23:45Z".to_owned(),
+            updated_at: "2026-06-07T01:23:45Z".to_owned(),
+            total_versions: 1,
+            fields: Vec::new(),
+            files: Vec::new(),
+        }))
+        .unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+
+        assert_eq!(409, error.status);
+        assert_eq!("conflict", error.code);
+        assert_eq!("item already exists", error.message);
+    }
+
+    #[test]
+    fn add_preflight_continues_only_after_not_found() {
+        assert!(
+            classify_item_preflight(Err(ApiError {
+                status: 404,
+                code: "not_found".to_owned(),
+                message: "item not found".to_owned(),
+            }
+            .into()))
+            .is_ok()
+        );
+
+        let error = classify_item_preflight(Err(ApiError {
+            status: 500,
+            code: "internal_error".to_owned(),
+            message: "internal error".to_owned(),
+        }
+        .into()))
+        .unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+
+        assert_eq!(500, error.status);
+        assert_eq!("internal_error", error.code);
+    }
+
+    #[test]
+    fn edit_preflight_builds_input_only_for_an_existing_item() {
+        let mut built = false;
+        let result = with_existing_item::<()>(
+            Err(ApiError {
+                status: 404,
+                code: "not_found".to_owned(),
+                message: "item not found".to_owned(),
+            }
+            .into()),
+            || {
+                built = true;
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err();
+        let error = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(404, error.status);
+        assert_eq!("not_found", error.code);
+        assert!(!built);
+
+        with_existing_item(
+            Ok(ItemResponse {
+                name: "existing".to_owned(),
+                created_at: "2026-06-07T01:23:45Z".to_owned(),
+                updated_at: "2026-06-07T01:23:45Z".to_owned(),
+                total_versions: 1,
+                fields: Vec::new(),
+                files: Vec::new(),
+            }),
+            || {
+                built = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(built);
     }
 
     #[test]

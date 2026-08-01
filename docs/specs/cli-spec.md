@@ -374,8 +374,15 @@ monopass add <dir>/<item>
     --file relative/path/to/notes.txt
 ```
 
-Build a `CreateItemRequest` and send
-`PUT /api/v1/dir/{dirName}/item/{itemName}` to create the item.
+Before reading or prompting for any field input, generating a password, decoding
+a TOTP value, validating or uploading files, request the masked item metadata
+with `GET /api/v1/dir/{dirName}/item/{itemName}`. If the item exists, fail with
+`409 conflict` and message `item already exists`. Continue only after `404
+not_found`; propagate any other preflight failure. Then build a
+`CreateItemRequest` and send
+`PUT /api/v1/dir/{dirName}/item/{itemName}` to create the item. The create
+request must still surface `409 conflict` if the item is created after the
+preflight.
 
 - `--username` creates a string field named `username`.
 - `--email` creates a string field named `email`.
@@ -424,9 +431,14 @@ monopass edit <dir>/<item>
     --file relative/path/to/notes.txt
 ```
 
-Build the same partial request shape as `add` and send
-`PATCH /api/v1/dir/{dirName}/item/{itemName}` to update the item. The API
-merges supplied fields and files with the existing item and stores a new
+Before reading or prompting for any field input, generating a password, decoding
+a TOTP value, validating or uploading files, request the masked item metadata
+with `GET /api/v1/dir/{dirName}/item/{itemName}`. Continue only when the item
+exists; propagate `404 not_found` and any other preflight failure. Then build
+the same partial request shape as `add` and send
+`PATCH /api/v1/dir/{dirName}/item/{itemName}` to update the item. The PATCH must
+still surface `404 not_found` if the item is deleted after the preflight. The
+API merges supplied fields and files with the existing item and stores a new
 version. Omitted fields and files are retained. Field and file names must stay
 unique in the resulting item version. Fields or files deleted during editing
 are sent as update-only removal entries, for example
