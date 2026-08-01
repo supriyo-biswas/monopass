@@ -192,13 +192,39 @@ chmod 755 "$tmp_dir/$BINARY_NAME"
 mv -f "$tmp_dir/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
 profiles=.profile
+completion_profile=
+completion_profiles=
 
 case "${SHELL:-}" in
   */bash)
-    profiles="$profiles .bashrc .bash_profile"
+    if [ -f "$HOME/.bashrc" ] && [ ! -f "$HOME/.bash_profile" ]; then
+      profiles="$profiles .bashrc"
+      completion_profile="$HOME/.bashrc"
+      completion_profiles=.bashrc
+    elif [ ! -f "$HOME/.bashrc" ] && [ -f "$HOME/.bash_profile" ]; then
+      profiles="$profiles .bash_profile"
+      completion_profile="$HOME/.bash_profile"
+      completion_profiles=.bash_profile
+    else
+      profiles="$profiles .bashrc .bash_profile"
+      completion_profile="$HOME/.bashrc"
+      completion_profiles=".bashrc .bash_profile"
+    fi
     ;;
   */zsh)
-    profiles="$profiles .zshrc .zprofile"
+    if [ -f "$HOME/.zshrc" ] && [ ! -f "$HOME/.zprofile" ]; then
+      profiles="$profiles .zshrc"
+      completion_profile="$HOME/.zshrc"
+      completion_profiles=.zshrc
+    elif [ ! -f "$HOME/.zshrc" ] && [ -f "$HOME/.zprofile" ]; then
+      profiles="$profiles .zprofile"
+      completion_profile="$HOME/.zprofile"
+      completion_profiles=.zprofile
+    else
+      profiles="$profiles .zshrc .zprofile"
+      completion_profile="$HOME/.zshrc"
+      completion_profiles=".zshrc .zprofile"
+    fi
     ;;
 esac
 
@@ -210,10 +236,14 @@ completion_binary="$INSTALL_DIR/$BINARY_NAME"
 completion_binary_quoted="$(shell_quote "$completion_binary")"
 case "${SHELL:-}" in
   */bash)
-    append_completion_line "$HOME/.bashrc" "source <(COMPLETE=bash $completion_binary_quoted)"
+    for profile in $completion_profiles; do
+      append_completion_line "$HOME/$profile" "source <(COMPLETE=bash $completion_binary_quoted)"
+    done
     ;;
   */zsh)
-    append_completion_line "$HOME/.zshrc" "source <(COMPLETE=zsh $completion_binary_quoted)"
+    for profile in $completion_profiles; do
+      append_completion_line "$HOME/$profile" "source <(COMPLETE=zsh $completion_binary_quoted)"
+    done
     ;;
   */fish)
     append_completion_line \
@@ -258,12 +288,13 @@ restart_existing_agent
 printf 'Installed %s to %s/%s\n' "$BINARY_NAME" "$INSTALL_DIR" "$BINARY_NAME" >&2
 
 if [ "$path_was_missing" -eq 1 ]; then
+  profile_hint=${completion_profile#"$HOME"}
   case "${SHELL:-}" in
     */bash)
-      printf 'Add %s to your PATH in a new shell, or run: . ~/.bashrc\n' "$HOME/.local/bin" >&2
+      printf 'Add %s to your PATH in a new shell, or run: . ~%s\n' "$HOME/.local/bin" "$profile_hint" >&2
       ;;
     */zsh)
-      printf 'Add %s to your PATH in a new shell, or run: . ~/.zshrc\n' "$HOME/.local/bin" >&2
+      printf 'Add %s to your PATH in a new shell, or run: . ~%s\n' "$HOME/.local/bin" "$profile_hint" >&2
       ;;
     *)
       printf 'Add %s to your PATH in a new shell to pick up the change.\n' "$HOME/.local/bin" >&2
