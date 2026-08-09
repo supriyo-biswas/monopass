@@ -84,7 +84,7 @@ shell_quote() {
   printf "'%s'" "$escaped"
 }
 
-need_cmd uname mktemp chmod mv mkdir grep dirname rm id sed cp
+need_cmd uname mktemp chmod mv mkdir grep dirname rm id sed cp sleep
 
 platform="$(uname -sm | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
 selected_variant=cli
@@ -276,9 +276,20 @@ restart_existing_agent() {
 
       if launchctl print "$service_target" >/dev/null 2>&1; then
         launchctl bootout "$service_target" >/dev/null 2>&1 || true
+
+        attempts=0
+        while launchctl print "$service_target" >/dev/null 2>&1; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 100 ]; then
+            die "timed out waiting for $service_target to unload"
+          fi
+          sleep 0.1
+        done
       fi
-      launchctl bootstrap "$domain_label" "$plist" >/dev/null 2>&1 || true
-      launchctl enable "$service_target" >/dev/null 2>&1 || true
+      launchctl bootstrap "$domain_label" "$plist" >/dev/null 2>&1 \
+        || die "failed to bootstrap $service_target"
+      launchctl enable "$service_target" >/dev/null 2>&1 \
+        || die "failed to enable $service_target"
       ;;
   esac
 }
