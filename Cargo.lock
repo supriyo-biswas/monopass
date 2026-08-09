@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "monopass"
-version = "0.0.1-alpha22"
+version = "0.0.1"
 dependencies = [
  "age",
  "arboard",
