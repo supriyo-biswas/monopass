@@ -26,7 +26,10 @@ impl Server {
     fn router_with_state(state: AgentState) -> Router {
         auth_routes()
             .merge(database_routes(state.clone()))
-            .route_layer(middleware::from_fn(auth::require_same_uid_and_gid))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_same_uid_and_gid,
+            ))
             .with_state(state)
     }
 }
@@ -2551,6 +2554,7 @@ mod tests {
                 "agent.autoDeleteTrashItemsAfterSeconds":"15552000",
                 "agent.denialTtlSeconds":"60",
                 "agent.gcSeconds":"3600",
+                "agent.processIdentificationType":"process-chain",
                 "agent.settingsAuthTtlSeconds":"300",
                 "agent.trustedProgramPaths":"[]",
                 "cli.clearClipboardAfterSeconds":"30",

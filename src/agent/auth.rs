@@ -17,10 +17,49 @@ use super::error::ApiError;
 use super::models::AccessScope;
 use super::process::{ProcessDisplay, ResolvedAuthorizationScope, ScopeHash, UltimateProcess};
 use super::state::{ActiveDatabaseRequest, AgentState};
+use crate::settings::ProcessIdentificationType;
 
 #[derive(Debug, Clone)]
 pub struct PeerConnectInfo {
+    authorization: Option<PeerAuthorization>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PeerAuthorization {
+    uid: u32,
     scope: Option<ResolvedAuthorizationScope>,
+    originating_process_hash: Option<ScopeHash>,
+    ultimate: Option<UltimateProcess>,
+}
+
+impl PeerAuthorization {
+    pub(crate) fn scope_hash(
+        &self,
+        identification_type: ProcessIdentificationType,
+    ) -> Option<ScopeHash> {
+        match identification_type {
+            ProcessIdentificationType::InsecureAll => Some(ScopeHash::insecure_all(self.uid)),
+            ProcessIdentificationType::ProcessChain => {
+                self.scope.as_ref().map(|scope| scope.hash.clone())
+            }
+            ProcessIdentificationType::OriginatingProcess => self.originating_process_hash.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(uid: u32, process_chain: ScopeHash, originating_process: ScopeHash) -> Self {
+        Self {
+            uid,
+            scope: Some(ResolvedAuthorizationScope {
+                hash: process_chain,
+                originating_process_hash: originating_process.clone(),
+                display: None,
+                ultimate: UltimateProcess::test("test-client"),
+            }),
+            originating_process_hash: Some(originating_process),
+            ultimate: Some(UltimateProcess::test("test-client")),
+        }
+    }
 }
 
 impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
@@ -32,20 +71,31 @@ impl Connected<IncomingStream<'_, UnixListener>> for PeerConnectInfo {
 impl PeerConnectInfo {
     fn from_peer_credentials(credentials: Option<PeerCredentials>) -> Self {
         Self {
-            scope: authorized_peer_scope(credentials.as_ref()),
+            authorization: authorized_peer_authorization(credentials.as_ref()),
         }
     }
 
-    fn scope_hash(&self) -> Option<&ScopeHash> {
-        self.scope.as_ref().map(|scope| &scope.hash)
+    fn authorization(&self) -> Option<&PeerAuthorization> {
+        self.authorization.as_ref()
+    }
+
+    #[cfg(test)]
+    fn scope_hash(&self) -> Option<ScopeHash> {
+        self.authorization()?
+            .scope_hash(ProcessIdentificationType::ProcessChain)
     }
 
     fn display(&self) -> Option<&ProcessDisplay> {
-        self.scope.as_ref().and_then(|scope| scope.display.as_ref())
+        self.authorization
+            .as_ref()
+            .and_then(|authorization| authorization.scope.as_ref())
+            .and_then(|scope| scope.display.as_ref())
     }
 
     fn ultimate(&self) -> Option<&UltimateProcess> {
-        self.scope.as_ref().map(|scope| &scope.ultimate)
+        self.authorization
+            .as_ref()
+            .and_then(|authorization| authorization.ultimate.as_ref())
     }
 }
 
@@ -67,12 +117,18 @@ impl From<tokio::net::unix::UCred> for PeerCredentials {
 }
 
 pub async fn require_same_uid_and_gid(
+    State(state): State<AgentState>,
     ConnectInfo(connect_info): ConnectInfo<PeerConnectInfo>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if let Some(scope_hash) = connect_info.scope_hash() {
-        request.extensions_mut().insert(scope_hash.clone());
+    if let Some(authorization) = connect_info.authorization() {
+        let identification_type = state.process_identification_type().await;
+        let scope_hash = authorization
+            .scope_hash(identification_type)
+            .ok_or_else(ApiError::access_denied)?;
+        request.extensions_mut().insert(scope_hash);
+        request.extensions_mut().insert(authorization.clone());
         if let Some(display) = connect_info.display() {
             request.extensions_mut().insert(display.clone());
         }
@@ -207,15 +263,39 @@ impl HttpBody for GuardedBody {
     }
 }
 
-fn authorized_peer_scope(
+fn authorized_peer_authorization(
     credentials: Option<&PeerCredentials>,
-) -> Option<ResolvedAuthorizationScope> {
+) -> Option<PeerAuthorization> {
     let credentials = credentials?;
     if !peer_credentials_are_authorized(Some(credentials)) {
         return None;
     }
 
-    super::process::resolve_authorization_scope(credentials.pid?, credentials.uid)
+    let scope = credentials
+        .pid
+        .and_then(|pid| super::process::resolve_authorization_scope(pid, credentials.uid));
+    let originating_process_hash = scope
+        .as_ref()
+        .map(|scope| scope.originating_process_hash.clone())
+        .or_else(|| {
+            credentials.pid.and_then(|pid| {
+                super::process::resolve_originating_process_scope_hash(pid, credentials.uid)
+            })
+        });
+    let ultimate = scope
+        .as_ref()
+        .map(|scope| scope.ultimate.clone())
+        .or_else(|| {
+            credentials
+                .pid
+                .and_then(|pid| super::process::resolve_direct_process(pid, credentials.uid))
+        });
+    Some(PeerAuthorization {
+        uid: credentials.uid,
+        scope,
+        originating_process_hash,
+        ultimate,
+    })
 }
 
 fn peer_credentials_are_authorized(credentials: Option<&PeerCredentials>) -> bool {
@@ -224,7 +304,6 @@ fn peer_credentials_are_authorized(credentials: Option<&PeerCredentials>) -> boo
         Some(credentials)
             if credentials.uid == current_process_uid()
                 && credentials.gid == current_process_gid()
-                && credentials.pid.is_some()
     )
 }
 
@@ -249,8 +328,12 @@ mod tests {
     use crate::agent::process::{
         DirectUnlockCaller, ProcessDisplay, ResolvedAuthorizationScope, ScopeHash, UltimateProcess,
     };
+    use crate::settings::ProcessIdentificationType;
 
-    use super::{PeerConnectInfo, PeerCredentials, current_process_gid, current_process_uid};
+    use super::{
+        PeerAuthorization, PeerConnectInfo, PeerCredentials, current_process_gid,
+        current_process_uid,
+    };
 
     #[test]
     fn matching_uid_and_gid_are_authorized() {
@@ -291,8 +374,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_peer_pid_is_rejected() {
-        assert!(!super::peer_credentials_are_authorized(Some(
+    fn missing_peer_pid_still_allows_same_user_insecure_mode() {
+        assert!(super::peer_credentials_are_authorized(Some(
             &PeerCredentials {
                 pid: None,
                 uid: current_process_uid(),
@@ -355,7 +438,9 @@ mod tests {
     #[tokio::test]
     async fn middleware_with_no_precomputed_hash_returns_access_denied() {
         let response = router()
-            .oneshot(request_with_connect_info(PeerConnectInfo { scope: None }))
+            .oneshot(request_with_connect_info(PeerConnectInfo {
+                authorization: None,
+            }))
             .await
             .unwrap();
 
@@ -363,13 +448,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insecure_all_accepts_same_user_without_process_lineage() {
+        let state = crate::agent::state::AgentState::from_database_path("missing.db");
+        state
+            .set_process_identification_type_for_test(ProcessIdentificationType::InsecureAll)
+            .await;
+        let response = Router::new()
+            .route("/", get(any_hash_handler))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::require_same_uid_and_gid,
+            ))
+            .with_state(state)
+            .oneshot(request_with_connect_info(PeerConnectInfo {
+                authorization: Some(PeerAuthorization {
+                    uid: current_process_uid(),
+                    scope: None,
+                    originating_process_hash: None,
+                    ultimate: None,
+                }),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(StatusCode::OK, response.status());
+    }
+
+    #[tokio::test]
     async fn middleware_inserts_precomputed_hash_into_request_extensions() {
         let response = router()
             .oneshot(request_with_connect_info(PeerConnectInfo {
-                scope: Some(ResolvedAuthorizationScope {
-                    hash: ScopeHash::test(1),
-                    display: None,
-                    ultimate: UltimateProcess::test("example"),
+                authorization: Some(PeerAuthorization {
+                    uid: current_process_uid(),
+                    originating_process_hash: Some(ScopeHash::test(2)),
+                    ultimate: Some(UltimateProcess::test("example")),
+                    scope: Some(ResolvedAuthorizationScope {
+                        hash: ScopeHash::test(1),
+                        originating_process_hash: ScopeHash::test(2),
+                        display: None,
+                        ultimate: UltimateProcess::test("example"),
+                    }),
                 }),
             }))
             .await
@@ -388,10 +506,16 @@ mod tests {
         };
         let response = display_router()
             .oneshot(request_with_connect_info(PeerConnectInfo {
-                scope: Some(ResolvedAuthorizationScope {
-                    hash: ScopeHash::test(1),
-                    display: Some(display),
-                    ultimate: UltimateProcess::test("example"),
+                authorization: Some(PeerAuthorization {
+                    uid: current_process_uid(),
+                    originating_process_hash: Some(ScopeHash::test(2)),
+                    ultimate: Some(UltimateProcess::test("example")),
+                    scope: Some(ResolvedAuthorizationScope {
+                        hash: ScopeHash::test(1),
+                        originating_process_hash: ScopeHash::test(2),
+                        display: Some(display),
+                        ultimate: UltimateProcess::test("example"),
+                    }),
                 }),
             }))
             .await
@@ -404,10 +528,16 @@ mod tests {
     async fn direct_unlock_middleware_derives_agent_policy_from_verified_ultimate_process() {
         let response = direct_router()
             .oneshot(request_with_connect_info(PeerConnectInfo {
-                scope: Some(ResolvedAuthorizationScope {
-                    hash: ScopeHash::test(1),
-                    display: None,
-                    ultimate: UltimateProcess::test_agent(),
+                authorization: Some(PeerAuthorization {
+                    uid: current_process_uid(),
+                    originating_process_hash: Some(ScopeHash::test(2)),
+                    ultimate: Some(UltimateProcess::test_agent()),
+                    scope: Some(ResolvedAuthorizationScope {
+                        hash: ScopeHash::test(1),
+                        originating_process_hash: ScopeHash::test(2),
+                        display: None,
+                        ultimate: UltimateProcess::test_agent(),
+                    }),
                 }),
             }))
             .await
@@ -430,28 +560,51 @@ mod tests {
     }
 
     fn router() -> Router {
+        let state = crate::agent::state::AgentState::from_database_path("missing.db");
         Router::new()
             .route("/", get(hash_required_handler))
-            .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::require_same_uid_and_gid,
+            ))
+            .with_state(state)
     }
 
     fn display_router() -> Router {
+        let state = crate::agent::state::AgentState::from_database_path("missing.db");
         Router::new()
             .route("/", get(display_required_handler))
-            .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::require_same_uid_and_gid,
+            ))
+            .with_state(state)
     }
 
     fn direct_router() -> Router {
+        let state = crate::agent::state::AgentState::from_database_path("missing.db");
         Router::new()
             .route("/", get(direct_caller_required_handler))
             .route_layer(middleware::from_fn(super::require_direct_unlock_caller))
-            .route_layer(middleware::from_fn(super::require_same_uid_and_gid))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::require_same_uid_and_gid,
+            ))
+            .with_state(state)
     }
 
     async fn hash_required_handler(scope_hash: Option<axum::Extension<ScopeHash>>) -> StatusCode {
         match scope_hash {
             Some(axum::Extension(scope_hash)) if scope_hash == ScopeHash::test(1) => StatusCode::OK,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    async fn any_hash_handler(scope_hash: Option<axum::Extension<ScopeHash>>) -> StatusCode {
+        if scope_hash.is_some() {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 

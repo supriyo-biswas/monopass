@@ -1,8 +1,10 @@
 # Flexible Auth Spec
 
-Monopass clients discover unlock methods before attempting to authorize a
-process lineage for either `items` or `settings`. The scopes are independent;
-omitting `scope` defaults to `items` for backward compatibility.
+Monopass clients discover unlock methods before attempting to authorize the
+process identity selected by `agent.processIdentificationType` for either
+`items` or `settings`. The scopes are independent; omitting `scope` defaults to
+`items` for backward compatibility. Identification modes and bootstrap loading
+are defined in [`api-spec.md`](api-spec.md#auth).
 
 ## Unlock Method Discovery
 
@@ -138,7 +140,7 @@ request. A cancelled or closed dialog denies immediately. Concurrent GUI unlock
 requests are shown as separate dialogs.
 
 Clicking the explicit **Deny** button returns `403 temporary_lockout` and caches
-that result for the process-lineage and access-scope pair for
+that result for the selected process-identity and access-scope pair for
 `agent.denialTtlSeconds`. Later GUI unlock requests for that pair fail with the
 same error without opening a dialog until the cache entry expires. Escape,
 window close, backend failure, and
@@ -160,7 +162,7 @@ HTTP/1.1 200 OK
 The direct method is the Linux fallback and the direct-only Linux agent behavior.
 It is the migrated form of the older `/auth/unlock` behavior. It validates the
 bearer master password, opens or verifies the unlocked database, and authorizes
-the caller's process lineage for only the requested access scope.
+the caller's selected process identity for only the requested access scope.
 
 Direct unlock is restricted by `agent.trustedProgramPaths`. Policy uses the
 ultimate executable in the verified process lineage—the process connected

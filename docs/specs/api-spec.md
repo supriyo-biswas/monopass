@@ -60,13 +60,14 @@ access accounting are identical to other database-backed operations.
 
 ## Auth
 
-The agent derives an authorization scope from the Unix peer credentials and the
-peer's process lineage. A scope contains the caller UID, the PID and start time
-of the oldest accessible same-user process, and the ordered identity of every
-process from that anchor through the direct client. The direct `monopass`
-process is included. POSIX session IDs do not limit traversal or contribute to
-the scope, so matching lineages remain stable when a terminal creates a new
-session.
+The agent requires Unix peer credentials matching its effective UID and GID,
+then derives the authorization identity selected by
+`agent.processIdentificationType`. `process-chain` is the default and contains
+the caller UID, the PID and start time of the oldest accessible same-user
+process, and the ordered identity of every process from that anchor through the
+direct client. The direct `monopass` process is included. POSIX session IDs do
+not limit traversal or contribute to the scope, so matching lineages remain
+stable when a terminal creates a new session.
 
 Each lineage element uses executable file identity (device, inode, available
 generation, size, modification time, and change time) when available. If the
@@ -81,6 +82,34 @@ process group, controlling terminal and session, parent relationship, and stable
 process observations all corroborate the boundary. The `login` process itself
 is excluded from the scope. If any evidence is missing or inconsistent,
 traversal stops at the boundary and preserves the narrower per-shell scope.
+
+`originating-process` walks the same verified ancestry but identifies one
+origin process by UID, PID, and start time. It selects the nearest exact GUI
+application process; inherited Linux cgroup/desktop context remains
+presentation-only. Without an exact GUI process, it selects the child side of
+the nearest POSIX session-ID change while walking from the direct client toward
+its ancestors. Nested processes and shells that retain the same session
+therefore share the origin. If neither boundary exists, it selects the oldest
+verified same-user process immediately below the first different-UID ancestor,
+or the parentless verified root. It may stop successfully at an exact GUI or
+established session-boundary process when more remote ancestry is unavailable.
+The verified macOS `login` exception and its evidence requirements remain
+unchanged. Session IDs select the boundary and executable metadata may aid GUI
+recognition or presentation, but neither contributes to the origin hash;
+session IDs also do not alter `process-chain` identities.
+
+`insecure-all` uses one authorization identity for every matching-UID/GID local
+client and does not require a PID or process-lineage resolution. It does not
+disable master-password authentication, Unix-socket isolation, access-scope
+separation, or `agent.trustedProgramPaths` enforcement for direct unlock.
+
+The in-memory identification type starts as `process-chain`. The encrypted
+setting is loaded during the first successful database unlock/reopen and is
+retained across idle database unloads. The bootstrap caller must therefore pass
+full-chain verification; after the password and setting are validated, that
+unlock is recorded under the loaded identification type. Changing the setting
+clears item and settings authorizations and both GUI-denial caches; writing the
+same value leaves them intact.
 
 Authorization is recorded independently for the `items` and `settings` access
 scopes. Auth endpoints that accept `scope` default to `items` when it is omitted.
@@ -303,6 +332,7 @@ Registered agent and CLI settings are stored as string values in
 | `agent.autoDeleteTrashItemsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
 | `agent.autoDeleteOldVersionsAfterSeconds` | `15552000` | integer seconds, `0..=157680000` |
 | `agent.trustedProgramPaths` | `[]` | JSON-serialized array of valid path globs |
+| `agent.processIdentificationType` | `process-chain` | `process-chain`, `originating-process`, or `insecure-all` |
 | `cli.clearClipboardAfterSeconds` | `30` | integer seconds, `10..=300` |
 
 Opening a database transactionally renames the seven legacy `user.*` rows to
@@ -339,6 +369,10 @@ executable when the setting is written. The default `[]` allows only callers
 whose executable file identity matches the running agent. Removing a pattern
 affects future direct unlocks and does not revoke an authorization already
 issued to a process lineage.
+`agent.processIdentificationType` selects the authorization identity as
+described under Auth. A changed value takes effect immediately and revokes all
+cached authorizations and denials; the value remains in memory across idle
+database unloads.
 
 ### List Settings
 
@@ -355,6 +389,7 @@ Content-Type: application/json
   "agent.settingsAuthTtlSeconds": "300",
   "agent.denialTtlSeconds": "60",
   "agent.gcSeconds": "3600",
+  "agent.processIdentificationType": "process-chain",
   "agent.trustedProgramPaths": "[]",
   "cli.clearClipboardAfterSeconds": "30"
 }

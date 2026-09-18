@@ -28,7 +28,9 @@ Every unsuccessful response uses this shape:
 
 ## Authorization and scopes
 
-monopass authorizes a specific same-user process lineage. It starts with the program that connected to the local socket, walks back through its same-user parents to the oldest process it can identify, and records that ordered chain. monopass recognizes the same chain when its programs and ancestry still match; starting the integration through a different executable, terminal, launcher, or process chain requires authorization again.
+By default, monopass authorizes a specific same-user process lineage. It starts with the program that connected to the local socket, walks back through its same-user parents to the oldest process it can identify, and records that ordered chain. monopass recognizes the same chain when its programs and ancestry still match; starting the integration through a different executable, terminal, launcher, or process chain requires authorization again.
+
+`agent.processIdentificationType` can instead use `originating-process`, which binds authorization to the nearest exact GUI application process, otherwise the nearest process on the child side of a POSIX session-ID change, and finally the oldest verified same-user process below a UID boundary. The selected process is identified by its UID, PID, and start time. Nested shells in the same session share the origin. `insecure-all` shares authorization across every matching-UID/GID local process. Item and settings scopes remain separate in all modes. `insecure-all` does not disable password authentication or the trusted-program policy for direct unlock. The encrypted setting is loaded after the first successful full-chain unlock and retained across idle database unloads.
 
 Successful unlocks are remembered for that lineage until their authorization expires. The default lifetime is 15 minutes for `items` and 5 minutes for `settings`, although a user can change both settings. A process must be authorized before monopass allows it to use endpoints in that scope.
 
@@ -196,7 +198,8 @@ Failures: `400 bad_request`, `403 access_denied`.
 
 ### List settings
 
-`GET /settings` returns user settings and uses the `settings` scope.
+`GET /settings` returns registered agent and CLI settings and uses the
+`settings` scope.
 
 ```http
 GET /api/v1/settings HTTP/1.1
@@ -205,9 +208,10 @@ HTTP/1.1 200 OK
 Content-Type: application/json
 
 {
-  "user.authTtlSeconds": "900",
-  "user.settingsAuthTtlSeconds": "300",
-  "user.trustedProgramPaths": "[]"
+  "agent.authTtlSeconds": "900",
+  "agent.processIdentificationType": "process-chain",
+  "agent.settingsAuthTtlSeconds": "300",
+  "agent.trustedProgramPaths": "[]"
 }
 ```
 
@@ -215,10 +219,11 @@ Failures: `403 access_denied`.
 
 ### Update a setting
 
-`PUT /settings/{name}` updates a user setting and uses the `settings` scope.
+`PUT /settings/{name}` updates a registered setting and uses the `settings`
+scope.
 
 ```http
-PUT /api/v1/settings/user.authTtlSeconds HTTP/1.1
+PUT /api/v1/settings/agent.authTtlSeconds HTTP/1.1
 Content-Type: application/json
 
 { "value": "900" }

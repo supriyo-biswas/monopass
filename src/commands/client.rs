@@ -85,6 +85,32 @@ impl AccessScope {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct UnlockRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    content_type: Option<&'a str>,
+    auth_mode: AuthMode,
+    access_scope: AccessScope,
+}
+
+impl<'a> UnlockRequest<'a> {
+    fn for_api_path(
+        method: &'a str,
+        path: &'a str,
+        content_type: Option<&'a str>,
+        auth_mode: AuthMode,
+    ) -> Self {
+        Self {
+            method,
+            path,
+            content_type,
+            auth_mode,
+            access_scope: AccessScope::for_api_path(path),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthUnlockMethodsResponse {
     methods: Vec<AuthUnlockMethod>,
@@ -139,12 +165,14 @@ impl<'a> Client<'a> {
     ))]
     pub fn get_json_with_item_scope<T: DeserializeOwned>(&self, path: &str) -> AppResult<T> {
         let response = self.request_with_unlock_prompt_for_scope(
-            "GET",
-            path,
+            UnlockRequest {
+                method: "GET",
+                path,
+                content_type: None,
+                auth_mode: AuthMode::ProcessOnly,
+                access_scope: AccessScope::Items,
+            },
             Zeroizing::new(Vec::new()),
-            None,
-            AuthMode::ProcessOnly,
-            AccessScope::Items,
             prompt_master_password,
         )?;
         Ok(serde_json::from_slice(&response.body)?)
@@ -281,12 +309,14 @@ impl<'a> Client<'a> {
         content_length: u64,
     ) -> AppResult<T> {
         let response = self.request_reader_with_unlock_prompt(
-            "PUT",
-            path,
+            UnlockRequest::for_api_path(
+                "PUT",
+                path,
+                Some("application/octet-stream"),
+                AuthMode::ProcessOnly,
+            ),
             body,
             content_length,
-            Some("application/octet-stream"),
-            AuthMode::ProcessOnly,
             prompt_master_password,
         )?;
         Ok(serde_json::from_slice(&response.body)?)
@@ -323,29 +353,28 @@ impl<'a> Client<'a> {
         F: FnMut() -> io::Result<Zeroizing<String>>,
     {
         self.request_with_unlock_prompt_for_scope(
-            method,
-            path,
+            UnlockRequest::for_api_path(method, path, content_type, auth_mode),
             body,
-            content_type,
-            auth_mode,
-            AccessScope::for_api_path(path),
             prompt,
         )
     }
 
     fn request_with_unlock_prompt_for_scope<F>(
         &self,
-        method: &str,
-        path: &str,
+        request: UnlockRequest<'_>,
         body: Zeroizing<Vec<u8>>,
-        content_type: Option<&str>,
-        auth_mode: AuthMode,
-        access_scope: AccessScope,
         mut prompt: F,
     ) -> AppResult<Response>
     where
         F: FnMut() -> io::Result<Zeroizing<String>>,
     {
+        let UnlockRequest {
+            method,
+            path,
+            content_type,
+            auth_mode,
+            access_scope,
+        } = request;
         let mut password: Option<Zeroizing<String>> = None;
         let mut response = self.request(method, path, &body, content_type, None)?;
         if is_access_denied(&response) {
@@ -386,24 +415,28 @@ impl<'a> Client<'a> {
 
     fn request_reader_with_unlock_prompt<R, F>(
         &self,
-        method: &str,
-        path: &str,
+        request: UnlockRequest<'_>,
         body: &mut R,
         content_length: u64,
-        content_type: Option<&str>,
-        auth_mode: AuthMode,
         mut prompt: F,
     ) -> AppResult<Response>
     where
         R: Read + Seek,
         F: FnMut() -> io::Result<Zeroizing<String>>,
     {
+        let UnlockRequest {
+            method,
+            path,
+            content_type,
+            auth_mode,
+            access_scope,
+        } = request;
         let mut password: Option<Zeroizing<String>> = None;
         body.seek(SeekFrom::Start(0))?;
         let mut response =
             self.request_reader(method, path, body, content_length, content_type, None)?;
         if is_access_denied(&response) {
-            let unlock_method = self.first_unlock_method(AccessScope::for_api_path(path))?;
+            let unlock_method = self.first_unlock_method(access_scope)?;
             if unlock_method.accepts_master_password {
                 let prompted = self.unlock_with_password_prompt(&unlock_method, &mut prompt)?;
                 password = Some(prompted);

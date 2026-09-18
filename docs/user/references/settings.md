@@ -1,6 +1,6 @@
 # Settings
 
-Settings let you tune agent behavior, including authorization and cleanup, and CLI behavior, including how long `monopass clip` leaves a copied secret on the clipboard.
+Settings let you tune agent behavior, including authorization and cleanup, and CLI behavior.
 
 ## Inspect and change settings
 
@@ -13,6 +13,7 @@ agent.autoDeleteOldVersionsAfterSeconds	15552000
 agent.autoDeleteTrashItemsAfterSeconds	15552000
 agent.denialTtlSeconds	60
 agent.gcSeconds	3600
+agent.processIdentificationType	process-chain
 agent.settingsAuthTtlSeconds	300
 agent.trustedProgramPaths	[]
 cli.clearClipboardAfterSeconds	30
@@ -44,9 +45,46 @@ Unknown names and invalid values fail rather than being stored. All duration val
 | `agent.autoDeleteTrashItemsAfterSeconds` | `15552000` | Integer seconds, `0..=157680000` | How long an item stays in `Trash` before cleanup permanently removes it. Moving or renaming a trashed item restarts its retention period. |
 | `agent.autoDeleteOldVersionsAfterSeconds` | `15552000` | Integer seconds, `0..=157680000` | How long non-latest item versions remain before cleanup permanently removes them. |
 | `agent.trustedProgramPaths` | `[]` | A JSON array of string glob patterns | Which external executables may use direct master-password unlock. |
+| `agent.processIdentificationType` | `process-chain` | `process-chain`, `originating-process`, or `insecure-all` | How the agent identifies processes that share an authorization. |
 | `cli.clearClipboardAfterSeconds` | `30` | Integer seconds, `10..=300` | How long `monopass clip` keeps a copied secret before clearing it, if the clipboard still contains the same text. |
 
 The authorization and denial timers count time while the computer is asleep. Changing an authorization or denial duration applies to existing cached entries as well as future ones. Cleanup and retention changes take effect when cleanup next runs.
+
+## Choose how processes share authorization
+
+`process-chain` is the secure default and binds authorization to the complete
+verified ancestry from the oldest accessible same-user process through the
+socket client.
+
+`originating-process` binds authorization to one selected process identity.
+monopass chooses that process by walking from the socket client toward its
+parents:
+
+1. Use the nearest recognized GUI application process. For example, Firefox's
+   main process normally becomes the origin instead of its desktop session
+   manager.
+2. If there is no recognized GUI process, stop on the child side of the nearest
+   POSIX session-ID change. Nested shells in the same session therefore share
+   an origin, while separate terminal sessions do not.
+3. If neither boundary exists, use the oldest verified same-user process below
+   the first different-user parent, or the parentless same-user process.
+
+The selected process is identified by its UID, PID, and process start time, so
+restarting it requires authorization again. On Linux, a GUI process must have
+an executable that uniquely matches a visible desktop application; inherited
+desktop context is used only for presentation. On macOS, the ancestry walk may
+cross the narrowly verified root-owned `/usr/bin/login` boundary to find
+Terminal or iTerm2. Session IDs do not change `process-chain` behavior.
+
+`insecure-all` lets every local process with the same UID and GID use an
+authorization granted to any other such process. Item and settings scopes stay
+separate, and direct password unlock still honors `agent.trustedProgramPaths`,
+but this mode substantially weakens process isolation.
+
+The agent starts with `process-chain` until the first successful unlock loads
+the encrypted setting, then keeps the loaded value in memory across idle vault
+unloads. Changing the value clears all cached authorizations and GUI denials;
+the next command must authenticate again.
 
 ## Trust a direct-unlock client
 

@@ -196,9 +196,10 @@ monopass read-setting <name>
 monopass write-setting <name> <value>
 ```
 
-All settings commands require settings-scoped process-lineage authorization and
-use the settings unlock discovery flow. Names are exact full setting names such
-as `agent.trustedProgramPaths`; the CLI does not add an `agent.` prefix.
+All settings commands require settings-scoped authorization under the active
+process identification type and use the settings unlock discovery flow. Names
+are exact full setting names such as `agent.trustedProgramPaths`; the CLI does
+not add an `agent.` prefix.
 
 `ls-settings` calls `GET /api/v1/settings`, sorts the response by name, and
 prints one tab-separated `<name>\t<value>` row per setting. `read-setting` calls
@@ -209,6 +210,10 @@ the name is absent. Both commands append a newline to each printed value.
 `{ "value": "<value>" }`, where the path component is percent-encoded and the
 argument is passed through unchanged. It produces no output on success. The
 agent remains responsible for rejecting unknown settings and invalid values.
+`agent.processIdentificationType` accepts exactly `process-chain`,
+`originating-process`, or `insecure-all`. Changing it revokes cached
+item/settings authorizations and GUI denials, so the next agent-backed command
+reauthenticates.
 
 The retention settings `agent.autoDeleteTrashItemsAfterSeconds` and
 `agent.autoDeleteOldVersionsAfterSeconds` default to `15552000` seconds (180

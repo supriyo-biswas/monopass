@@ -625,29 +625,50 @@ struct ItemInput {
     files: Vec<String>,
 }
 
+struct FieldInputs {
+    username: Option<String>,
+    email: Option<String>,
+    website: Option<String>,
+    password: bool,
+    generate_password: Option<String>,
+    totp: Option<String>,
+    fields: Vec<String>,
+    concealed_fields: Option<Vec<String>>,
+}
+
+impl ItemInput {
+    fn into_fields_and_files(self) -> (FieldInputs, Vec<String>) {
+        let Self {
+            username,
+            email,
+            website,
+            password,
+            generate_password,
+            totp,
+            fields,
+            concealed_fields,
+            files,
+        } = self;
+        (
+            FieldInputs {
+                username,
+                email,
+                website,
+                password,
+                generate_password,
+                totp,
+                fields,
+                concealed_fields,
+            },
+            files,
+        )
+    }
+}
+
 fn build_create_request(client: &Client<'_>, input: ItemInput) -> AppResult<CreateItemRequest> {
-    let ItemInput {
-        username,
-        email,
-        website,
-        password,
-        generate_password,
-        totp,
-        fields,
-        concealed_fields,
-        files,
-    } = input;
+    let (fields, files) = input.into_fields_and_files();
     let file_inputs = parse_file_inputs(files)?;
-    let fields = build_fields(
-        username,
-        email,
-        website,
-        password,
-        generate_password.as_deref(),
-        totp.as_deref(),
-        fields,
-        concealed_fields,
-    )?;
+    let fields = build_fields(fields)?;
     validate_field_and_file_name_overlap(
         fields.iter().map(|field| field.name.as_str()),
         file_inputs.iter().map(|file| file.name.as_str()),
@@ -663,29 +684,10 @@ fn build_create_request(client: &Client<'_>, input: ItemInput) -> AppResult<Crea
 }
 
 fn build_update_request(client: &Client<'_>, input: ItemInput) -> AppResult<UpdateItemRequest> {
-    let ItemInput {
-        username,
-        email,
-        website,
-        password,
-        generate_password,
-        totp,
-        fields,
-        concealed_fields,
-        files,
-    } = input;
+    let (fields, files) = input.into_fields_and_files();
     let file_inputs = parse_file_inputs(files)?;
     let mut request = UpdateItemRequest::default();
-    for field in build_fields(
-        username,
-        email,
-        website,
-        password,
-        generate_password.as_deref(),
-        totp.as_deref(),
-        fields,
-        concealed_fields,
-    )? {
+    for field in build_fields(fields)? {
         request.fields.push(UpdateFieldEntry::Set(UpdateFieldSet {
             name: field.name,
             field_type: field.field_type,
@@ -708,16 +710,17 @@ fn build_update_request(client: &Client<'_>, input: ItemInput) -> AppResult<Upda
     Ok(request)
 }
 
-fn build_fields(
-    username: Option<String>,
-    email: Option<String>,
-    website: Option<String>,
-    password: bool,
-    generate_password: Option<&str>,
-    totp: Option<&str>,
-    fields: Vec<String>,
-    concealed_fields: Option<Vec<String>>,
-) -> AppResult<Vec<CreateField>> {
+fn build_fields(input: FieldInputs) -> AppResult<Vec<CreateField>> {
+    let FieldInputs {
+        username,
+        email,
+        website,
+        password,
+        generate_password,
+        totp,
+        fields,
+        concealed_fields,
+    } = input;
     let concealed: Option<HashSet<String>> =
         concealed_fields.map(|fields| fields.into_iter().collect());
     let mut names = HashSet::new();
@@ -749,7 +752,7 @@ fn build_fields(
             string_field(password, Some(true)),
         )?;
     }
-    if let Some(spec) = generate_password {
+    if let Some(spec) = generate_password.as_deref() {
         let password = super::pwgen::generate(if spec.is_empty() { None } else { Some(spec) })?;
         push_field(
             &mut output,
@@ -758,7 +761,7 @@ fn build_fields(
             string_field(password, Some(true)),
         )?;
     }
-    if let Some(totp) = totp {
+    if let Some(totp) = totp.as_deref() {
         push_field(
             &mut output,
             &mut names,
@@ -965,7 +968,7 @@ mod tests {
     use crate::commands::models::{Field, FileMetadata, ItemResponse};
 
     use super::{
-        FieldType, RemovalPlan, build_fields, classify_item_preflight, human_size,
+        FieldInputs, FieldType, RemovalPlan, build_fields, classify_item_preflight, human_size,
         is_item_exists_conflict, next_trash_number, parse_file_inputs, plan_removal,
         read_prompted_field_value, remove_item_is_permanent_delete, trash_fallback_name,
         trash_number, trash_numbered_glob, validate_field_and_file_name_overlap,
@@ -1320,16 +1323,16 @@ mod tests {
 
     #[test]
     fn build_fields_infers_concealment_without_explicit_list() {
-        let fields = build_fields(
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            vec!["password=plain-text".to_owned()],
-            None,
-        )
+        let fields = build_fields(FieldInputs {
+            username: None,
+            email: None,
+            website: None,
+            password: false,
+            generate_password: None,
+            totp: None,
+            fields: vec!["password=plain-text".to_owned()],
+            concealed_fields: None,
+        })
         .unwrap();
 
         assert_eq!(1, fields.len());
@@ -1338,16 +1341,16 @@ mod tests {
 
     #[test]
     fn build_fields_uses_explicit_list_for_custom_fields() {
-        let fields = build_fields(
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            vec!["password=plain-text".to_owned()],
-            Some(vec!["other".to_owned()]),
-        )
+        let fields = build_fields(FieldInputs {
+            username: None,
+            email: None,
+            website: None,
+            password: false,
+            generate_password: None,
+            totp: None,
+            fields: vec!["password=plain-text".to_owned()],
+            concealed_fields: Some(vec!["other".to_owned()]),
+        })
         .unwrap();
 
         assert_eq!(1, fields.len());
@@ -1356,16 +1359,16 @@ mod tests {
 
     #[test]
     fn build_fields_adds_unconcealed_email_and_website_shortcuts() {
-        let fields = build_fields(
-            None,
-            Some("alice@example.com".to_owned()),
-            Some("https://example.com".to_owned()),
-            false,
-            None,
-            None,
-            Vec::new(),
-            None,
-        )
+        let fields = build_fields(FieldInputs {
+            username: None,
+            email: Some("alice@example.com".to_owned()),
+            website: Some("https://example.com".to_owned()),
+            password: false,
+            generate_password: None,
+            totp: None,
+            fields: Vec::new(),
+            concealed_fields: None,
+        })
         .unwrap();
 
         assert_eq!(2, fields.len());

@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use zeroize::Zeroizing;
 
+use super::auth::PeerAuthorization;
 use super::error::ApiError;
 #[cfg(any(
     target_os = "macos",
@@ -193,6 +194,7 @@ fn client_capabilities_include_gui_session(value: &str) -> bool {
 pub async fn unlock_direct(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
+    authorization: Option<Extension<PeerAuthorization>>,
     caller: Option<Extension<DirectUnlockCaller>>,
     headers: HeaderMap,
     query: Result<Query<AuthScopeQuery>, QueryRejection>,
@@ -202,9 +204,20 @@ pub async fn unlock_direct(
     let Extension(caller) = caller.ok_or_else(ApiError::access_denied)?;
     let password = bearer_password(&headers)?;
 
-    state
-        .unlock_direct_for_scope(password, scope_hash, access_scope, caller)
-        .await
+    let result = match authorization {
+        Some(Extension(authorization)) => {
+            state
+                .unlock_direct_for_peer(password, authorization, access_scope, caller)
+                .await
+        }
+        None => {
+            state
+                .unlock_direct_for_scope(password, scope_hash, access_scope, caller)
+                .await
+        }
+    };
+
+    result
         .map(|()| StatusCode::OK)
         .map_err(|error| match error {
             super::state::UnlockError::AccessDenied => ApiError::access_denied(),
@@ -220,6 +233,7 @@ pub async fn unlock_direct(
 pub async fn unlock_gui(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
+    authorization: Option<Extension<PeerAuthorization>>,
     display: Option<Extension<ProcessDisplay>>,
     headers: HeaderMap,
     query: Result<Query<AuthScopeQuery>, QueryRejection>,
@@ -227,6 +241,7 @@ pub async fn unlock_gui(
     unlock_gui_with_prompt(
         State(state),
         scope_hash,
+        authorization,
         display,
         headers,
         query,
@@ -242,6 +257,7 @@ pub async fn unlock_gui(
 async fn unlock_gui_with_prompt<F, Fut>(
     State(state): State<AgentState>,
     scope_hash: Option<Extension<ScopeHash>>,
+    authorization: Option<Extension<PeerAuthorization>>,
     display: Option<Extension<ProcessDisplay>>,
     headers: HeaderMap,
     query: Result<Query<AuthScopeQuery>, QueryRejection>,
@@ -268,10 +284,19 @@ where
     for attempt in 0..MAX_GUI_PASSWORD_ATTEMPTS {
         match prompt.next().await {
             PromptOutcome::Allowed { password, feedback } => {
-                match state
-                    .unlock_for_scope(password, scope_hash.clone(), access_scope)
-                    .await
-                {
+                let result = match authorization.as_ref() {
+                    Some(Extension(authorization)) => {
+                        state
+                            .unlock_for_peer(password, authorization.clone(), access_scope)
+                            .await
+                    }
+                    None => {
+                        state
+                            .unlock_for_scope(password, scope_hash.clone(), access_scope)
+                            .await
+                    }
+                };
+                match result {
                     Ok(()) => {
                         let _ = feedback.send(PromptFeedback::Complete);
                         return Ok(StatusCode::OK);
@@ -1311,6 +1336,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             HeaderMap::new(),
             default_scope_query(),
@@ -1330,6 +1356,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             headers,
             default_scope_query(),
@@ -1345,6 +1372,7 @@ mod tests {
         let state = AgentState::from_database_path("missing.db");
         let error = super::unlock_direct(
             axum::extract::State(state),
+            None,
             None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("correct"),
@@ -1362,6 +1390,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             None,
             authorization_headers("correct"),
             default_scope_query(),
@@ -1381,6 +1410,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("wrong"),
             default_scope_query(),
@@ -1404,6 +1434,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("correct"),
             default_scope_query(),
@@ -1423,6 +1454,7 @@ mod tests {
         let status = super::unlock_direct(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("correct"),
             default_scope_query(),
@@ -1460,6 +1492,7 @@ mod tests {
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
             None,
+            None,
             gui_unlock_headers(),
             default_scope_query(),
             prompt,
@@ -1485,6 +1518,7 @@ mod tests {
         super::unlock_gui_with_prompt(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             None,
             gui_unlock_headers(),
             scope_query(AccessScope::Settings),
@@ -1531,6 +1565,7 @@ mod tests {
                 axum::extract::State(state.clone()),
                 Some(axum::Extension(ScopeHash::test(1))),
                 None,
+                None,
                 gui_unlock_headers(),
                 default_scope_query(),
                 &prompt,
@@ -1564,6 +1599,7 @@ mod tests {
         let response = super::unlock_gui_with_prompt(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             None,
             gui_unlock_headers(),
             default_scope_query(),
@@ -1603,6 +1639,7 @@ mod tests {
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
             None,
+            None,
             gui_unlock_headers(),
             default_scope_query(),
             |_display, _access_scope| async { prompt_session([PromptOutcome::Dismissed]) },
@@ -1636,6 +1673,7 @@ mod tests {
             let error = super::unlock_gui_with_prompt(
                 axum::extract::State(state.clone()),
                 Some(axum::Extension(scope_hash)),
+                None,
                 None,
                 gui_unlock_headers(),
                 default_scope_query(),
@@ -1677,6 +1715,7 @@ mod tests {
                 axum::extract::State(state.clone()),
                 Some(axum::Extension(ScopeHash::test(1))),
                 None,
+                None,
                 gui_unlock_headers(),
                 scope_query(access_scope),
                 &prompt,
@@ -1713,6 +1752,7 @@ mod tests {
                 axum::extract::State(state.clone()),
                 Some(axum::Extension(ScopeHash::test(1))),
                 None,
+                None,
                 gui_unlock_headers(),
                 default_scope_query(),
                 &prompt,
@@ -1744,6 +1784,7 @@ mod tests {
         let error = super::unlock_gui_with_prompt(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(1))),
+            None,
             None,
             HeaderMap::new(),
             default_scope_query(),
@@ -1851,6 +1892,7 @@ mod tests {
         let error = super::unlock_direct(
             axum::extract::State(state),
             Some(axum::Extension(ScopeHash::test(2))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("wrong"),
             default_scope_query(),
@@ -1870,6 +1912,7 @@ mod tests {
         let response = super::unlock_direct(
             axum::extract::State(state.clone()),
             Some(axum::Extension(ScopeHash::test(2))),
+            None,
             Some(axum::Extension(DirectUnlockCaller::Agent)),
             authorization_headers("correct"),
             default_scope_query(),

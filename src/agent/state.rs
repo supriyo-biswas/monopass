@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::auth::PeerAuthorization;
 use super::clock::{SuspendAwareClock, SuspendAwareInstant, SystemSuspendAwareClock};
 use super::models::{
     AccessScope, ContactResponse, CreateContactRequest, CreateField, CreateItemRequest,
@@ -43,8 +44,8 @@ use crate::db;
 use crate::settings::{
     AUTH_TTL_SETTING, AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING,
     AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING, DENIAL_TTL_SETTING, GC_SECONDS_SETTING,
-    SETTINGS_AUTH_TTL_SETTING, SettingsError, TRUSTED_PROGRAM_PATHS_SETTING, setting,
-    trusted_program_path_matcher,
+    PROCESS_IDENTIFICATION_TYPE_SETTING, ProcessIdentificationType, SETTINGS_AUTH_TTL_SETTING,
+    SettingsError, TRUSTED_PROGRAM_PATHS_SETTING, setting, trusted_program_path_matcher,
 };
 
 const SCOPE_CACHE_CAPACITY: usize = 32;
@@ -166,6 +167,21 @@ impl AgentState {
         });
     }
 
+    pub(crate) async fn process_identification_type(&self) -> ProcessIdentificationType {
+        self.inner.lock().await.process_identification_type
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_process_identification_type_for_test(
+        &self,
+        process_identification_type: ProcessIdentificationType,
+    ) {
+        self.inner
+            .lock()
+            .await
+            .set_process_identification_type(process_identification_type);
+    }
+
     #[cfg(test)]
     pub async fn unlock(
         &self,
@@ -187,8 +203,35 @@ impl AgentState {
         scope_hash: ScopeHash,
         access_scope: AccessScope,
     ) -> Result<(), UnlockError> {
-        self.unlock_for_scope_with_policy(password, scope_hash, access_scope, false, None)
-            .await
+        self.unlock_for_scope_with_policy(
+            password,
+            UnlockScope::Fixed(scope_hash),
+            access_scope,
+            false,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(any(
+        test,
+        target_os = "macos",
+        all(target_os = "linux", any(feature = "gtk", feature = "qt"))
+    ))]
+    pub async fn unlock_for_peer(
+        &self,
+        password: Zeroizing<String>,
+        authorization: PeerAuthorization,
+        access_scope: AccessScope,
+    ) -> Result<(), UnlockError> {
+        self.unlock_for_scope_with_policy(
+            password,
+            UnlockScope::Peer(Box::new(authorization)),
+            access_scope,
+            false,
+            None,
+        )
+        .await
     }
 
     #[cfg(any(not(target_os = "macos"), test))]
@@ -211,7 +254,35 @@ impl AgentState {
         };
         self.unlock_for_scope_with_policy(
             password,
-            scope_hash,
+            UnlockScope::Fixed(scope_hash),
+            access_scope,
+            true,
+            canonical_program.as_deref(),
+        )
+        .await
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    pub async fn unlock_direct_for_peer(
+        &self,
+        password: Zeroizing<String>,
+        authorization: PeerAuthorization,
+        access_scope: AccessScope,
+        caller: DirectUnlockCaller,
+    ) -> Result<(), UnlockError> {
+        let canonical_program = match caller {
+            DirectUnlockCaller::Agent => None,
+            DirectUnlockCaller::Program(path) => {
+                let canonical_path = tokio::task::spawn_blocking(move || fs::canonicalize(path))
+                    .await
+                    .map_err(|_| UnlockError::AccessDenied)?
+                    .map_err(|_| UnlockError::AccessDenied)?;
+                Some(canonical_path)
+            }
+        };
+        self.unlock_for_scope_with_policy(
+            password,
+            UnlockScope::Peer(Box::new(authorization)),
             access_scope,
             true,
             canonical_program.as_deref(),
@@ -222,7 +293,7 @@ impl AgentState {
     async fn unlock_for_scope_with_policy(
         &self,
         password: Zeroizing<String>,
-        scope_hash: ScopeHash,
+        unlock_scope: UnlockScope,
         access_scope: AccessScope,
         enforce_direct_trust: bool,
         direct_program: Option<&Path>,
@@ -235,6 +306,9 @@ impl AgentState {
             }
             let database = inner.database.clone().ok_or(UnlockError::AccessDenied)?;
             let auth_epoch = inner.auth_epoch;
+            let scope_hash = unlock_scope
+                .scope_hash(inner.process_identification_type)
+                .ok_or(UnlockError::AccessDenied)?;
             drop(inner);
             if !direct_unlock_caller_is_trusted(&database, enforce_direct_trust, direct_program)
                 .await
@@ -299,9 +373,19 @@ impl AgentState {
             .setting_duration(DENIAL_TTL_SETTING)
             .await
             .map_err(|_| UnlockError::AccessDenied)?;
+        let process_identification_type = handle
+            .get_setting(PROCESS_IDENTIFICATION_TYPE_SETTING.to_owned())
+            .await
+            .map_err(|_| UnlockError::AccessDenied)?
+            .parse::<ProcessIdentificationType>()
+            .map_err(|_| UnlockError::AccessDenied)?;
+        let scope_hash = unlock_scope
+            .scope_hash(process_identification_type)
+            .ok_or(UnlockError::AccessDenied)?;
         let now = self.clock.now().ok_or(UnlockError::AccessDenied)?;
 
         inner.invalidate_auth_epoch();
+        inner.set_process_identification_type(process_identification_type);
         inner.database = Some(handle);
         inner.password_verifier = Some(PasswordVerifier::new(&password)?);
         inner.denial_ttl = denial_ttl;
@@ -464,10 +548,25 @@ impl AgentState {
         } else {
             None
         };
+        let process_identification_type = if name == PROCESS_IDENTIFICATION_TYPE_SETTING {
+            Some(
+                value
+                    .parse::<ProcessIdentificationType>()
+                    .map_err(map_settings_error)?,
+            )
+        } else {
+            None
+        };
 
         database.upsert_setting(name, value).await?;
-        if let Some(denial_ttl) = denial_ttl {
-            self.inner.lock().await.denial_ttl = denial_ttl;
+        if denial_ttl.is_some() || process_identification_type.is_some() {
+            let mut inner = self.inner.lock().await;
+            if let Some(denial_ttl) = denial_ttl {
+                inner.denial_ttl = denial_ttl;
+            }
+            if let Some(process_identification_type) = process_identification_type {
+                inner.set_process_identification_type(process_identification_type);
+            }
         }
         Ok(())
     }
@@ -788,6 +887,7 @@ struct InnerState {
     active_jobs: HashSet<String>,
     auth_epoch: u64,
     migration_needed: bool,
+    process_identification_type: ProcessIdentificationType,
 }
 
 impl Default for InnerState {
@@ -811,11 +911,28 @@ impl Default for InnerState {
             active_jobs: HashSet::new(),
             auth_epoch: 0,
             migration_needed: false,
+            process_identification_type: ProcessIdentificationType::ProcessChain,
         }
     }
 }
 
 impl InnerState {
+    fn set_process_identification_type(
+        &mut self,
+        process_identification_type: ProcessIdentificationType,
+    ) {
+        if self.process_identification_type == process_identification_type {
+            return;
+        }
+        self.invalidate_auth_epoch();
+        self.process_identification_type = process_identification_type;
+        self.authorized_scopes.clear();
+        self.settings_authorized_scopes.clear();
+        self.denied_scopes.clear();
+        self.settings_denied_scopes.clear();
+        self.max_authorization_expires_at = None;
+    }
+
     fn authorized_scopes(&self, access_scope: AccessScope) -> &AuthCache {
         match access_scope {
             AccessScope::Items => &self.authorized_scopes,
@@ -846,6 +963,20 @@ impl InnerState {
             self.max_authorization_expires_at
                 .map_or(expires_at, |current| current.max(expires_at)),
         );
+    }
+}
+
+enum UnlockScope {
+    Fixed(ScopeHash),
+    Peer(Box<PeerAuthorization>),
+}
+
+impl UnlockScope {
+    fn scope_hash(&self, identification_type: ProcessIdentificationType) -> Option<ScopeHash> {
+        match self {
+            Self::Fixed(scope_hash) => Some(scope_hash.clone()),
+            Self::Peer(authorization) => authorization.scope_hash(identification_type),
+        }
     }
 }
 
@@ -6090,8 +6221,10 @@ mod tests {
         PRIVATE_FILE_MODE, PageRequest, ShellCompletionKind, UnlockError, UpdateContactRequest,
         UpdateItemRequest,
     };
+    use crate::agent::auth::PeerAuthorization;
     use crate::agent::clock::{SuspendAwareInstant as Instant, TestSuspendAwareClock};
     use crate::agent::process::{DirectUnlockCaller, ScopeHash};
+    use crate::settings::{PROCESS_IDENTIFICATION_TYPE_SETTING, ProcessIdentificationType};
 
     const AUTH_TTL: Duration = Duration::from_secs(900);
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -7744,6 +7877,10 @@ mod tests {
             settings.get("agent.trustedProgramPaths")
         );
         assert_eq!(
+            Some(&"process-chain".to_owned()),
+            settings.get(PROCESS_IDENTIFICATION_TYPE_SETTING)
+        );
+        assert_eq!(
             Some(&"30".to_owned()),
             settings.get("cli.clearClipboardAfterSeconds")
         );
@@ -7779,6 +7916,98 @@ mod tests {
             Some(&r#"["","relative","relative"]"#.to_owned()),
             settings.get("agent.trustedProgramPaths")
         );
+    }
+
+    #[tokio::test]
+    async fn first_unlock_loads_mode_and_authorizes_configured_peer_identity() {
+        let file = NamedTempFile::new().unwrap();
+        crate::db::create_encrypted_database_with_password(file.path(), "correct").unwrap();
+        let connection =
+            crate::db::open_encrypted_database_with_password(file.path(), "correct").unwrap();
+        connection
+            .execute(
+                "UPDATE system_settings SET value = 'originating-process' WHERE name = ?1",
+                [PROCESS_IDENTIFICATION_TYPE_SETTING],
+            )
+            .unwrap();
+        drop(connection);
+
+        let state = AgentState::from_database_path(file.path());
+        let process_chain = ScopeHash::test(1);
+        let originating = ScopeHash::test(2);
+        let authorization =
+            PeerAuthorization::test(1000, process_chain.clone(), originating.clone());
+
+        state
+            .unlock_for_peer(password("correct"), authorization, AccessScope::Items)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ProcessIdentificationType::OriginatingProcess,
+            state.process_identification_type().await
+        );
+        assert!(!state.is_authorized(&process_chain).await);
+        assert!(state.is_authorized(&originating).await);
+
+        let mut inner = state.inner.lock().await;
+        AgentState::unload_locked(&mut inner);
+        assert_eq!(
+            ProcessIdentificationType::OriginatingProcess,
+            inner.process_identification_type
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_process_identification_type_revokes_both_scopes_and_denials() {
+        let state = AgentState::from_database_path("missing.db");
+        let database = DbHandle::test();
+        state.store_database_handle(database.clone()).await;
+        state.authorize_scope_hash(ScopeHash::test(1)).await;
+        state
+            .authorize_scope_hash_for_scope(ScopeHash::test(2), AccessScope::Settings)
+            .await;
+        state.deny_scope_hash(ScopeHash::test(1)).await;
+        state
+            .deny_scope_hash_for_scope(ScopeHash::test(2), AccessScope::Settings)
+            .await;
+
+        state
+            .upsert_setting(
+                &database,
+                PROCESS_IDENTIFICATION_TYPE_SETTING.to_owned(),
+                "insecure-all".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ProcessIdentificationType::InsecureAll,
+            state.process_identification_type().await
+        );
+        assert!(!state.is_authorized(&ScopeHash::test(1)).await);
+        assert!(
+            !state
+                .is_authorized_for_scope(&ScopeHash::test(2), AccessScope::Settings)
+                .await
+        );
+        assert!(!state.is_scope_denied(&ScopeHash::test(1)).await);
+        assert!(
+            !state
+                .is_scope_denied_for_scope(&ScopeHash::test(2), AccessScope::Settings)
+                .await
+        );
+
+        state.authorize_scope_hash(ScopeHash::test(3)).await;
+        state
+            .upsert_setting(
+                &database,
+                PROCESS_IDENTIFICATION_TYPE_SETTING.to_owned(),
+                "insecure-all".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(state.is_authorized(&ScopeHash::test(3)).await);
     }
 
     #[tokio::test]

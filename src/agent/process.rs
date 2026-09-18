@@ -17,6 +17,13 @@ impl ScopeHash {
         hash[0] = value;
         Self(hash)
     }
+
+    pub(crate) fn insecure_all(uid: u32) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"monopass-authorization-insecure-all-v1\0");
+        hasher.update(uid.to_le_bytes());
+        Self(hasher.finalize().into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +68,7 @@ enum StableProcessIdentity {
 struct ProcessInfo {
     instance: ProcessInstanceIdentity,
     parent_pid: i32,
+    session_id: Option<i32>,
     uid: u32,
     executable: Option<ExecutableIdentity>,
     executable_path: Option<PathBuf>,
@@ -84,6 +92,7 @@ struct AuthorizationScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedAuthorizationScope {
     pub(crate) hash: ScopeHash,
+    pub(crate) originating_process_hash: ScopeHash,
     pub(crate) display: Option<ProcessDisplay>,
     pub(crate) ultimate: UltimateProcess,
 }
@@ -214,6 +223,130 @@ pub(crate) fn resolve_authorization_scope(
     resolve_authorization_scope_with_resolver(peer_pid, peer_uid, &resolver)
 }
 
+pub(crate) fn resolve_originating_process_scope_hash(
+    peer_pid: i32,
+    peer_uid: u32,
+) -> Option<ScopeHash> {
+    resolve_originating_process_scope_hash_with_resolver_and_gui(
+        peer_pid,
+        peer_uid,
+        &PlatformProcessResolver,
+        &PlatformGuiApplicationResolver,
+    )
+}
+
+pub(crate) fn resolve_direct_process(peer_pid: i32, peer_uid: u32) -> Option<UltimateProcess> {
+    let process = PlatformProcessResolver.process_info(peer_pid)?;
+    if process.uid != peer_uid {
+        return None;
+    }
+    Some(UltimateProcess {
+        executable: process.executable,
+        executable_path: process.executable_path,
+    })
+}
+
+fn resolve_originating_process_scope_hash_with_resolver_and_gui(
+    peer_pid: i32,
+    peer_uid: u32,
+    resolver: &impl ProcessResolver,
+    gui_resolver: &impl GuiApplicationResolver,
+) -> Option<ScopeHash> {
+    let mut current = resolver.process_info(peer_pid)?;
+    if current.uid != peer_uid {
+        return None;
+    }
+
+    let mut chain = Vec::new();
+    let mut crossed_macos_login_boundary = false;
+    let mut remaining_depth = MAX_PROCESS_CHAIN_DEPTH;
+    let mut session_candidate = None;
+
+    loop {
+        if remaining_depth == 0 || current.uid != peer_uid {
+            return narrower_originating_process_hash(
+                peer_uid,
+                &chain,
+                session_candidate.as_ref(),
+                gui_resolver,
+            );
+        }
+        remaining_depth -= 1;
+        if chain
+            .iter()
+            .any(|process: &ProcessInfo| process.instance.pid == current.instance.pid)
+        {
+            return narrower_originating_process_hash(
+                peer_uid,
+                &chain,
+                session_candidate.as_ref(),
+                gui_resolver,
+            );
+        }
+
+        if gui_resolver
+            .gui_application(&current)
+            .is_some_and(|matched| matched.kind == GuiApplicationMatchKind::Process)
+        {
+            return Some(hash_originating_process(peer_uid, &current));
+        }
+
+        let parent_pid = current.parent_pid;
+        chain.push(current.clone());
+        if parent_pid <= 0 {
+            break;
+        }
+        if remaining_depth == 0 {
+            return narrower_originating_process_hash(
+                peer_uid,
+                &chain,
+                session_candidate.as_ref(),
+                gui_resolver,
+            );
+        }
+
+        let Some(parent_uid) = resolver.process_uid(parent_pid) else {
+            return narrower_originating_process_hash(
+                peer_uid,
+                &chain,
+                session_candidate.as_ref(),
+                gui_resolver,
+            );
+        };
+        if parent_uid != peer_uid {
+            if !crossed_macos_login_boundary
+                && let Some(parent) = resolver
+                    .verified_parent_across_macos_login_boundary(&current, parent_pid, peer_uid)
+            {
+                record_nearest_session_boundary(&mut session_candidate, &current, &parent);
+                crossed_macos_login_boundary = true;
+                remaining_depth -= 1;
+                current = parent;
+                continue;
+            }
+            break;
+        }
+
+        let Some(parent) = resolver.process_info(parent_pid) else {
+            return narrower_originating_process_hash(
+                peer_uid,
+                &chain,
+                session_candidate.as_ref(),
+                gui_resolver,
+            );
+        };
+        if parent.uid != peer_uid {
+            break;
+        }
+        record_nearest_session_boundary(&mut session_candidate, &current, &parent);
+        current = parent;
+    }
+
+    chain.reverse();
+    let originating = originating_process_from_chain(&chain, gui_resolver)?;
+    Some(hash_originating_process(peer_uid, originating))
+}
+
 trait ProcessResolver {
     fn process_info(&self, pid: i32) -> Option<ProcessInfo>;
     fn process_uid(&self, pid: i32) -> Option<u32>;
@@ -328,11 +461,87 @@ fn resolve_authorization_scope_with_resolver_and_gui(
     let ultimate = ultimate_process_from_chain(&chain)?;
     let display =
         process_display_from_chain_with_agent_and_gui(&chain, agent_executable, gui_resolver);
+    let originating = originating_process_from_chain(&chain, gui_resolver)?;
     Some(ResolvedAuthorizationScope {
         hash: hash_authorization_scope(&scope),
+        originating_process_hash: hash_originating_process(peer_uid, originating),
         display,
         ultimate,
     })
+}
+
+fn originating_process_from_chain<'a>(
+    chain: &'a [ProcessInfo],
+    gui_resolver: &impl GuiApplicationResolver,
+) -> Option<&'a ProcessInfo> {
+    let resolve = || {
+        chain.iter().rev().find(|process| {
+            gui_resolver
+                .gui_application(process)
+                .is_some_and(|matched| matched.kind == GuiApplicationMatchKind::Process)
+        })
+    };
+
+    resolve()
+        .or_else(|| {
+            if gui_resolver.refresh_after_miss() {
+                resolve()
+            } else {
+                None
+            }
+        })
+        .or_else(|| nearest_session_boundary_process(chain))
+        .or_else(|| chain.first())
+}
+
+fn narrower_originating_process_hash(
+    uid: u32,
+    direct_to_ancestor_chain: &[ProcessInfo],
+    session_candidate: Option<&ProcessInfo>,
+    gui_resolver: &impl GuiApplicationResolver,
+) -> Option<ScopeHash> {
+    let resolve_gui = || {
+        direct_to_ancestor_chain.iter().find(|process| {
+            gui_resolver
+                .gui_application(process)
+                .is_some_and(|matched| matched.kind == GuiApplicationMatchKind::Process)
+        })
+    };
+    let process = resolve_gui()
+        .or_else(|| {
+            if gui_resolver.refresh_after_miss() {
+                resolve_gui()
+            } else {
+                None
+            }
+        })
+        .or(session_candidate)?;
+    Some(hash_originating_process(uid, process))
+}
+
+fn nearest_session_boundary_process(chain: &[ProcessInfo]) -> Option<&ProcessInfo> {
+    chain.windows(2).rev().find_map(|pair| {
+        let parent = &pair[0];
+        let child = &pair[1];
+        sessions_differ(child, parent).then_some(child)
+    })
+}
+
+fn record_nearest_session_boundary(
+    candidate: &mut Option<ProcessInfo>,
+    child: &ProcessInfo,
+    parent: &ProcessInfo,
+) {
+    if candidate.is_none() && sessions_differ(child, parent) {
+        *candidate = Some(child.clone());
+    }
+}
+
+fn sessions_differ(child: &ProcessInfo, parent: &ProcessInfo) -> bool {
+    matches!(
+        (child.session_id, parent.session_id),
+        (Some(child_session), Some(parent_session)) if child_session != parent_session
+    )
 }
 
 fn ultimate_process_from_chain(chain: &[ProcessInfo]) -> Option<UltimateProcess> {
@@ -563,6 +772,14 @@ fn hash_authorization_scope(scope: &AuthorizationScope) -> ScopeHash {
     ScopeHash(hasher.finalize().into())
 }
 
+fn hash_originating_process(uid: u32, process: &ProcessInfo) -> ScopeHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"monopass-authorization-originating-process-v1\0");
+    hasher.update(uid.to_le_bytes());
+    hash_instance(&mut hasher, process.instance);
+    ScopeHash(hasher.finalize().into())
+}
+
 fn hash_instance(hasher: &mut Sha256, instance: ProcessInstanceIdentity) {
     hasher.update(instance.pid.to_le_bytes());
     hasher.update(instance.start_time.primary.to_le_bytes());
@@ -646,6 +863,7 @@ impl ProcessResolver for PlatformProcessResolver {
                 },
             },
             parent_pid: stat.parent_pid,
+            session_id: Some(stat.session_id),
             uid: process_dir.uid(),
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
@@ -663,6 +881,7 @@ impl ProcessResolver for PlatformProcessResolver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinuxProcessStat {
     parent_pid: i32,
+    session_id: i32,
     start_time: u64,
 }
 
@@ -674,7 +893,7 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
     let _state = fields.next()?;
     let parent_pid = fields.next()?.parse().ok()?;
     let _process_group = fields.next()?;
-    fields.next()?; // Session ID is intentionally excluded from authorization.
+    let session_id = fields.next()?.parse().ok()?;
     for _ in 7..=21 {
         fields.next()?;
     }
@@ -682,6 +901,7 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
 
     Some(LinuxProcessStat {
         parent_pid,
+        session_id,
         start_time,
     })
 }
@@ -705,6 +925,7 @@ impl ProcessResolver for PlatformProcessResolver {
                 },
             },
             parent_pid: i32::try_from(info.pbi_ppid).ok()?,
+            session_id: macos_session_id(pid),
             uid: info.pbi_uid,
             executable: executable_metadata.as_ref().map(executable_identity),
             executable_path,
@@ -936,6 +1157,14 @@ mod tests {
 
         fn with_uid_only(mut self, pid: i32, uid: u32) -> Self {
             self.visible_uids.insert(pid, uid);
+            self
+        }
+
+        fn with_session(mut self, pid: i32, session_id: i32) -> Self {
+            self.processes
+                .get_mut(&pid)
+                .expect("process must be added before assigning its session")
+                .session_id = Some(session_id);
             self
         }
 
@@ -1472,6 +1701,7 @@ mod tests {
         assert_eq!(
             Some(super::LinuxProcessStat {
                 parent_pid: 456,
+                session_id: 333,
                 start_time: 999,
             }),
             super::parse_linux_process_stat(stat)
@@ -1670,6 +1900,310 @@ mod tests {
     }
 
     #[test]
+    fn originating_process_uses_nearest_exact_gui_ancestor() {
+        let first = FakeResolver::default()
+            .with_path(12, 11, UID, 5, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 4, "/bin/bash")
+            .with_path(10, 9, UID, 3, "/usr/bin/inner-terminal")
+            .with_path(9, 1, UID, 2, "/usr/bin/outer-terminal")
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with_path(22, 21, UID, 7, "/usr/local/bin/monopass")
+            .with_path(21, 10, UID, 6, "/bin/zsh")
+            .with_path(10, 9, UID, 3, "/usr/bin/inner-terminal")
+            .with_path(9, 1, UID, 2, "/usr/bin/outer-terminal")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default()
+            .with(10, "Inner Terminal")
+            .with(9, "Outer Terminal");
+
+        let first = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &first,
+            &gui,
+            Some(test_executable(8)),
+        )
+        .unwrap();
+        let second = super::resolve_authorization_scope_with_resolver_and_gui(
+            22,
+            UID,
+            &second,
+            &gui,
+            Some(test_executable(8)),
+        )
+        .unwrap();
+
+        assert_ne!(first.hash, second.hash);
+        assert_eq!(
+            first.originating_process_hash,
+            second.originating_process_hash
+        );
+    }
+
+    #[test]
+    fn originating_process_ignores_inherited_gui_context_and_falls_back_to_uid_boundary() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 1, UID, 2, "/usr/lib/systemd/systemd")
+            .with_uid_only(1, 0);
+        let gui = FakeGuiResolver::default().with_context(11, "Inherited Context");
+
+        let scope = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &resolver,
+            &gui,
+            Some(test_executable(5)),
+        )
+        .unwrap();
+        let boundary = resolver.process_info(10).unwrap();
+
+        assert_eq!(
+            super::hash_originating_process(UID, &boundary),
+            scope.originating_process_hash
+        );
+        assert_ne!(scope.hash, scope.originating_process_hash);
+        assert_ne!(
+            scope.originating_process_hash,
+            super::ScopeHash::insecure_all(UID)
+        );
+    }
+
+    #[test]
+    fn originating_process_uses_nearest_session_boundary_from_process_snapshot() {
+        let resolver = FakeResolver::default()
+            .with(65508, 43059, UID, 7)
+            .with_session(65508, 43059)
+            .with(43059, 9966, UID, 6)
+            .with_session(43059, 43059)
+            .with(9966, 9812, UID, 5)
+            .with_session(9966, 9703)
+            .with(9812, 9703, UID, 4)
+            .with_session(9812, 9703)
+            .with(9703, 1037, UID, 3)
+            .with_session(9703, 9703)
+            .with(1037, 1, UID, 2)
+            .with_session(1037, 1037)
+            .with_uid_only(1, 0);
+
+        let scope = super::resolve_authorization_scope_with_resolver_and_gui(
+            65508,
+            UID,
+            &resolver,
+            &FakeGuiResolver::default(),
+            None,
+        )
+        .unwrap();
+        let shell = resolver.process_info(43059).unwrap();
+
+        assert_eq!(
+            super::hash_originating_process(UID, &shell),
+            scope.originating_process_hash
+        );
+    }
+
+    #[test]
+    fn originating_process_distinguishes_terminal_sessions() {
+        let first = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 100)
+            .with(11, 10, UID, 3)
+            .with_session(11, 100)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with(22, 21, UID, 4)
+            .with_session(22, 200)
+            .with(21, 10, UID, 3)
+            .with_session(21, 200)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+
+        let first = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &first,
+            &FakeGuiResolver::default(),
+            None,
+        )
+        .unwrap();
+        let second = super::resolve_authorization_scope_with_resolver_and_gui(
+            22,
+            UID,
+            &second,
+            &FakeGuiResolver::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(
+            first.originating_process_hash,
+            second.originating_process_hash
+        );
+    }
+
+    #[test]
+    fn originating_process_shares_nested_shells_in_the_same_session() {
+        let direct = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 100)
+            .with(11, 10, UID, 3)
+            .with_session(11, 100)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+        let nested = FakeResolver::default()
+            .with(22, 21, UID, 4)
+            .with_session(22, 100)
+            .with(21, 11, UID, 5)
+            .with_session(21, 100)
+            .with(11, 10, UID, 3)
+            .with_session(11, 100)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+
+        let direct = super::resolve_authorization_scope_with_resolver_and_gui(
+            12,
+            UID,
+            &direct,
+            &FakeGuiResolver::default(),
+            None,
+        )
+        .unwrap();
+        let nested = super::resolve_authorization_scope_with_resolver_and_gui(
+            22,
+            UID,
+            &nested,
+            &FakeGuiResolver::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            direct.originating_process_hash,
+            nested.originating_process_hash
+        );
+    }
+
+    #[test]
+    fn originating_process_hash_ignores_executable_identity() {
+        let first = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 100)
+            .with(11, 10, UID, 3)
+            .with_session(11, 100)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 100)
+            .with(11, 10, UID, 30)
+            .with_session(11, 100)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+
+        let first = resolver_originating_process_hash(12, &first);
+        let second = resolver_originating_process_hash(12, &second);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn process_chain_hash_does_not_include_session_ids() {
+        let first = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 100)
+            .with(11, 10, UID, 3)
+            .with_session(11, 100)
+            .with(10, 1, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(1, 0);
+        let second = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 300)
+            .with(11, 10, UID, 3)
+            .with_session(11, 200)
+            .with(10, 1, UID, 2)
+            .with_session(10, 100)
+            .with_uid_only(1, 0);
+
+        assert_eq!(
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &first),
+            super::resolve_authorization_scope_hash_with_resolver(12, UID, &second)
+        );
+    }
+
+    #[test]
+    fn originating_process_can_stop_at_gui_when_more_remote_ancestry_is_unavailable() {
+        let resolver = FakeResolver::default()
+            .with_path(12, 11, UID, 4, "/usr/local/bin/monopass")
+            .with_path(11, 10, UID, 3, "/bin/bash")
+            .with_path(10, 9, UID, 2, "/usr/bin/terminal")
+            .with_uid_only(9, UID);
+        let gui = FakeGuiResolver::default().with(10, "Terminal");
+
+        assert!(
+            super::resolve_authorization_scope_with_resolver_and_gui(
+                12,
+                UID,
+                &resolver,
+                &gui,
+                Some(test_executable(5)),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            Some(super::hash_originating_process(
+                UID,
+                &resolver.process_info(10).unwrap(),
+            )),
+            super::resolve_originating_process_scope_hash_with_resolver_and_gui(
+                12, UID, &resolver, &gui,
+            )
+        );
+    }
+
+    #[test]
+    fn originating_process_can_stop_at_session_boundary_when_remote_ancestry_is_unavailable() {
+        let resolver = FakeResolver::default()
+            .with(12, 11, UID, 4)
+            .with_session(12, 100)
+            .with(11, 10, UID, 3)
+            .with_session(11, 100)
+            .with(10, 9, UID, 2)
+            .with_session(10, 90)
+            .with_uid_only(9, UID);
+        let expected = super::hash_originating_process(UID, &resolver.process_info(11).unwrap());
+
+        assert!(
+            super::resolve_authorization_scope_with_resolver_and_gui(
+                12,
+                UID,
+                &resolver,
+                &FakeGuiResolver::default(),
+                None,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            Some(expected),
+            super::resolve_originating_process_scope_hash_with_resolver_and_gui(
+                12,
+                UID,
+                &resolver,
+                &FakeGuiResolver::default(),
+            )
+        );
+    }
+
+    #[test]
     fn direct_gui_caller_uses_localized_name_without_via() {
         let resolver = FakeResolver::default()
             .with_path(12, 11, UID, 3, "/usr/local/bin/monopass")
@@ -1775,6 +2309,7 @@ mod tests {
                 },
             },
             parent_pid,
+            session_id: Some(1),
             uid,
             executable: executable.map(test_executable),
             executable_path: executable.map(|inode| PathBuf::from(format!("/bin/test-{inode}"))),
@@ -1785,6 +2320,21 @@ mod tests {
         pids.iter()
             .map(|pid| resolver.process_info(*pid).unwrap())
             .collect()
+    }
+
+    fn resolver_originating_process_hash(
+        peer_pid: i32,
+        resolver: &FakeResolver,
+    ) -> super::ScopeHash {
+        super::resolve_authorization_scope_with_resolver_and_gui(
+            peer_pid,
+            UID,
+            resolver,
+            &FakeGuiResolver::default(),
+            None,
+        )
+        .unwrap()
+        .originating_process_hash
     }
 
     fn test_executable(inode: u64) -> ExecutableIdentity {

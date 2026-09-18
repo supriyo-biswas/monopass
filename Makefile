@@ -9,6 +9,9 @@ build-gtk:
 build-qt:
 	QMAKE=qmake QT_SELECT=qt5 cargo build --locked --no-default-features --features qt
 
+build-release:
+	cargo build --locked --release
+
 build-release-gtk:
 	cargo build --locked --release --no-default-features --features gtk
 

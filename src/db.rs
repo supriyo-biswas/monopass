@@ -704,6 +704,7 @@ mod tests {
         assert_setting_value(&conn, "agent.autoDeleteTrashItemsAfterSeconds", "15552000");
         assert_setting_value(&conn, "agent.autoDeleteOldVersionsAfterSeconds", "15552000");
         assert_setting_value(&conn, "agent.trustedProgramPaths", "[]");
+        assert_setting_value(&conn, "agent.processIdentificationType", "process-chain");
         assert_setting_value(&conn, "cli.clearClipboardAfterSeconds", "30");
     }
 
@@ -787,6 +788,7 @@ mod tests {
         assert_setting_value(&conn, "agent.autoDeleteTrashItemsAfterSeconds", "0");
         assert_setting_value(&conn, "agent.autoDeleteOldVersionsAfterSeconds", "15552000");
         assert_setting_value(&conn, "agent.trustedProgramPaths", "[]");
+        assert_setting_value(&conn, "agent.processIdentificationType", "process-chain");
         assert_setting_value(&conn, "cli.clearClipboardAfterSeconds", "30");
         for (legacy_name, _) in super::LEGACY_SETTING_NAMES {
             assert_setting_missing(&conn, legacy_name);

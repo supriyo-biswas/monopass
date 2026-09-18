@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::{fmt, str::FromStr};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
@@ -11,6 +12,7 @@ pub(crate) const AUTO_DELETE_TRASH_ITEMS_AFTER_SETTING: &str =
 pub(crate) const AUTO_DELETE_OLD_VERSIONS_AFTER_SETTING: &str =
     "agent.autoDeleteOldVersionsAfterSeconds";
 pub(crate) const TRUSTED_PROGRAM_PATHS_SETTING: &str = "agent.trustedProgramPaths";
+pub(crate) const PROCESS_IDENTIFICATION_TYPE_SETTING: &str = "agent.processIdentificationType";
 pub(crate) const CLEAR_CLIPBOARD_AFTER_SECONDS_SETTING: &str = "cli.clearClipboardAfterSeconds";
 
 const FIVE_YEARS_SECONDS: u64 = 5 * 365 * 24 * 60 * 60;
@@ -19,6 +21,44 @@ const FIVE_YEARS_SECONDS: u64 = 5 * 365 * 24 * 60 * 60;
 pub(crate) enum SettingKind {
     Seconds { min: u64, max: u64 },
     TrustedProgramPaths,
+    ProcessIdentificationType,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ProcessIdentificationType {
+    #[default]
+    ProcessChain,
+    OriginatingProcess,
+    InsecureAll,
+}
+
+impl ProcessIdentificationType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessChain => "process-chain",
+            Self::OriginatingProcess => "originating-process",
+            Self::InsecureAll => "insecure-all",
+        }
+    }
+}
+
+impl FromStr for ProcessIdentificationType {
+    type Err = SettingsError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "process-chain" => Ok(Self::ProcessChain),
+            "originating-process" => Ok(Self::OriginatingProcess),
+            "insecure-all" => Ok(Self::InsecureAll),
+            _ => Err(SettingsError::InvalidValue),
+        }
+    }
+}
+
+impl fmt::Display for ProcessIdentificationType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +102,10 @@ impl Setting {
                     .map_err(|_| SettingsError::InvalidValue)?;
                 compile_trusted_program_paths(&values)?;
                 serde_json::to_string(&values).map_err(|_| SettingsError::InvalidValue)
+            }
+            SettingKind::ProcessIdentificationType => {
+                value.parse::<ProcessIdentificationType>()?;
+                Ok(value.to_owned())
             }
         }
     }
@@ -128,6 +172,11 @@ pub(crate) const SETTINGS: &[Setting] = &[
         kind: SettingKind::TrustedProgramPaths,
     },
     Setting {
+        name: PROCESS_IDENTIFICATION_TYPE_SETTING,
+        default: "process-chain",
+        kind: SettingKind::ProcessIdentificationType,
+    },
+    Setting {
         name: CLEAR_CLIPBOARD_AFTER_SECONDS_SETTING,
         default: "30",
         kind: SettingKind::Seconds { min: 10, max: 300 },
@@ -188,6 +237,24 @@ pub(crate) fn trusted_program_paths_setting() -> &'static Setting {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_identification_type_accepts_only_exact_registered_values() {
+        let setting = super::setting(super::PROCESS_IDENTIFICATION_TYPE_SETTING).unwrap();
+
+        for value in ["process-chain", "originating-process", "insecure-all"] {
+            assert_eq!(value, setting.normalize(value).unwrap());
+        }
+        for value in [
+            "",
+            "process_chain",
+            "Process-Chain",
+            "originating-pid",
+            "all",
+        ] {
+            assert!(setting.normalize(value).is_err(), "{value}");
+        }
+    }
+
     #[test]
     fn trusted_program_globs_use_case_sensitive_path_separator_semantics() {
         let exact = super::trusted_program_path_matcher(r#"["/opt/tools/bin/example"]"#).unwrap();
